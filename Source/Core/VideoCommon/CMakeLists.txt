@@ -67,6 +67,13 @@ add_library(videocommon
   FramebufferShaderGen.h
   FrameDumper.cpp
   FrameDumper.h
+  FrameRedraw.cpp
+  FrameRedraw.h
+  FrameRedrawFrame.h
+  FrameRedrawRecord.cpp
+  FrameRedrawReplay.cpp
+  FrameRedrawReport.cpp
+  FrameRedrawTags.cpp
   FrameDumpFFMpeg.h
   FreeLookCamera.cpp
   FreeLookCamera.h

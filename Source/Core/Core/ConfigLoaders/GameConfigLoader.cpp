@@ -15,6 +15,7 @@
 
 #include <fmt/format.h>
 
+#include "Common/RunSettings.h"
 #include "Common/CommonPaths.h"
 #include "Common/Config/Config.h"
 #include "Common/FileUtil.h"
@@ -190,7 +191,7 @@ public:
       for (const std::string& filename : GetGameIniFilenames(m_id, m_revision))
         ini.Load(File::GetSysDirectory() + GAMESETTINGS_DIR DIR_SEP + filename, true);
     }
-    else
+    else if (RunSettings::UserGameSettings())
     {
       for (const std::string& filename : GetGameIniFilenames(m_id, m_revision))
         ini.Load(File::GetUserPath(D_GAMESETTINGS_IDX) + filename, true);

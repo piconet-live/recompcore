@@ -108,6 +108,12 @@ public:
   PixelFormat GetPrevPixelFormat() const { return m_prev_efb_format; }
   void StorePixelFormat(PixelFormat new_format) { m_prev_efb_format = new_format; }
 
+  // FrameRedraw: swaps the EFB's color, convert and depth textures and their framebuffers with a second set of the
+  // same formats and size (made at the first call, and again when the EFB's size or formats changed), so that
+  // everything drawn, cleared, copied or reinterpreted meanwhile uses the second; the same call swaps them back.
+  // False when the second set cannot be made (nothing is swapped then).
+  bool SwapReplayEFB();
+
   // Clears the EFB using shaders.
   void ClearEFB(const MathUtil::Rectangle<int>& rc, bool clear_color, bool clear_alpha,
                 bool clear_z, u32 color, u32 z, PixelFormat pixel_format);
@@ -209,6 +215,14 @@ protected:
   std::unique_ptr<AbstractFramebuffer> m_efb_depth_resolve_framebuffer;
   std::unique_ptr<AbstractPipeline> m_efb_color_resolve_pipeline;
   std::unique_ptr<AbstractPipeline> m_efb_depth_resolve_pipeline;
+
+  // FrameRedraw's second EFB (SwapReplayEFB)
+  std::unique_ptr<AbstractTexture> m_replay_color_texture;
+  std::unique_ptr<AbstractTexture> m_replay_convert_color_texture;
+  std::unique_ptr<AbstractTexture> m_replay_depth_texture;
+  std::unique_ptr<AbstractFramebuffer> m_replay_framebuffer;
+  std::unique_ptr<AbstractFramebuffer> m_replay_convert_framebuffer;
+  bool m_replay_swapped = false;
 
   // Pipeline for restoring the contents of the EFB from a save state
   std::unique_ptr<AbstractPipeline> m_efb_restore_pipeline;

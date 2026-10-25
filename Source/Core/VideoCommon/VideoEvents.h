@@ -62,6 +62,10 @@ struct PresentInfo
   PresentTimeAccuracy present_time_accuracy = PresentTimeAccuracy::Unimplemented;
 
   std::vector<std::string_view> xfb_copy_hashes;
+
+  // A host's picture between two of the game's (FrameRedraw, Presenter::PresentInBetween): its fraction of a field
+  // after the last of the game's; -1 for the game's own pictures.
+  float in_between = -1.0f;
 };
 
 struct VideoEvents

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "Core/PowerPC/StaticRecomp/StaticRecompLockstep.h"
+#include "Common/RunSettings.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
 #include "Core/System.h"
 #include "Common/Logging/Log.h"
@@ -49,7 +50,7 @@ StaticRecompLockstepVerifier::~StaticRecompLockstepVerifier()
 
 void StaticRecompLockstepVerifier::Init()
 {
-  const char* enable = std::getenv("STATICRECOMP_LOCKSTEP");
+  const char* enable = RunSettings::Get("STATICRECOMP_LOCKSTEP");
   if (!enable || enable[0] == '0' || enable[0] == '\0')
     return;
   if (!m_core.m_module)
@@ -66,23 +67,23 @@ void StaticRecompLockstepVerifier::Init()
   }
 
   m_lockstep = true;
-  if (const char* s = std::getenv("STATICRECOMP_LOCKSTEP_START"))
+  if (const char* s = RunSettings::Get("STATICRECOMP_LOCKSTEP_START"))
     m_ls_start = std::strtoull(s, nullptr, 0);
-  if (const char* s = std::getenv("STATICRECOMP_LOCKSTEP_LIMIT"))
+  if (const char* s = RunSettings::Get("STATICRECOMP_LOCKSTEP_LIMIT"))
     m_ls_limit = std::strtoull(s, nullptr, 0);
-  if (const char* s = std::getenv("STATICRECOMP_LOCKSTEP_FILTER"))
+  if (const char* s = RunSettings::Get("STATICRECOMP_LOCKSTEP_FILTER"))
     m_ls_filter = s;
-  if (const char* s = std::getenv("STATICRECOMP_LOCKSTEP_NODEDUP"))
+  if (const char* s = RunSettings::Get("STATICRECOMP_LOCKSTEP_NODEDUP"))
     m_ls_nodedup = s[0] != '0';
-  if (const char* s = std::getenv("STATICRECOMP_LOCKSTEP_MAXREPORT"))
+  if (const char* s = RunSettings::Get("STATICRECOMP_LOCKSTEP_MAXREPORT"))
     m_ls_max_report = std::strtoull(s, nullptr, 0);
-  if (const char* s = std::getenv("STATICRECOMP_LOCKSTEP_STEPCAP"))
+  if (const char* s = RunSettings::Get("STATICRECOMP_LOCKSTEP_STEPCAP"))
     m_ls_step_cap = std::atoi(s);
-  if (const char* s = std::getenv("STATICRECOMP_LOCKSTEP_TRACE"))
+  if (const char* s = RunSettings::Get("STATICRECOMP_LOCKSTEP_TRACE"))
     m_ls_trace_pc = static_cast<u32>(std::strtoull(s, nullptr, 0));
-  if (const char* s = std::getenv("STATICRECOMP_LOCKSTEP_REPEAT"))
+  if (const char* s = RunSettings::Get("STATICRECOMP_LOCKSTEP_REPEAT"))
     m_ls_repeat_pc = static_cast<u32>(std::strtoull(s, nullptr, 0));
-  if (const char* s = std::getenv("STATICRECOMP_LOCKSTEP_WHITELIST"))
+  if (const char* s = RunSettings::Get("STATICRECOMP_LOCKSTEP_WHITELIST"))
   {
     const char* p = s;
     while (*p)

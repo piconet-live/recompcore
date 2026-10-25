@@ -339,6 +339,9 @@ protected:
   alignas(16) u8* m_temp = nullptr;
   size_t m_temp_size = 0;
 
+  // FrameRedraw's replay makes its copies into scratch entries (AllocateCacheEntry, CopyEFBToCacheEntry)
+  friend struct FrameRedrawAccess;
+
 private:
   using TexAddrCache = std::multimap<u32, RcTcacheEntry>;
   using TexHashCache = std::multimap<u64, RcTcacheEntry>;
@@ -393,8 +396,9 @@ private:
   static std::array<u32, 3>
   GetVRAMCopyFilterCoefficients(const CopyFilterCoefficients::Values& coefficients);
 
-  // Flushes a pending EFB copy to RAM from the host to the guest RAM.
-  void WriteEFBCopyToRAM(u8* dst_ptr, u32 width, u32 height, u32 stride,
+  // Flushes a pending EFB copy to RAM from the host to the guest RAM (dst_addr: dst_ptr's physical address, for the
+  // host's HostHooks::clear_copy_memory).
+  void WriteEFBCopyToRAM(u32 dst_addr, u8* dst_ptr, u32 width, u32 height, u32 stride,
                          std::unique_ptr<AbstractStagingTexture> staging_texture);
   void FlushEFBCopy(TCacheEntry* entry);
 
@@ -423,6 +427,7 @@ private:
   std::array<RcTcacheEntry, 8> m_bound_textures{};
 
   TexPool m_texture_pool;
+  u32 m_fzgx_invalidated = 0;  // the pacing log: entries invalidated since the last frame's end
   u64 m_last_entry_id = 0;
 
   // Backup configuration values

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "VideoCommon/ShaderCache.h"
+#include "Core/FzgxProbe.h"
 
 #include <utility>
 
@@ -130,7 +131,11 @@ const AbstractPipeline* ShaderCache::GetPipelineForUid(const GXPipelineUid& uid)
   std::unique_ptr<AbstractPipeline> pipeline;
   std::optional<AbstractPipelineConfig> pipeline_config = GetGXPipelineConfig(uid);
   if (pipeline_config)
+  {
+    const unsigned long long fzgx_start = FzgxProbe::PaceClock();
     pipeline = g_gfx->CreatePipeline(*pipeline_config);
+    FzgxProbe::PaceCompiled("pipeline (in the draw)", fzgx_start);
+  }
   if (g_ActiveConfig.bShaderCache && !exists_in_cache)
     AppendGXPipelineUID(uid);
   return InsertGXPipeline(uid, std::move(pipeline));
@@ -162,7 +167,11 @@ const AbstractPipeline* ShaderCache::GetUberPipelineForUid(const GXUberPipelineU
   std::unique_ptr<AbstractPipeline> pipeline;
   std::optional<AbstractPipelineConfig> pipeline_config = GetGXPipelineConfig(uid);
   if (pipeline_config)
+  {
+    const unsigned long long fzgx_start = FzgxProbe::PaceClock();
     pipeline = g_gfx->CreatePipeline(*pipeline_config);
+    FzgxProbe::PaceCompiled("pipeline (in the draw)", fzgx_start);
+  }
   return InsertGXUberPipeline(uid, std::move(pipeline));
 }
 
@@ -438,6 +447,7 @@ void ShaderCache::CompileMissingPipelines()
 
 std::unique_ptr<AbstractShader> ShaderCache::CompileVertexShader(const VertexShaderUid& uid) const
 {
+  struct FzgxTimed { unsigned long long start = FzgxProbe::PaceClock(); ~FzgxTimed() { FzgxProbe::PaceCompiled("vertex shader", start); } } fzgx_timed;
   const ShaderCode source_code =
       GenerateVertexShaderCode(m_api_type, m_host_config, uid.GetUidData(), {});
   return g_gfx->CreateShaderFromSource(ShaderStage::Vertex, source_code.GetBuffer());
@@ -454,6 +464,7 @@ ShaderCache::CompileVertexUberShader(const UberShader::VertexShaderUid& uid) con
 
 std::unique_ptr<AbstractShader> ShaderCache::CompilePixelShader(const PixelShaderUid& uid) const
 {
+  struct FzgxTimed { unsigned long long start = FzgxProbe::PaceClock(); ~FzgxTimed() { FzgxProbe::PaceCompiled("pixel shader", start); } } fzgx_timed;
   const ShaderCode source_code =
       GeneratePixelShaderCode(m_api_type, m_host_config, uid.GetUidData(), {});
   return g_gfx->CreateShaderFromSource(ShaderStage::Pixel, source_code.GetBuffer());
@@ -1054,7 +1065,11 @@ void ShaderCache::QueuePipelineCompile(const GXPipelineUid& uid, u32 priority)
     bool Compile() override
     {
       if (config)
+      {
+        const unsigned long long fzgx_start = FzgxProbe::PaceClock();
         pipeline = g_gfx->CreatePipeline(*config);
+        FzgxProbe::PaceCompiled("pipeline (background)", fzgx_start);
+      }
       return true;
     }
 
@@ -1129,7 +1144,11 @@ void ShaderCache::QueueUberPipelineCompile(const GXUberPipelineUid& uid, u32 pri
     bool Compile() override
     {
       if (config)
+      {
+        const unsigned long long fzgx_start = FzgxProbe::PaceClock();
         UberPipeline = g_gfx->CreatePipeline(*config);
+        FzgxProbe::PaceCompiled("uber pipeline (background)", fzgx_start);
+      }
       return true;
     }
 

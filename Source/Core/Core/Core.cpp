@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "Core/Core.h"
+#include "Core/FzgxProbe.h"
 
 #include <algorithm>
 #include <atomic>
@@ -786,6 +787,7 @@ void Callback_FramePresented(const PresentInfo& present_info)
 // Called from VideoInterface::Update (CPU thread) at emulated field boundaries
 void Callback_NewField(Core::System& system)
 {
+  FzgxProbe::OnNewField(system);
   if (s_frame_step)
   {
     // To ensure that s_stop_frame_step is up to date, wait for the GPU thread queue to empty,

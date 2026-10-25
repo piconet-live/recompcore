@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
+#include "Common/RunSettings.h"
 #include "Core/System.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/PowerPC/Interpreter/Interpreter.h"
@@ -15,6 +16,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <intrin.h>
+#include "Core/FzgxProbe.h"
 
 namespace
 {
@@ -34,7 +37,7 @@ using FilePtr = std::unique_ptr<std::FILE, FileCloser>;
 
 FilePtr OpenDispatchTrace()
 {
-  const char* path = std::getenv("STATICRECOMP_TRACE_FILE");
+  const char* path = RunSettings::Get("STATICRECOMP_TRACE_FILE");
   if (!path || !*path)
     return {};
 
@@ -63,6 +66,14 @@ void StaticRecompCore::Run()
   m_guest.exram = memory.GetEXRAM();
   m_guest.exram_size = memory.GetExRamSizeReal();
   InitLookupTable(m_guest.ram_size, m_guest.exram_size);
+  PublishGatherPipe();
+  // Spike: expose the locked L1 cache (0xE0000000) through the module's second direct window when the
+  // module was generated with DOLRECOMP_MEM2_BASE=0xA0000000 (GameCube has no MEM2).
+  if (!m_guest.exram && memory.GetL1Cache() && RunSettings::Get("FZGX_L1_AS_MEM2"))
+  {
+    m_guest.exram = memory.GetL1Cache();
+    m_guest.exram_size = memory.GetL1CacheSize();
+  }
   const bool lockstep_enabled = m_lockstep_verifier->IsEnabled();
   const auto fast_dispatchable_at = [this](u32 address) {
     if (m_has_rel_modules || !m_forced_fallback_ranges.empty())
@@ -125,6 +136,9 @@ void StaticRecompCore::Run()
 
     do
     {
+      // External interrupt, FP unavailable (the OS's lazy FPU switch after an interrupt) and decrementer (OS alarms).
+      if (FzgxProbe::g_trace_on && (ppc.pc == 0x00000500u || ppc.pc == 0x00000800u || ppc.pc == 0x00000900u))
+        FzgxProbe::TraceInterrupt(ppc.spr[SPR_SRR0], ppc.gpr[1]);
       // MSR.FP needs no gate here: generated FPU instructions raise the
       // FP-unavailable exception themselves (ppc_fp_available).
       if (m_module_active && DispatchableAt(ppc.pc) &&
@@ -155,7 +169,13 @@ void StaticRecompCore::Run()
           if (m_has_rel_modules)
             ResolveNativeAddress(runtime_dispatch_address, &linked_dispatch_address, nullptr);
           m_guest.pc = linked_dispatch_address;
+          FzgxProbe::g_trace_r1 = m_guest.gpr[1];
+          FzgxProbe::g_trace_r3 = m_guest.gpr[3];
+          FzgxProbe::OnNativeDispatch(linked_dispatch_address, m_guest.lr);
+          BeginDispatchBudget(m_wait_streak != 0);
           m_module->dispatch(&m_guest, linked_dispatch_address);
+          ++FzgxProbe::g_dispatches;
+          FzgxProbe::CensusDispatch(m_guest.pc);
           if (m_has_rel_modules)
             m_guest.pc = TranslateRelAddress(m_guest.pc);
           ++m_native_dispatches;
@@ -174,17 +194,33 @@ void StaticRecompCore::Run()
           // external-interrupt latency matches stock.
           const s64 charge = -m_guest.downcount;
           m_guest.downcount = 0;
-          const u64 effective_charge = static_cast<u64>(charge > 0 ? charge : 1);
+          // Cycles a hardware access already charged during the dispatch count as progress.
+          const u64 effective_charge =
+              static_cast<u64>(charge > 0 ? charge : (m_dispatch_flushed != 0 ? 0 : 1));
           ppc.downcount -= static_cast<int>(effective_charge);
           m_charged_cycles += effective_charge;
-          const u64 total_cycles = m_timebase_cycle_remainder + effective_charge;
-          m_guest.timebase += total_cycles / SystemTimers::TIMER_RATIO;
-          m_timebase_cycle_remainder = total_cycles % SystemTimers::TIMER_RATIO;
+          AdvanceGuestTimebase(effective_charge);
 
           // Idle loop skipping for configured target loops (e.g. Wii Menu OSIdleThread)
-          if (m_guest.pc == m_idle_pc && m_idle_pc != 0)
+          // A configured idle PC only covers loops we already know about. A
+          // dispatch that returns to the address it entered at is a self-loop,
+          // and if the analyzer agrees it is an idle loop there is nothing to
+          // gain from spinning it in real time.
+          bool configured_idle = m_idle_pc != 0 && m_guest.pc == m_idle_pc;
+          for (const u32 idle_pc : m_idle_pcs)
+            configured_idle |= m_guest.pc == idle_pc;
+          const bool detected_idle = m_detect_busy_wait &&
+                                     m_guest.pc == runtime_dispatch_address &&
+                                     IsBusyWaitLoop(runtime_dispatch_address);
+          FzgxProbe::g_idles += configured_idle || detected_idle;
+          if (configured_idle || detected_idle)
           {
             m_system.GetCoreTiming().Idle();
+            m_wait_streak = 8;
+          }
+          else if (m_wait_streak != 0)
+          {
+            --m_wait_streak;
           }
 
           // ctx->timebase is refreshed at burst start (SyncIn), and here we
@@ -192,11 +228,14 @@ void StaticRecompCore::Run()
           // prevent guest busy-wait loops from spinning on a stale timebase.
           if (m_guest.exception)
           {
+            if (FzgxProbe::g_trace_on && m_guest.pc < 0x2000u)
+              FzgxProbe::TraceInterrupt(m_guest.srr0, m_guest.gpr[1]);
             // DolRecomp's runtime already redirected pc/msr/srr to the guest
             // exception vector; the flag only signals that it happened.
             m_guest.exception = 0;
             m_guest.program_exception = 0;
             ++m_native_exceptions;
+            FzgxProbe::Census(10);
           }
           if ((ppc.Exceptions & SYNC_EXCEPTION_MASK) != 0)
             break;  // Hook-raised synchronous exception: deliver via Dolphin below.
@@ -249,7 +288,10 @@ void StaticRecompCore::Run()
         }
         else if (m_fallback_jit)
         {
+          const u64 fz_t0 = __rdtsc();
+          FzgxProbe::PaceEvent(0, ppc.pc);
           m_fallback_jit->Run();
+          FzgxProbe::g_jit_tsc += __rdtsc() - fz_t0;
         }
         else
         {

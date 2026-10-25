@@ -3,6 +3,9 @@
 
 #include "Core/CoreTiming.h"
 
+#include <intrin.h>
+#include "Core/FzgxProbe.h"
+
 #include <algorithm>
 #include <mutex>
 #include <string>
@@ -346,6 +349,14 @@ void CoreTimingManager::MoveEvents()
 
 void CoreTimingManager::Advance()
 {
+  // Spike probe: events run here (GPU FIFO work, VI, audio) are not guest code; time them apart while
+  // a task is being timed.
+  const u64 fz_t0 = FzgxProbe::g_task_active ? __rdtsc() : 0;
+  Common::ScopeGuard fz_guard([fz_t0] {
+    if (fz_t0)
+      FzgxProbe::g_task_emu_tsc += __rdtsc() - fz_t0;
+      FzgxProbe::Census(11);
+  });
   CPUThreadConfigCallback::CheckForConfigChanges();
 
   MoveEvents();
@@ -423,6 +434,8 @@ void CoreTimingManager::SleepUntil(TimePoint time_point)
     // Count amount of time sleeping for analytics
     const TimePoint time_after_sleep = Clock::now();
     m_system.GetPerfMetrics().CountThrottleSleep(time_after_sleep - time);
+    FzgxProbe::CountCpuThreadSleep(static_cast<unsigned long long>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(time_after_sleep - time).count()));
   }
   else
   {

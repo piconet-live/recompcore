@@ -67,6 +67,7 @@ public:
   void PresentBackbuffer() override;
   void SetFullscreen(bool enable_fullscreen) override;
   bool IsFullscreen() const override;
+  std::string DescribeSwapChain() const override;
 
   void Flush() override;
   void WaitForGPUIdle() override;

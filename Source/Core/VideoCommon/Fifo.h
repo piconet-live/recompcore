@@ -69,6 +69,10 @@ public:
   void* PopFifoAuxBuffer(size_t size);
 
   void FlushGpu();
+  // fzgx: with a GPU thread, waits until no pass of its command-list loop is in flight (one that
+  // began before reads were turned off); true when one was. FlushGpu is no such barrier: its
+  // loop may run the payload again in its busy state, where Wait returns at once.
+  bool WaitForGpuPass();
   void RunGpu();
   void GpuMaySleep();
   void RunGpuLoop();
@@ -78,6 +82,9 @@ public:
 
 private:
   void RefreshConfig();
+  // The GPU thread: the picture the presenter holds for its time is presented when that time has come, or the
+  // loop's next sleep is bounded by it (Presenter::SetImmediateSwapHold)
+  void PresentHeldPicture();
   void ReadDataFromFifo(u32 read_ptr);
   void ReadDataFromFifoOnCPU(u32 read_ptr);
   int RunGpuOnCpu(int ticks);
@@ -87,6 +94,9 @@ private:
   static constexpr u32 FIFO_SIZE = 2 * 1024 * 1024;
 
   Common::BlockingLoop m_gpu_mainloop;
+  // fzgx: a pass of the GPU thread's command-list loop is between its check that reads are on and
+  // its store of the read pointer (WaitForGpuPass)
+  std::atomic<bool> m_gpu_pass_active{false};
 
   Common::Flag m_emu_running_state;
 

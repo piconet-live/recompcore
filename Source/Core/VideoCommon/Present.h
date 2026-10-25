@@ -12,9 +12,14 @@
 #include "VideoCommon/VideoCommon.h"
 
 #include <array>
+#include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <tuple>
+
+#include "VideoCommon/VideoEvents.h"
 
 class AbstractTexture;
 struct SurfaceInfo;
@@ -38,6 +43,26 @@ public:
   void ViSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height, u64 ticks,
               TimePoint presentation_time);
   void ImmediateSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height);
+
+  // A host that shows an immediate swap's picture at a time of its own (the port's "console": when a console puts
+  // the picture's first line out) gives that time here. The function is called at the copy, after the XFB is
+  // fetched, on the copy's thread; no time presents at once. A picture with a time is held, and the GPU thread's
+  // FIFO loop presents it once the time has come (PresentHeldSwap): between its passes over the commands, or from
+  // its idle wait, which the time bounds and new commands end at once. No thread waits for the time: a wait on the
+  // GPU thread let the game's switch of its two command buffers race with the GPU's lag, and the GPU decoded
+  // garbage ("FIFO: Unknown Opcode"). Dual core only (the copy's thread is then the GPU thread). Empty by default.
+  using HoldUntil = std::function<std::optional<TimePoint>(const PresentInfo&)>;
+  static void SetImmediateSwapHold(HoldUntil hold);
+  // The GPU thread: a held picture whose time has come is presented; the time of one still held is returned.
+  std::optional<TimePoint> PresentHeldSwap();
+  // The GPU thread: a picture of the host's own between two of the game's (FrameRedraw's replay, in a texture of
+  // its own): held as the game's are, by the host's function (PresentInfo::in_between the fraction), or shown at
+  // once after the pictures held before it.
+  void PresentInBetween(RcTcacheEntry entry, const MathUtil::Rectangle<int>& rect, float fraction);
+  // The GPU thread: whether the host holds pictures for their time (SetImmediateSwapHold), and the last immediate
+  // swap's intended time (the game's own picture's moment): FrameRedraw's pictures after it are guessed for theirs.
+  bool HoldsPictures() const;
+  TimePoint LastTrueMoment() const { return m_last_true_moment; }
 
   void SetNextSwapEstimatedTime(u64 ticks, TimePoint host_time);
 
@@ -191,8 +216,32 @@ private:
   // Can be used for presentation of ImmediateXFB swaps which don't have timing information.
   u64 m_next_swap_estimated_ticks = 0;
   TimePoint m_next_swap_estimated_time{Clock::now()};
+  TimePoint m_last_true_moment{};  // (LastTrueMoment)
 
   std::atomic_bool m_immediate_swap_happened_this_field{};
+
+  // The rest of an immediate swap, once its XFB is fetched: the events, the present and frame dumping.
+  void FinishImmediateSwap(PresentInfo& present_info);
+
+  // SetImmediateSwapHold: the host's function, and the picture held for its time (the GPU thread's own)
+  static std::mutex s_hold_mutex;
+  static HoldUntil s_hold;
+  // Each held picture keeps its own XFB (and the content lock FetchXFB took on it), so that the copies that come
+  // while it is held cannot replace what it shows: a host that draws more than one picture a field (the port's
+  // drawn frames between two steps) holds several, presented in their order, each at its time.
+  struct HeldSwap
+  {
+    PresentInfo info;
+    TimePoint due;
+    RcTcacheEntry xfb_entry;
+    MathUtil::Rectangle<int> xfb_rect;
+    u64 xfb_id = 0, xfb_ticks = 0;
+    u32 xfb_addr = 0, xfb_width = 0, xfb_stride = 0, xfb_height = 0;
+  };
+  static constexpr std::size_t MOST_HELD = 6;
+  std::deque<HeldSwap> m_held_swaps;
+  // The oldest held picture, presented now with its own XFB.
+  void PresentOldestHeld();
 };
 
 }  // namespace VideoCommon

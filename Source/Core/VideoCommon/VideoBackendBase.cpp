@@ -51,6 +51,7 @@
 #include "VideoCommon/EFBInterface.h"
 #include "VideoCommon/Fifo.h"
 #include "VideoCommon/FrameDumper.h"
+#include "VideoCommon/FrameRedraw.h"
 #include "VideoCommon/FramebufferManager.h"
 #include "VideoCommon/GeometryShaderManager.h"
 #include "VideoCommon/GraphicsModSystem/Runtime/GraphicsModManager.h"
@@ -378,6 +379,7 @@ void VideoBackendBase::ShutdownShared()
 
   g_frame_dumper.reset();
   g_presenter.reset();
+  VideoCommon::FrameRedraw::Shutdown();
 
   if (g_shader_cache)
     g_shader_cache->Shutdown();

@@ -19,6 +19,7 @@
 #include "VideoCommon/AbstractTexture.h"
 #include "VideoCommon/BPFunctions.h"
 #include "VideoCommon/DriverDetails.h"
+#include "VideoCommon/FrameRedraw.h"
 #include "VideoCommon/FramebufferShaderGen.h"
 #include "VideoCommon/PixelShaderManager.h"
 #include "VideoCommon/Present.h"
@@ -384,6 +385,8 @@ bool FramebufferManager::ReinterpretPixelData(EFBReinterpretType convtype)
 {
   if (!m_format_conversion_pipelines[static_cast<u32>(convtype)])
     return false;
+  if (VideoCommon::FrameRedraw::Recording())
+    VideoCommon::FrameRedraw::OnReinterpret(convtype);
 
   // Draw to the secondary framebuffer.
   // We don't discard here because discarding the framebuffer also throws away the depth
@@ -402,6 +405,44 @@ bool FramebufferManager::ReinterpretPixelData(EFBReinterpretType convtype)
   std::swap(m_efb_framebuffer, m_efb_convert_framebuffer);
   g_gfx->EndUtilityDrawing();
   InvalidatePeekCache(true);
+  return true;
+}
+
+bool FramebufferManager::SwapReplayEFB()
+{
+  if (!m_replay_swapped)
+  {
+    const TextureConfig color_config = m_efb_color_texture->GetConfig();
+    const TextureConfig depth_config = m_efb_depth_texture->GetConfig();
+    if (!m_replay_color_texture || !(m_replay_color_texture->GetConfig() == color_config) ||
+        !(m_replay_depth_texture->GetConfig() == depth_config))
+    {
+      m_replay_framebuffer.reset();
+      m_replay_convert_framebuffer.reset();
+      m_replay_color_texture = g_gfx->CreateTexture(color_config, "EFB replay color texture");
+      m_replay_convert_color_texture =
+          g_gfx->CreateTexture(color_config, "EFB replay convert color texture");
+      m_replay_depth_texture = g_gfx->CreateTexture(depth_config, "EFB replay depth texture");
+      if (m_replay_color_texture && m_replay_convert_color_texture && m_replay_depth_texture)
+      {
+        m_replay_framebuffer =
+            g_gfx->CreateFramebuffer(m_replay_color_texture.get(), m_replay_depth_texture.get());
+        m_replay_convert_framebuffer = g_gfx->CreateFramebuffer(
+            m_replay_convert_color_texture.get(), m_replay_depth_texture.get());
+      }
+      if (!m_replay_framebuffer || !m_replay_convert_framebuffer)
+      {
+        m_replay_color_texture.reset();
+        return false;
+      }
+    }
+  }
+  std::swap(m_efb_color_texture, m_replay_color_texture);
+  std::swap(m_efb_convert_color_texture, m_replay_convert_color_texture);
+  std::swap(m_efb_depth_texture, m_replay_depth_texture);
+  std::swap(m_efb_framebuffer, m_replay_framebuffer);
+  std::swap(m_efb_convert_framebuffer, m_replay_convert_framebuffer);
+  m_replay_swapped = !m_replay_swapped;
   return true;
 }
 
@@ -859,6 +900,8 @@ void FramebufferManager::ClearEFB(const MathUtil::Rectangle<int>& rc, bool color
                                   bool alpha_enable, bool z_enable, u32 color, u32 z,
                                   PixelFormat pixel_format)
 {
+  if (VideoCommon::FrameRedraw::Recording())
+    VideoCommon::FrameRedraw::OnClear(rc, color_enable, alpha_enable, z_enable, color, z, pixel_format);
   FlushEFBPokes();
   FlagPeekCacheAsOutOfDate();
 

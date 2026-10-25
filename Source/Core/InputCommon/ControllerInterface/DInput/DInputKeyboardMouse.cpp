@@ -266,6 +266,16 @@ Core::DeviceRemoval KeyboardMouse::UpdateInput()
       INFO_LOG_FMT(CONTROLLERINTERFACE, "Keyboard device failed to re-acquire, we'll retry later");
   }
 
+  // The keyboard and the mouse are opened to be read in the background, as every device is, so that a controller
+  // goes on working while another window is in front. A key typed into that other window is not the game's: what
+  // the two hold counts only while the host says its window has the focus (a host with no window always has).
+  if (!Host_RendererHasFocus() && !Host_TASInputHasFocus())
+  {
+    std::fill(std::begin(m_state_in.keyboard), std::end(m_state_in.keyboard), BYTE{0});
+    m_state_in.mouse = {};
+    m_state_in.relative_mouse = {};
+  }
+
   return Core::DeviceRemoval::Keep;
 }
 

@@ -1,6 +1,7 @@
 // RecompCore: StaticRecomp CPU core - State synchronization.
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <cstring>
 #include "Core/CoreTiming.h"
 #include "Core/HW/SystemTimers.h"
@@ -37,11 +38,61 @@ void StaticRecompCore::SetPPCStateFromGuestState(const CPUState& s, PowerPC::Pow
   ppc.reserve = s.reserve_valid;
 }
 
+// The time base counts emulated ticks, twelve to a step. What generated code charges are the cycles of the
+// instructions it ran, which is Dolphin's downcount: with the emulated CPU clock raised (Core.Overclock) that is the
+// clock's factor times the ticks that passed. Counting the charge as ticks made the guest's time base run that many
+// times too fast inside a burst and fall back at the next one (it is set from the emulator's clock at every
+// SyncIn): a guest loop that reads the time saw it jump forward and back. The quotient is kept as a fraction of a
+// tick, so nothing is lost between dispatches; with the clock at 1 the arithmetic is the old one.
+// Test switch FZGX_TIMEBASE_BY_CHARGE=1: the fault as it was (the charge counted as ticks), to show whether a
+// player's report from before the fix was this fault. Never set for a player. StaticRecompCore::Init sets it from
+// this run's settings (Common/RunSettings.h): it is no static initialiser's, which would run before they are known.
+bool g_staticrecomp_timebase_by_charge = false;
+
 void StaticRecompCore::AdvanceGuestTimebase(u64 cpu_cycles)
 {
+  // The factor in effect for this slice, as CoreTiming's own DowncountToCycles uses it.
+  const double per_cycle = m_system.GetCoreTiming().GetGlobals().last_OC_factor_inverted;
+  if (per_cycle > 0.0 && per_cycle != 1.0 && !g_staticrecomp_timebase_by_charge)
+  {
+    const double ticks = static_cast<double>(cpu_cycles) * per_cycle + m_timebase_tick_fraction;
+    cpu_cycles = static_cast<u64>(ticks);
+    m_timebase_tick_fraction = ticks - static_cast<double>(cpu_cycles);
+  }
   const u64 total_cycles = m_timebase_cycle_remainder + cpu_cycles;
   m_guest.timebase += total_cycles / SystemTimers::TIMER_RATIO;
   m_timebase_cycle_remainder = total_cycles % SystemTimers::TIMER_RATIO;
+}
+
+void StaticRecompCore::BeginDispatchBudget(bool waiting)
+{
+  const s64 left = m_system.GetPPCState().downcount;
+  m_dispatch_flushed = 0;
+  m_guest.cycle_budget = waiting ? 256 : (left > 0 ? left : 1);
+}
+
+void StaticRecompCore::FlushDispatchCharge()
+{
+  if (!m_hook_flush)
+    return;
+  const s64 charge = -m_guest.downcount;
+  if (charge <= 0)
+    return;
+  m_guest.downcount = 0;
+  m_system.GetPPCState().downcount -= static_cast<int>(charge);
+  m_charged_cycles += static_cast<u64>(charge);
+  m_dispatch_flushed += static_cast<u64>(charge);
+  AdvanceGuestTimebase(static_cast<u64>(charge));
+}
+
+void StaticRecompCore::RefreshDispatchBudget()
+{
+  if (m_wait_streak != 0)
+    return;
+  // Generated code compares the cycles since the dispatch began with the budget. Those already charged are in
+  // m_dispatch_flushed; Dolphin's downcount is what is left after them.
+  const s64 left = m_system.GetPPCState().downcount;
+  m_guest.cycle_budget = static_cast<s64>(m_dispatch_flushed) + (left > 0 ? left : 0);
 }
 
 void StaticRecompCore::SyncIn()
@@ -78,6 +129,7 @@ void StaticRecompCore::SyncIn()
   const auto& core_timing = m_system.GetCoreTiming();
   m_timebase_cycle_remainder =
       (core_timing.GetTicks() - core_timing.GetFakeTBStartTicks()) % SystemTimers::TIMER_RATIO;
+  m_timebase_tick_fraction = 0.0;
   m_guest.reserve_addr = ppc.reserve_address;
   m_guest.reserve_valid = ppc.reserve;
   m_guest.exception = 0;

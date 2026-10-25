@@ -23,6 +23,7 @@
 #include "VideoCommon/BPMemory.h"
 #include "VideoCommon/BoundingBox.h"
 #include "VideoCommon/DataReader.h"
+#include "VideoCommon/FrameRedraw.h"
 #include "VideoCommon/FramebufferManager.h"
 #include "VideoCommon/GeometryShaderManager.h"
 #include "VideoCommon/GraphicsModSystem/Runtime/CustomShaderCache.h"
@@ -192,7 +193,7 @@ DataReader VertexManagerBase::PrepareForAdditionalData(OpcodeDecoder::Primitive 
     }
     else
     {
-      ResetBuffer(stride);
+      StartBatch(stride);
     }
 
     remaining_index_generator_indices = m_index_generator.GetRemainingIndices(primitive);
@@ -225,9 +226,24 @@ DataReader VertexManagerBase::DisableCullAll(u32 stride)
   if (m_cull_all)
   {
     m_cull_all = false;
-    ResetBuffer(stride);
+    StartBatch(stride);
   }
   return DataReader(m_cur_buffer_pointer, m_end_buffer_pointer);
+}
+
+void VertexManagerBase::StartBatch(u32 stride)
+{
+  // While FrameRedraw records, the batch is built in the CPU buffers and copied to the backend's stream at its
+  // draw: the record copies it from cached memory (a stream buffer is often write-combined, slow to read back)
+  m_batch_on_cpu = VideoCommon::FrameRedraw::Recording();
+  if (!m_batch_on_cpu)
+  {
+    ResetBuffer(stride);
+    return;
+  }
+  m_cur_buffer_pointer = m_base_buffer_pointer = m_cpu_vertex_buffer.data();
+  m_end_buffer_pointer = m_base_buffer_pointer + m_cpu_vertex_buffer.size();
+  m_index_generator.Start(m_cpu_index_buffer.data());
 }
 
 void VertexManagerBase::FlushData(u32 count, u32 stride)
@@ -1069,17 +1085,43 @@ void VertexManagerBase::RenderDrawCall(
     pixel_shader_manager.custom_constants_dirty = true;
   }
   pixel_shader_manager.custom_constants = custom_pixel_shader_uniforms;
+  if (VideoCommon::FrameRedraw::Recording())
+    VideoCommon::FrameRedraw::OnConstants();  // (before the upload clears what changed)
   UploadUniforms();
 
   g_gfx->SetPipeline(current_pipeline);
 
   u32 base_vertex, base_index;
-  CommitBuffer(m_index_generator.GetNumVerts(),
-               VertexLoaderManager::GetCurrentVertexFormat()->GetVertexStride(),
-               m_index_generator.GetIndexLen(), &base_vertex, &base_index);
+  const bool expand_base_vertex =
+      g_backend_info.api_type != APIType::D3D && g_ActiveConfig.UseVSForLinePointExpand() &&
+      (primitive_type == PrimitiveType::Points || primitive_type == PrimitiveType::Lines);
+  if (m_batch_on_cpu)
+  {
+    // the batch is in the CPU buffers (StartBatch): recorded from there, then copied to the backend's stream
+    const u32 stride = VertexLoaderManager::GetCurrentVertexFormat()->GetVertexStride();
+    const u32 num_vertices = m_index_generator.GetNumVerts();
+    const u32 num_indices = m_index_generator.GetIndexLen();
+    const u8* vertices = m_cur_buffer_pointer - num_vertices * stride;
+    // (the indices are put aside: the upload restarts the index generator, on the CPU buffer itself in a
+    // backend without a stream of its own)
+    m_batch_indices.assign(m_index_generator.GetIndexStart(),
+                           m_index_generator.GetIndexStart() + num_indices);
+    if (VideoCommon::FrameRedraw::Recording())
+    {
+      VideoCommon::FrameRedraw::OnDraw(current_pipeline, vertices, num_vertices, stride,
+                                       m_batch_indices.data(), num_indices, expand_base_vertex);
+    }
+    UploadUtilityVertices(vertices, stride, num_vertices, m_batch_indices.data(), num_indices,
+                          &base_vertex, &base_index);
+  }
+  else
+  {
+    CommitBuffer(m_index_generator.GetNumVerts(),
+                 VertexLoaderManager::GetCurrentVertexFormat()->GetVertexStride(),
+                 m_index_generator.GetIndexLen(), &base_vertex, &base_index);
+  }
 
-  if (g_backend_info.api_type != APIType::D3D && g_ActiveConfig.UseVSForLinePointExpand() &&
-      (primitive_type == PrimitiveType::Points || primitive_type == PrimitiveType::Lines))
+  if (expand_base_vertex)
   {
     // VS point/line expansion puts the vertex id at gl_VertexID << 2
     // That means the base vertex has to be adjusted to match

@@ -17,6 +17,7 @@
 
 #include "AudioCommon/AudioCommon.h"
 
+#include "Common/RunSettings.h"
 #include "Common/CommonPaths.h"
 #include "Common/CommonTypes.h"
 #include "Common/Config/Config.h"
@@ -279,7 +280,10 @@ void SConfig::OnTitleDirectlyBooted(const Core::CPUThreadGuard& guard)
 
   auto& ppc_symbol_db = system.GetPPCSymbolDB();
 
-  if (ppc_symbol_db.LoadMapOnBoot(guard))
+  // The user folder's map file names the game's functions, and a function that carries the name of one the
+  // emulator answers itself (OSPanic, the OS's print routines) is then no longer the game's: in a start a launch
+  // file rules it is read only when the game's files may be patched from the folders.
+  if (RunSettings::FilesMayPatch() ? ppc_symbol_db.LoadMapOnBoot(guard) : ppc_symbol_db.Clear())
     Host_PPCSymbolsChanged();
   HLE::Reload(system);
 
@@ -534,6 +538,8 @@ Common::IniFile SConfig::LoadDefaultGameIni(std::string_view id, std::optional<u
 Common::IniFile SConfig::LoadLocalGameIni(std::string_view id, std::optional<u16> revision)
 {
   Common::IniFile game_ini;
+  if (!RunSettings::UserGameSettings())
+    return game_ini;
   for (const std::string& filename : ConfigLoaders::GetGameIniFilenames(id, revision))
     game_ini.Load(File::GetUserPath(D_GAMESETTINGS_IDX) + filename, true);
   return game_ini;
@@ -544,6 +550,8 @@ Common::IniFile SConfig::LoadGameIni(std::string_view id, std::optional<u16> rev
   Common::IniFile game_ini;
   for (const std::string& filename : ConfigLoaders::GetGameIniFilenames(id, revision))
     game_ini.Load(File::GetSysDirectory() + GAMESETTINGS_DIR DIR_SEP + filename, true);
+  if (!RunSettings::UserGameSettings())
+    return game_ini;
   for (const std::string& filename : ConfigLoaders::GetGameIniFilenames(id, revision))
     game_ini.Load(File::GetUserPath(D_GAMESETTINGS_IDX) + filename, true);
   return game_ini;

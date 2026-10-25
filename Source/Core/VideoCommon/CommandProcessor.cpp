@@ -4,6 +4,7 @@
 #include "VideoCommon/CommandProcessor.h"
 
 #include <atomic>
+#include <chrono>
 #include <fmt/format.h>
 
 #include "Common/Assert.h"
@@ -17,8 +18,10 @@
 #include "Core/HW/MMIO.h"
 #include "Core/HW/ProcessorInterface.h"
 #include "Core/PowerPC/PowerPC.h"
+#include "Core/FzgxProbe.h"
 #include "Core/System.h"
 #include "VideoCommon/Fifo.h"
+#include "VideoCommon/FrameRedraw.h"
 
 namespace CommandProcessor
 {
@@ -338,6 +341,8 @@ void CommandProcessorManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
 
 void CommandProcessorManager::GatherPipeBursted()
 {
+  // FrameRedraw: the command stream's position, linked or not (a host's request is keyed by it)
+  VideoCommon::FrameRedraw::OnBurstWritten();
   SetCPStatusFromCPU();
 
   auto& processor_interface = m_system.GetProcessorInterface();
@@ -573,12 +578,35 @@ void CommandProcessorManager::SetCpStatusRegister()
 
 void CommandProcessorManager::SetCpControlRegister()
 {
+  const bool reads_turned_off =
+      m_fifo.bFF_GPReadEnable.load(std::memory_order_relaxed) && !m_cp_ctrl_reg.GPReadEnable;
   // Just before disabling reads, give the GPU a chance to catch up.
-  if (m_fifo.bFF_GPReadEnable.load(std::memory_order_relaxed) && !m_cp_ctrl_reg.GPReadEnable)
+  if (reads_turned_off)
   {
     m_system.GetFifo().SyncGPUForRegisterAccess();
   }
-  m_fifo.bFF_GPReadEnable.store(m_cp_ctrl_reg.GPReadEnable, std::memory_order_relaxed);
+  m_fifo.bFF_GPReadEnable.store(m_cp_ctrl_reg.GPReadEnable, reads_turned_off ?
+                                                                std::memory_order_seq_cst :
+                                                                std::memory_order_relaxed);
+  // fzgx: with a GPU thread, a pass of its command-list loop that began before reads were turned
+  // off still loads and stores the read pointer. A game that hands the processor another command
+  // list next (GXSetGPFifo, which writes the pointer's two halves apart) would have that pass put
+  // a pointer into the old list over the new one's, or half of one, and the processor would run
+  // past the new list's end. Wait for that pass (FifoManager::WaitForGpuPass: a no-op without a
+  // GPU thread or with the deterministic one). The pacing log's G record times the wait.
+  if (reads_turned_off)
+  {
+    auto& fifo_manager = m_system.GetFifo();
+    const unsigned long long start_us = FzgxProbe::PaceClock();
+    const auto start = std::chrono::steady_clock::now();
+    const bool in_flight = fifo_manager.WaitForGpuPass();
+    FzgxProbe::PaceReadsOff(start_us,
+                            static_cast<unsigned long long>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - start)
+                                    .count()),
+                            in_flight);
+  }
   m_fifo.bFF_BPInt.store(m_cp_ctrl_reg.BPInt, std::memory_order_relaxed);
   m_fifo.bFF_BPEnable.store(m_cp_ctrl_reg.BPEnable, std::memory_order_relaxed);
   m_fifo.bFF_HiWatermarkInt.store(m_cp_ctrl_reg.FifoOverflowIntEnable, std::memory_order_relaxed);

@@ -1,6 +1,10 @@
 // Copyright 2008 Dolphin Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
+#include <cstdlib>
+#include "Core/CoreTiming.h"
+#include "Common/RunSettings.h"
 #include "Core/HW/DSPHLE/UCodes/AX.h"
 
 #include <array>
@@ -471,6 +475,31 @@ void AXUCode::ProcessPBList(u32 pb_addr)
                           m_samples_auxB_left, m_samples_auxB_right, m_samples_auxB_surround}};
 
     ReadPB(memory, pb_addr, pb);
+
+    // Spike (FZGX_AXLOG=<path>): every voice's parameter block as the game left it, before this audio frame is
+    // mixed: [u32 frame][u64 ticks][u32 pb address][u32 size][the block]. For comparing two runs voice by voice.
+    {
+      static std::FILE* log = [] {
+        const char* path = RunSettings::Get("FZGX_AXLOG");
+        return path && *path ? std::fopen(path, "wb") : nullptr;
+      }();
+      static u32 frame = 0;
+      static u32 first_pb = 0;
+      if (log)
+      {
+        if (first_pb == 0)
+          first_pb = pb_addr;
+        if (pb_addr == first_pb)
+          ++frame;
+        const u64 ticks = m_dsphle->GetSystem().GetCoreTiming().GetTicks();
+        const u32 size = sizeof(AXPB);
+        std::fwrite(&frame, 4, 1, log);
+        std::fwrite(&ticks, 8, 1, log);
+        std::fwrite(&pb_addr, 4, 1, log);
+        std::fwrite(&size, 4, 1, log);
+        std::fwrite(&pb, size, 1, log);
+      }
+    }
 
     PBUpdateData updates = LoadPBUpdates(memory, pb);
 

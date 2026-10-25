@@ -24,6 +24,7 @@
 #include "VideoCommon/BPMemory.h"
 #include "VideoCommon/BoundingBox.h"
 #include "VideoCommon/Fifo.h"
+#include "VideoCommon/FrameRedraw.h"
 #include "VideoCommon/FramebufferManager.h"
 #include "VideoCommon/GeometryShaderManager.h"
 #include "VideoCommon/OpcodeDecoding.h"
@@ -182,6 +183,8 @@ static void BPWritten(PixelShaderManager& pixel_shader_manager, XFStateManager& 
     {
     case 0x02:
     {
+      if (VideoCommon::FrameRedraw::Recording())
+        VideoCommon::FrameRedraw::OnDrawDone();
       INCSTAT(g_stats.this_frame.num_draw_done);
       g_texture_cache->FlushEFBCopies();
       g_texture_cache->FlushStaleBinds();
@@ -340,6 +343,11 @@ static void BPWritten(PixelShaderManager& pixel_shader_manager, XFStateManager& 
             destAddr, EFBCopyFormat::XFB, copy_width, height, destStride, is_depth_copy, srcRect,
             false, false, yScale, s_gammaLUT[PE_copy.gamma], bpmem.triggerEFBCopy.clamp_top,
             bpmem.triggerEFBCopy.clamp_bottom, bpmem.copyfilter.GetCoefficients());
+
+        // FrameRedraw: the frame recorded since the last XFB copy is drawn again (and compared), before the
+        // presentation and before this copy's clear
+        if (VideoCommon::FrameRedraw::Recording())
+          VideoCommon::FrameRedraw::OnXFBCopy(srcRect);
 
         auto& system = Core::System::GetInstance();
 

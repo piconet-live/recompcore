@@ -59,6 +59,10 @@ void VideoBackend::InitBackendInfo(const WindowSystemInfo& wsi)
   g_backend_info.bSupportsSettingObjectNames = false;
   g_backend_info.bSupportsPartialMultisampleResolve = true;
   g_backend_info.bSupportsDynamicVertexLoader = false;
+  // A frame-buffer copy is kept as a texture, as with every drawing backend: without this every copy went to the
+  // game's memory as pixels (zeros: nothing fills a staging texture here), on the thread that draws. The game's
+  // memory then holds what it holds with any other backend.
+  g_backend_info.bSupportsCopyToVram = true;
 
   // aamodes: We only support 1 sample, so no MSAA
   g_backend_info.Adapters.clear();

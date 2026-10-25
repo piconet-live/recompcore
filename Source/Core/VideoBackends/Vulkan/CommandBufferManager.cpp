@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "VideoBackends/Vulkan/CommandBufferManager.h"
+#include <cstdio>
+#include "Core/FzgxProbe.h"
 
 #include <array>
 #include <cstdint>
@@ -245,7 +247,9 @@ void CommandBufferManager::WaitForWorkerThreadIdle()
   if (!m_use_threaded_submission)
     return;
 
+  const unsigned long long fzgx_wait = FzgxProbe::PaceClock();
   m_submit_thread.WaitForCompletion();
+  FzgxProbe::PaceSpan("vk wait for the submit thread", fzgx_wait);
 }
 
 void CommandBufferManager::WaitForFenceCounter(u64 fence_counter)
@@ -280,8 +284,10 @@ void CommandBufferManager::WaitForCommandBufferCompletion(u32 index)
   }
 
   // Wait for this command buffer to be completed.
+  const unsigned long long fzgx_wait = FzgxProbe::PaceClock();
   VkResult res =
       vkWaitForFences(g_vulkan_context->GetDevice(), 1, &resources.fence, VK_TRUE, UINT64_MAX);
+  FzgxProbe::PaceSpan("vk wait for a command buffer's fence", fzgx_wait);
   if (res != VK_SUCCESS)
     LOG_VULKAN_ERROR(res, "vkWaitForFences failed: ");
 
@@ -297,9 +303,14 @@ void CommandBufferManager::WaitForCommandBufferCompletion(u32 index)
 
     if (cleanup_resources.fence_counter > m_completed_fence_counter)
     {
+      const unsigned long long fzgx_cleanup = FzgxProbe::PaceClock();
+      char fzgx_what[64];
+      std::snprintf(fzgx_what, sizeof(fzgx_what), "vk deferred destruction of %zu objects",
+                    cleanup_resources.cleanup_resources.size());
       for (auto& it : cleanup_resources.cleanup_resources)
         it();
       cleanup_resources.cleanup_resources.clear();
+      FzgxProbe::PaceSpan(fzgx_what, fzgx_cleanup, 500);
     }
 
     cleanup_index = (cleanup_index + 1) % NUM_COMMAND_BUFFERS;
@@ -326,6 +337,7 @@ void CommandBufferManager::SubmitCommandBuffer(bool submit_on_worker_thread,
     }
   }
 
+  const unsigned long long fzgx_submit = FzgxProbe::PaceClock();
   // Submitting off-thread?
   if (m_use_threaded_submission && submit_on_worker_thread && !wait_for_completion)
   {
@@ -343,6 +355,8 @@ void CommandBufferManager::SubmitCommandBuffer(bool submit_on_worker_thread,
       WaitForCommandBufferCompletion(m_current_cmd_buffer);
   }
 
+  FzgxProbe::PaceSpan("vk submit (hand over or submit and wait)", fzgx_submit);
+  const unsigned long long fzgx_advance = FzgxProbe::PaceClock();
   if (advance_to_next_frame)
   {
     m_current_frame = (m_current_frame + 1) % NUM_FRAMES_IN_FLIGHT;
@@ -360,6 +374,9 @@ void CommandBufferManager::SubmitCommandBuffer(bool submit_on_worker_thread,
       cmd_buffer_index = (cmd_buffer_index + 1) % NUM_COMMAND_BUFFERS;
     }
 
+    FzgxProbe::PaceSpan("vk wait for the frame's earlier command buffers", fzgx_advance);
+    const unsigned long long fzgx_pools = FzgxProbe::PaceClock();
+    struct FzgxPools { unsigned long long start; ~FzgxPools() { FzgxProbe::PaceSpan("vk descriptor pools reset or remade", start); } } fzgx_pools_span{fzgx_pools};
     // Reset the descriptor pools
     FrameResources& frame_resources = GetCurrentFrameResources();
 
@@ -386,7 +403,9 @@ void CommandBufferManager::SubmitCommandBuffer(bool submit_on_worker_thread,
   }
 
   // Switch to next cmdbuffer.
+  const unsigned long long fzgx_begin = FzgxProbe::PaceClock();
   BeginCommandBuffer();
+  FzgxProbe::PaceSpan("vk begin the next command buffer", fzgx_begin);
 }
 
 void CommandBufferManager::SubmitCommandBuffer(u32 command_buffer_index,
@@ -426,8 +445,10 @@ void CommandBufferManager::SubmitCommandBuffer(u32 command_buffer_index,
     submit_info.pSignalSemaphores = &m_present_semaphores[present_image_index];
   }
 
+  const unsigned long long fzgx_queue = FzgxProbe::PaceClock();
   VkResult res =
       vkQueueSubmit(g_vulkan_context->GetGraphicsQueue(), 1, &submit_info, resources.fence);
+  FzgxProbe::PaceSpan("vkQueueSubmit", fzgx_queue);
   if (res != VK_SUCCESS)
   {
     LOG_VULKAN_ERROR(res, "vkQueueSubmit failed: ");
@@ -448,7 +469,9 @@ void CommandBufferManager::SubmitCommandBuffer(u32 command_buffer_index,
                                      &present_image_index,
                                      nullptr};
 
+    const unsigned long long fzgx_present = FzgxProbe::PaceClock();
     m_last_present_result = vkQueuePresentKHR(g_vulkan_context->GetPresentQueue(), &present_info);
+    FzgxProbe::PaceSpan("vkQueuePresentKHR", fzgx_present);
     if (m_last_present_result != VK_SUCCESS)
     {
       // VK_ERROR_OUT_OF_DATE_KHR is not fatal, just means we need to recreate our swap chain.
@@ -520,21 +543,33 @@ void CommandBufferManager::DeferBufferDestruction(VkBuffer buffer, VmaAllocation
 {
   CmdBufferResources& cmd_buffer_resources = GetCurrentCmdBufferResources();
   cmd_buffer_resources.cleanup_resources.push_back(
-      [buffer, alloc] { vmaDestroyBuffer(g_vulkan_context->GetMemoryAllocator(), buffer, alloc); });
+      [buffer, alloc] {
+        const unsigned long long fzgx_start = FzgxProbe::PaceClock();
+        vmaDestroyBuffer(g_vulkan_context->GetMemoryAllocator(), buffer, alloc);
+        FzgxProbe::PaceSpan("vmaDestroyBuffer", fzgx_start, 500);
+      });
 }
 
 void CommandBufferManager::DeferFramebufferDestruction(VkFramebuffer object)
 {
   CmdBufferResources& cmd_buffer_resources = GetCurrentCmdBufferResources();
   cmd_buffer_resources.cleanup_resources.push_back(
-      [object] { vkDestroyFramebuffer(g_vulkan_context->GetDevice(), object, nullptr); });
+      [object] {
+        const unsigned long long fzgx_start = FzgxProbe::PaceClock();
+        vkDestroyFramebuffer(g_vulkan_context->GetDevice(), object, nullptr);
+        FzgxProbe::PaceSpan("vkDestroyFramebuffer", fzgx_start, 500);
+      });
 }
 
 void CommandBufferManager::DeferImageDestruction(VkImage image, VmaAllocation alloc)
 {
   CmdBufferResources& cmd_buffer_resources = GetCurrentCmdBufferResources();
   cmd_buffer_resources.cleanup_resources.push_back(
-      [image, alloc] { vmaDestroyImage(g_vulkan_context->GetMemoryAllocator(), image, alloc); });
+      [image, alloc] {
+        const unsigned long long fzgx_start = FzgxProbe::PaceClock();
+        vmaDestroyImage(g_vulkan_context->GetMemoryAllocator(), image, alloc);
+        FzgxProbe::PaceSpan("vmaDestroyImage", fzgx_start, 500);
+      });
 }
 
 void CommandBufferManager::DeferImageViewDestruction(VkImageView object)

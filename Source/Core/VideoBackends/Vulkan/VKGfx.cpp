@@ -347,6 +347,32 @@ bool VKGfx::IsFullscreen() const
   return m_swap_chain && m_swap_chain->GetCurrentFullscreenState();
 }
 
+std::string VKGfx::DescribeSwapChain() const
+{
+  if (!m_swap_chain)
+    return {};
+  const char* mode = "another";
+  switch (m_swap_chain->GetPresentMode())
+  {
+  case VK_PRESENT_MODE_IMMEDIATE_KHR:
+    mode = "immediate";
+    break;
+  case VK_PRESENT_MODE_MAILBOX_KHR:
+    mode = "mailbox";
+    break;
+  case VK_PRESENT_MODE_FIFO_KHR:
+    mode = "FIFO";
+    break;
+  case VK_PRESENT_MODE_FIFO_RELAXED_KHR:
+    mode = "FIFO relaxed";
+    break;
+  default:
+    break;
+  }
+  return std::string("present mode ") + mode + ", exclusive full screen " +
+         (m_swap_chain->IsFullscreenSupported() ? "supported" : "not supported");
+}
+
 void VKGfx::ExecuteCommandBuffer(bool submit_off_thread, bool wait_for_completion)
 {
   StateTracker::GetInstance()->EndRenderPass();

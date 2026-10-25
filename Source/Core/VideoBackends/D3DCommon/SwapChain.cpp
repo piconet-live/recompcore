@@ -110,6 +110,7 @@ bool SwapChain::CreateSwapChain(bool stereo, bool hdr)
     }
 
     m_swap_chain = swap_chain1;
+    m_flip_model = SUCCEEDED(hr);
   }
 
   // Flip-model swapchains aren't supported on Windows 7, so here we fall back to a legacy
@@ -133,6 +134,7 @@ bool SwapChain::CreateSwapChain(bool stereo, bool hdr)
     desc.Flags = 0;
 
     m_allow_tearing_supported = false;
+    m_flip_model = false;
     hr = m_dxgi_factory->CreateSwapChain(m_d3d_device.Get(), &desc, &m_swap_chain);
   }
 
@@ -258,6 +260,12 @@ void SwapChain::SetHDR(bool hdr)
     PanicAlertFmt("Failed to switch swap chain SDR/HDR mode");
     CreateSwapChain(false, false);
   }
+}
+
+std::string SwapChain::Describe() const
+{
+  return std::string(m_flip_model ? "flip-model swap chain" : "bit-block swap chain") +
+         (m_allow_tearing_supported ? ", tearing-capable" : ", not tearing-capable");
 }
 
 bool SwapChain::GetFullscreen() const

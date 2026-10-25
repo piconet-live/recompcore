@@ -275,6 +275,11 @@ bool Gfx::IsFullscreen() const
   return m_swap_chain && m_swap_chain->GetFullscreen();
 }
 
+std::string Gfx::DescribeSwapChain() const
+{
+  return m_swap_chain ? m_swap_chain->Describe() : std::string();
+}
+
 SurfaceInfo Gfx::GetSurfaceInfo() const
 {
   return {m_swap_chain ? static_cast<u32>(m_swap_chain->GetWidth()) : 0,

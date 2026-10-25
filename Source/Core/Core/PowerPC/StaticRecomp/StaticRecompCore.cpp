@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
+#include "Common/RunSettings.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -10,6 +11,7 @@
 #include <sstream>
 
 #include "Common/Config/Config.h"
+#include "Core/FzgxProbe.h"
 #include "Common/DynamicLibrary.h"
 #include "Common/FileUtil.h"
 #include "Common/Logging/Log.h"
@@ -28,6 +30,7 @@
 
 
 StaticRecompCore* g_static_recomp_core = nullptr;
+extern bool g_staticrecomp_timebase_by_charge;  // StaticRecompCore_Sync.cpp
 
 u32 StaticRecompShouldYieldAt(u32 address)
 {
@@ -146,11 +149,25 @@ StaticRecompCore::~StaticRecompCore() = default;
 void StaticRecompCore::Init()
 {
   g_static_recomp_core = this;
+  // for the slow-second line (FzgxProbe.cpp)
+  FzgxProbe::g_core_counters = [](unsigned long long out[4]) {
+    if (const StaticRecompCore* core = g_static_recomp_core)
+    {
+      out[0] = core->m_fallback_steps;
+      out[1] = core->m_hook_fallback_instructions;
+      out[2] = core->m_failed_chunks;
+      out[3] = core->m_verifications;
+    }
+  };
+  FzgxProbe::ReadSettings();
+  g_staticrecomp_timebase_by_charge = RunSettings::Get("FZGX_TIMEBASE_BY_CHARGE") != nullptr;
   RefreshConfig();
-  m_collect_dispatch_samples = std::getenv("STATICRECOMP_DISPATCH_SAMPLES") != nullptr;
-  const char* fallback_override = std::getenv("STATICRECOMP_FALLBACK_RANGES");
+  m_collect_dispatch_samples = RunSettings::Get("STATICRECOMP_DISPATCH_SAMPLES") != nullptr;
+  const char* fallback_override = RunSettings::Get("STATICRECOMP_FALLBACK_RANGES");
+  // In a start a launch file rules, only that file names ranges for the fallback: the settings file does not.
   std::istringstream fallback_ranges(fallback_override ? fallback_override :
-                                                         Config::Get(Config::MAIN_STATICRECOMP_FALLBACK_RANGES));
+                                     RunSettings::Ruled() ? std::string() :
+                                     Config::Get(Config::MAIN_STATICRECOMP_FALLBACK_RANGES));
   std::string fallback_range;
   while (std::getline(fallback_ranges, fallback_range, ','))
   {
@@ -182,6 +199,31 @@ void StaticRecompCore::Init()
 
   LoadModule();
   m_idle_pc = Config::Get(Config::MAIN_STATICRECOMP_IDLE_PC);
+  {
+    // Spike: FZGX_IDLE_PCS overrides the setting per run; FZGX_NO_BUSYWAIT=1 turns the analyzer-based
+    // detection off (to measure each mechanism alone).
+    std::string list = Config::Get(Config::MAIN_STATICRECOMP_IDLE_PCS);
+    if (const char* env = RunSettings::Get("FZGX_IDLE_PCS"))
+      list = env;
+    m_idle_pcs.clear();
+    for (const char* p = list.c_str(); *p;)
+    {
+      char* end = nullptr;
+      const unsigned long value = std::strtoul(p, &end, 16);
+      if (end == p)
+        break;
+      if (value)
+        m_idle_pcs.push_back(static_cast<u32>(value));
+      p = end;
+      while (*p == ',' || *p == ' ')
+        ++p;
+    }
+    m_detect_busy_wait = RunSettings::Get("FZGX_NO_BUSYWAIT") == nullptr;
+    m_hook_flush = RunSettings::Get("FZGX_NO_HOOK_FLUSH") == nullptr;
+    std::fprintf(stderr, "[staticrecomp] GPU on its own thread (dual core): %s\n", m_system.IsDualCoreMode() ? "yes" : "no");
+    std::fprintf(stderr, "[staticrecomp] idle pc %08x, %zu listed idle pcs, busy-wait detection %s\n",
+                 m_idle_pc, m_idle_pcs.size(), m_detect_busy_wait ? "on" : "off");
+  }
   m_lockstep_verifier = std::make_unique<StaticRecompLockstep::StaticRecompLockstepVerifier>(*this);
   m_lockstep_verifier->Init();
 
@@ -200,6 +242,7 @@ void StaticRecompCore::Init()
 
 void StaticRecompCore::Shutdown()
 {
+  FzgxProbe::g_core_counters = nullptr;
   g_static_recomp_core = nullptr;
   std::fprintf(stderr,
                "[staticrecomp] shutdown: native=%llu fallback=%llu native_exc=%llu hook_fb=%llu "
@@ -209,11 +252,12 @@ void StaticRecompCore::Shutdown()
                (unsigned long long)m_hook_fallback_instructions, m_failed_chunks,
                (unsigned long long)m_verifications, (unsigned long long)m_reverify_events,
                (unsigned long long)m_bursts, (unsigned long long)m_charged_cycles);
+  FzgxProbe::PrintCensus();
   std::vector<std::pair<u32, u64>> dispatch_samples(m_dispatch_samples.begin(),
                                                     m_dispatch_samples.end());
   std::sort(dispatch_samples.begin(), dispatch_samples.end(),
             [](const auto& left, const auto& right) { return left.second > right.second; });
-  for (std::size_t i = 0; i < std::min<std::size_t>(dispatch_samples.size(), 16); ++i)
+  for (std::size_t i = 0; i < std::min<std::size_t>(dispatch_samples.size(), m_collect_dispatch_samples ? 2000 : 16); ++i)
   {
     std::fprintf(stderr, "[staticrecomp] dispatch-site pc=%08x samples=%llu\n",
                  dispatch_samples[i].first,
@@ -229,6 +273,8 @@ void StaticRecompCore::Shutdown()
   m_lockstep_verifier.reset();
   m_block_cache.Shutdown();
   m_module = nullptr;
+  m_set_native_valid = nullptr;
+  m_set_gather_pipe = nullptr;
   if (m_library.IsOpen())
     m_library.Close();
 
@@ -269,6 +315,8 @@ void StaticRecompCore::LoadModule()
   const auto reject = [&](const std::string& why) {
     ERROR_LOG_FMT(POWERPC, "StaticRecomp: rejecting module '{}': {}. Interpreter-only.", path, why);
     m_module = nullptr;
+    m_set_native_valid = nullptr;
+    m_set_gather_pipe = nullptr;
     if (m_library.IsOpen())
       m_library.Close();
   };
@@ -306,6 +354,21 @@ void StaticRecompCore::LoadModule()
   m_module_active = (desc != nullptr);
   m_has_rel_modules = desc->num_rel_modules != 0;
   m_chunk_state.assign(desc->num_chunk_ranges, CHUNK_UNVERIFIED);
+  m_set_native_valid = m_library.IsOpen() ?
+                           reinterpret_cast<SetNativeValidFn>(
+                               m_library.GetSymbolAddress("staticrecomp_set_native_valid")) :
+                           nullptr;
+  PublishChunkState(~0u);
+  m_set_gather_pipe = m_library.IsOpen() ?
+                          reinterpret_cast<SetGatherPipeFn>(
+                              m_library.GetSymbolAddress("staticrecomp_set_gather_pipe")) :
+                          nullptr;
+  if (FzgxProbe::g_trace_on && m_library.IsOpen())
+  {
+    using SetTraceFn = void (*)(void (*)(unsigned int, unsigned int));
+    if (const auto set_trace = reinterpret_cast<SetTraceFn>(m_library.GetSymbolAddress("fz_set_trace")))
+      set_trace(FzgxProbe::TraceAccess);
+  }
   m_chunk_host_call_state.assign(desc->num_chunk_ranges, 0);
   m_effective_chunk_hashes.assign(desc->chunk_hashes,
                                   desc->chunk_hashes + desc->num_chunk_ranges);
@@ -348,14 +411,60 @@ void StaticRecompCore::LoadModule()
                  desc->num_smc_ranges);
 }
 
+
+bool StaticRecompCore::IsBusyWaitLoop(u32 address)
+{
+  // Analysis reads guest memory and is not meaningful while a debugger or
+  // branch watch is active, both of which want every block to actually execute.
+  if (IsDebuggingEnabled() || IsBranchWatchEnabled())
+    return false;
+
+  // Code in the host program's window is not analysed: a loop there (the mod's wait for the race's start) calls
+  // the host on every turn and is no idle loop of the game's.
+  if (InHostWindow(address, address + 4))
+    return false;
+
+  const auto cached = m_busy_wait_cache.find(address);
+  if (cached != m_busy_wait_cache.end())
+    return cached->second;
+
+  constexpr std::size_t max_loop_instructions = 64;
+  // The analyzer writes its statistics through these; nothing else in this core sets them (PR #19
+  // as posted crashes here on the pinned tree).
+  code_block.m_stats = &js.st;
+  code_block.m_gpa = &js.gpa;
+  code_block.m_fpa = &js.fpa;
+  analyzer.Analyze(address, &code_block, &m_code_buffer,
+                   std::min(max_loop_instructions, m_code_buffer.size()));
+
+  const bool is_busy_wait = !code_block.m_memory_exception &&
+                            std::any_of(m_code_buffer.begin(),
+                                        m_code_buffer.begin() + code_block.m_num_instructions,
+                                        [address](const PPCAnalyst::CodeOp& op) {
+                                          return op.branchIsIdleLoop && op.branchTo == address;
+                                        });
+  m_busy_wait_cache.emplace(address, is_busy_wait);
+  if (is_busy_wait)
+    std::fprintf(stderr, "[staticrecomp] busy-wait loop detected at %08x (%u instructions)\n", address,
+                 code_block.m_num_instructions);
+  return is_busy_wait;
+}
+
 void StaticRecompCore::ClearCache()
 {
+  // the pacing log: a whole-cache clear puts every chunk back to "to be checked" and empties the fallback JIT
+  struct Span { unsigned long long start = FzgxProbe::PaceClock(); ~Span() { FzgxProbe::PaceSpan("cpu core: cache cleared, every chunk to be checked again", start, 0); } } span;
+  m_busy_wait_cache.clear();
+  // as every JIT does in its ClearCache: this core's copy of the settings follows them, or a setting that did
+  // change would differ from the copy for ever and clear everything at every later change of any setting
+  RefreshConfig();
   if (m_fallback_jit)
     m_fallback_jit->ClearCache();
 
   if (!m_module)
     return;
   std::fill(m_chunk_state.begin(), m_chunk_state.end(), u8{CHUNK_UNVERIFIED});
+  PublishChunkState(~0u);
   m_failed_chunks = 0;
   ++m_reverify_events;
 }

@@ -1,7 +1,10 @@
 // Copyright 2019 Dolphin Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include "DolphinNoGUI/Platform.h"
+#include "Common/RunSettings.h"
+#include "Common/WindowFrame.h"
 
 #include "Core/Config/MainSettings.h"
 #include "Core/Config/ConfigManager.h"
@@ -35,7 +38,7 @@ namespace
 constexpr UINT ID_SAVE_STATE = 41001;
 constexpr UINT ID_PAUSE = 41002;
 constexpr UINT ID_MUTE = 41003;
-constexpr UINT ID_FULLSCREEN = 41004;
+constexpr UINT ID_FULLSCREEN = WindowFrame::TOGGLE_FULLSCREEN;  // a host program's frame sends it too
 constexpr UINT ID_LOAD_STATE_FIRST = 41100;
 constexpr UINT ID_LOAD_STATE_LAST = 41199;
 
@@ -65,8 +68,17 @@ private:
   void RefreshMenu(HMENU menu);
   void SaveStateToStatesDirectory();
   void ToggleFullscreen();
+  void SetFastForward(bool on);
   void UpdateWindowPosition();
   void ProcessEvents();
+
+  // The window's controls that change the game: Save State and Load State (the File menu, F1), Pause, and fast
+  // forward while Space is held. In a start a launch file rules they exist only when the host program gave
+  // FZGX_WINDOW_CONTROLS (the launch file's "debug.windowControls"): a player's window has no File menu, F1 and
+  // Space do nothing there, and a command message with one of their numbers, whoever posts it, is not acted on.
+  // Fullscreen, Mute Audio and closing the window are every window's. A start no launch file rules has them all.
+  const bool m_test_controls =
+      !RunSettings::Ruled() || RunSettings::Get("FZGX_WINDOW_CONTROLS") != nullptr;
 
   HWND m_hwnd{};
   HMENU m_menu{};
@@ -78,6 +90,8 @@ private:
   std::time_t m_last_save_time{};
   std::size_t m_save_sequence{};
   bool m_fullscreen = false;
+  bool m_fast_forward = false;
+  float m_speed_before_fast_forward = 1.0f;
   LONG m_windowed_style = 0;
   RECT m_windowed_rect{};
 
@@ -130,31 +144,45 @@ bool PlatformWin32::CreateRenderWindow()
     return false;
   }
 
-  ShowWindow(m_hwnd, SW_SHOW);
+  // Whether the window has the focus is asked of the system in the main loop: a window shown without it has none.
+  m_window_focus = false;
+  // FZGX_WINDOW_NOACTIVATE=1 (tests): the window is shown without taking the keyboard from whoever is at the PC
+  ShowWindow(m_hwnd, RunSettings::Get("FZGX_WINDOW_NOACTIVATE") ? SW_SHOWNOACTIVATE : SW_SHOW);
   UpdateWindow(m_hwnd);
   return true;
 }
 
 bool PlatformWin32::CreateMenus()
 {
+  // A host program that draws the window's frame (Common/WindowFrame.h) has no menu bar under it: the commands of
+  // every window are its buttons and the keys.
+  if (WindowFrame::Given())
+    return true;
+
   m_menu = CreateMenu();
-  m_file_menu = CreatePopupMenu();
-  m_load_menu = CreatePopupMenu();
   m_view_menu = CreatePopupMenu();
-  if (!m_menu || !m_file_menu || !m_load_menu || !m_view_menu)
+  if (!m_menu || !m_view_menu)
     return false;
 
-  AppendMenuW(m_file_menu, MF_STRING, ID_SAVE_STATE, L"&Save State\tF1");
-  AppendMenuW(m_file_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(m_load_menu), L"&Load State");
-  AppendMenuW(m_file_menu, MF_SEPARATOR, 0, nullptr);
-  // Checked state is refreshed from the core when the menu opens, so it cannot
-  // drift out of step with an emulation that was paused some other way.
-  AppendMenuW(m_file_menu, MF_STRING, ID_PAUSE, L"&Pause");
+  if (m_test_controls)
+  {
+    m_file_menu = CreatePopupMenu();
+    m_load_menu = CreatePopupMenu();
+    if (!m_file_menu || !m_load_menu)
+      return false;
+    AppendMenuW(m_file_menu, MF_STRING, ID_SAVE_STATE, L"&Save State\tF1");
+    AppendMenuW(m_file_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(m_load_menu), L"&Load State");
+    AppendMenuW(m_file_menu, MF_SEPARATOR, 0, nullptr);
+    // Checked state is refreshed from the core when the menu opens, so it cannot
+    // drift out of step with an emulation that was paused some other way.
+    AppendMenuW(m_file_menu, MF_STRING, ID_PAUSE, L"&Pause");
+  }
 
   AppendMenuW(m_view_menu, MF_STRING, ID_FULLSCREEN, L"&Fullscreen\tAlt+Enter");
   AppendMenuW(m_view_menu, MF_STRING, ID_MUTE, L"&Mute Audio");
 
-  AppendMenuW(m_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(m_file_menu), L"&File");
+  if (m_test_controls)
+    AppendMenuW(m_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(m_file_menu), L"&File");
   AppendMenuW(m_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(m_view_menu), L"&View");
   return SetMenu(m_hwnd, m_menu) != FALSE;
 }
@@ -163,7 +191,7 @@ bool PlatformWin32::CreateMenus()
 // the menu is closed, and by the launcher between sessions.
 void PlatformWin32::RefreshMenu(const HMENU menu)
 {
-  if (menu == m_file_menu)
+  if (m_file_menu && menu == m_file_menu)
   {
     auto& system = Core::System::GetInstance();
     const bool paused = Core::GetState(system) == Core::State::Paused;
@@ -181,7 +209,7 @@ void PlatformWin32::RefreshMenu(const HMENU menu)
     return;
   }
 
-  if (menu != m_load_menu)
+  if (!m_load_menu || menu != m_load_menu)
     return;
 
   while (DeleteMenu(m_load_menu, 0, MF_BYPOSITION))
@@ -227,6 +255,21 @@ void PlatformWin32::SaveStateToStatesDirectory()
       StringToPath(directory) /
       State::Layout::TimestampedName(now, m_save_sequence, State::Layout::MANUAL_PREFIX);
   State::SaveAs(Core::System::GetInstance(), PathToString(path));
+}
+
+// Holding Space runs at FAST_FORWARD_SPEED; letting go, or losing the focus while it is held, puts back the speed
+// that was set before. A window that only loses the focus changes nothing. (It used to force 100% on every loss of
+// focus, which silently throttled a run configured as unlimited, EmulationSpeed = 0, as soon as another window came
+// to the front, and replaced whatever speed a host program had set.)
+void PlatformWin32::SetFastForward(const bool on)
+{
+  if (!m_test_controls || on == m_fast_forward)
+    return;
+  if (on)
+    m_speed_before_fast_forward = Config::Get(Config::MAIN_EMULATION_SPEED);
+  m_fast_forward = on;
+  Config::SetCurrent(Config::MAIN_EMULATION_SPEED,
+                     on ? FAST_FORWARD_SPEED : m_speed_before_fast_forward);
 }
 
 void PlatformWin32::ToggleFullscreen()
@@ -291,6 +334,11 @@ void PlatformWin32::MainLoop()
     Core::HostDispatchJobs(Core::System::GetInstance());
     ProcessEvents();
     UpdateWindowPosition();
+    // The host's answer to "has the render window the focus": it is the window the keyboard goes to, the one in
+    // front. Asked of the system here and not kept from WM_SETFOCUS: a window shown while another program is in
+    // front is given the focus of its own thread and never the keyboard, and is told of no loss. The keyboard and
+    // the mouse count only while this says yes (InputCommon's DInput keyboard asks); controllers are not asked.
+    m_window_focus = GetForegroundWindow() == m_hwnd;
 
     // TODO: Is this sleep appropriate?
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -302,7 +350,11 @@ WindowSystemInfo PlatformWin32::GetWindowSystemInfo() const
   WindowSystemInfo wsi;
   wsi.type = WindowSystemType::Windows;
   wsi.render_window = reinterpret_cast<void*>(m_hwnd);
-  wsi.render_surface = reinterpret_cast<void*>(m_hwnd);
+  // the picture's surface: the window, or the child window a host program's frame made for it
+  const WindowFrame::Host& frame = WindowFrame::Get();
+  wsi.render_surface = frame.surface ? frame.surface(m_hwnd) : nullptr;
+  if (!wsi.render_surface)
+    wsi.render_surface = reinterpret_cast<void*>(m_hwnd);
   return wsi;
 }
 
@@ -335,6 +387,14 @@ LRESULT PlatformWin32::WndProc(const HWND hwnd, const UINT msg, const WPARAM wPa
                                const LPARAM lParam)
 {
   PlatformWin32* platform = reinterpret_cast<PlatformWin32*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
+  // A host program's frame (Common/WindowFrame.h) sees every message first, and answers the ones that are the
+  // frame's: its size, what a point of it is, its drawing, its buttons.
+  if (const WindowFrame::Host& frame = WindowFrame::Get(); frame.message)
+  {
+    std::intptr_t answer = 0;
+    if (frame.message(hwnd, msg, wParam, lParam, &answer))
+      return static_cast<LRESULT>(answer);
+  }
   switch (msg)
   {
   case WM_NCCREATE:
@@ -368,12 +428,13 @@ LRESULT PlatformWin32::WndProc(const HWND hwnd, const UINT msg, const WPARAM wPa
     // F1 down would write a state every few milliseconds.
     if (wParam == VK_F1 && (static_cast<ULONG_PTR>(lParam) & (1u << 30)) == 0)
     {
-      platform->SaveStateToStatesDirectory();
+      if (platform->m_test_controls)
+        platform->SaveStateToStatesDirectory();
       return 0;
     }
     else if (wParam == VK_SPACE)
     {
-      Config::SetCurrent(Config::MAIN_EMULATION_SPEED, FAST_FORWARD_SPEED);
+      platform->SetFastForward(true);  // does nothing in a window without the test controls
       return 0;
     }
     else if (wParam == VK_F11)
@@ -395,7 +456,7 @@ LRESULT PlatformWin32::WndProc(const HWND hwnd, const UINT msg, const WPARAM wPa
   case WM_KEYUP:
     if (wParam == VK_SPACE)
     {
-      Config::SetCurrent(Config::MAIN_EMULATION_SPEED, 1.0f);
+      platform->SetFastForward(false);
       return 0;
     }
     break;
@@ -403,7 +464,8 @@ LRESULT PlatformWin32::WndProc(const HWND hwnd, const UINT msg, const WPARAM wPa
   case WM_KILLFOCUS:
     // Never leave emulation running fast because Space was released while
     // another window had focus and the key-up went elsewhere.
-    Config::SetCurrent(Config::MAIN_EMULATION_SPEED, 1.0f);
+    if (platform)
+      platform->SetFastForward(false);
     break;
 
   case WM_SYSKEYDOWN:
@@ -425,7 +487,20 @@ LRESULT PlatformWin32::WndProc(const HWND hwnd, const UINT msg, const WPARAM wPa
       break;
     const UINT command = LOWORD(wParam);
     auto& system = Core::System::GetInstance();
-    if (command == ID_SAVE_STATE)
+    // the two commands of every window first; the others are the test controls'
+    if (command == ID_MUTE)
+    {
+      Config::SetCurrent(Config::MAIN_AUDIO_MUTED, !Config::Get(Config::MAIN_AUDIO_MUTED));
+    }
+    else if (command == ID_FULLSCREEN)
+    {
+      platform->ToggleFullscreen();
+    }
+    else if (!platform->m_test_controls)
+    {
+      // a player's window: no saved state is written or loaded and the game is not paused, whoever sent the command
+    }
+    else if (command == ID_SAVE_STATE)
     {
       platform->SaveStateToStatesDirectory();
     }
@@ -433,14 +508,6 @@ LRESULT PlatformWin32::WndProc(const HWND hwnd, const UINT msg, const WPARAM wPa
     {
       const bool paused = Core::GetState(system) == Core::State::Paused;
       Core::SetState(system, paused ? Core::State::Running : Core::State::Paused);
-    }
-    else if (command == ID_MUTE)
-    {
-      Config::SetCurrent(Config::MAIN_AUDIO_MUTED, !Config::Get(Config::MAIN_AUDIO_MUTED));
-    }
-    else if (command == ID_FULLSCREEN)
-    {
-      platform->ToggleFullscreen();
     }
     else if (command >= ID_LOAD_STATE_FIRST && command <= ID_LOAD_STATE_LAST)
     {

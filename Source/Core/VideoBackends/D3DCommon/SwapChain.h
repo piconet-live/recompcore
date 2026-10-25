@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <string>
 #include <dxgi1_5.h>
 #include <wrl/client.h>
 
@@ -34,6 +35,9 @@ public:
   }
   u32 GetWidth() const { return m_width; }
   u32 GetHeight() const { return m_height; }
+
+  // What the swap chain is, in a few words for a host program's log.
+  std::string Describe() const;
 
   // Mode switches.
   bool GetFullscreen() const;
@@ -71,6 +75,7 @@ protected:
   bool m_stereo = false;
   bool m_hdr = false;
   bool m_allow_tearing_supported = false;
+  bool m_flip_model = false;
   bool m_has_fullscreen = false;
   bool m_fullscreen_request = false;
 };

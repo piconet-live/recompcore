@@ -47,6 +47,7 @@
 
 #include "Core/Core.h"
 #include "Core/HW/CPU.h"
+#include "Core/HostHooks.h"
 #include "Core/HW/GPFifo.h"
 #include "Core/HW/MMIO.h"
 #include "Core/HW/Memmap.h"
@@ -175,6 +176,9 @@ u32 MMU::Read_Opcode(u32 address)
 
 TryReadInstResult MMU::TryReadInstruction(u32 address)
 {
+  // Core/HostHooks.h: the host program's window has no memory to translate to; its code's words are the host's.
+  if (const HostHooks::Hooks& hooks = HostHooks::Get(); hooks.InWindow(address)) [[unlikely]]
+    return TryReadInstResult{true, true, static_cast<u32>(hooks.window_read(address, 4)), address};
   bool from_bat = true;
   if (m_ppc_state.msr.IR)
   {
@@ -208,6 +212,8 @@ TryReadInstResult MMU::TryReadInstruction(u32 address)
 template <std::unsigned_integral T>
 T MMU::Read(const u32 address)
 {
+  if (const HostHooks::Hooks& hooks = HostHooks::Get(); hooks.InWindow(address)) [[unlikely]]
+    return static_cast<T>(hooks.window_read(address, static_cast<u32>(sizeof(T))));
   T var = ReadFromHardware<XCheckTLBFlag::Read, T>(address);
   Memcheck(address, var, false, sizeof(T));
   return var;
@@ -222,6 +228,11 @@ template u64 MMU::Read<u64>(const u32 address);
 template <std::unsigned_integral T>
 void MMU::Write(const Common::MakeAtLeastU32<T> var, const u32 address)
 {
+  if (const HostHooks::Hooks& hooks = HostHooks::Get(); hooks.InWindow(address)) [[unlikely]]
+  {
+    hooks.window_write(address, var, static_cast<u32>(sizeof(T)));
+    return;
+  }
   Memcheck(address, var, true, sizeof(T));
   WriteToHardware<XCheckTLBFlag::Write>(address, var, sizeof(T));
 }
@@ -231,6 +242,11 @@ template void MMU::Write<u32>(const u32 var, const u32 address);
 template <>
 void MMU::Write<u64>(const u64 var, const u32 address)
 {
+  if (const HostHooks::Hooks& hooks = HostHooks::Get(); hooks.InWindow(address)) [[unlikely]]
+  {
+    hooks.window_write(address, var, 8);
+    return;
+  }
   Memcheck(address, var, true, 8);
   WriteToHardware<XCheckTLBFlag::Write>(address, static_cast<u32>(var >> 32), 4);
   WriteToHardware<XCheckTLBFlag::Write>(address + sizeof(u32), static_cast<u32>(var), 4);
@@ -650,10 +666,27 @@ void MMU::InvalidateTLBEntry(u32 address)
 
 
 
+// Core/HostHooks.h: main memory above the size the game was told stays mapped at its own addresses.
+static void MapRamAboveReported(BatTable& bat_table, u32 ram_size, const MemChecks& memchecks)
+{
+  const HostHooks::Hooks& hooks = HostHooks::Get();
+  if (!hooks.map_ram_above_reported || hooks.reported_ram_size == 0)
+    return;
+  for (u32 physical = hooks.reported_ram_size; physical < ram_size; physical += BAT_PAGE_SIZE)
+  {
+    const u32 virtual_address = 0x80000000 | physical;
+    u32 valid_bit = BAT_MAPPED_BIT | BAT_PHYSICAL_BIT;
+    if (memchecks.OverlapsMemcheck(virtual_address, BAT_PAGE_SIZE))
+      valid_bit &= ~BAT_PHYSICAL_BIT;
+    bat_table[virtual_address >> BAT_INDEX_SHIFT] = physical | valid_bit;
+  }
+}
+
 void MMU::DBATUpdated()
 {
   m_dbat_table = {};
   UpdateBATs(m_dbat_table, SPR_DBAT0U);
+  MapRamAboveReported(m_dbat_table, m_memory.GetRamSizeReal(), m_power_pc.GetMemChecks());
   bool extended_bats = m_system.IsWii() && HID4(m_ppc_state).SBE;
   if (extended_bats)
     UpdateBATs(m_dbat_table, SPR_DBAT4U);
@@ -682,6 +715,7 @@ void MMU::IBATUpdated()
 {
   m_ibat_table = {};
   UpdateBATs(m_ibat_table, SPR_IBAT0U);
+  MapRamAboveReported(m_ibat_table, m_memory.GetRamSizeReal(), m_power_pc.GetMemChecks());
   bool extended_bats = m_system.IsWii() && HID4(m_ppc_state).SBE;
   if (extended_bats)
     UpdateBATs(m_ibat_table, SPR_IBAT4U);

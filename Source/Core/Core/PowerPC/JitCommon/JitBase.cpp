@@ -115,7 +115,16 @@ JitBase::~JitBase()
 
 bool JitBase::DoesConfigNeedRefresh() const
 {
-  return std::ranges::any_of(JIT_SETTINGS, [this](const auto& pair) {
+  // Under the StaticRecomp core RefreshConfig forces the two fast-memory copies off whatever the settings say, so
+  // comparing them with the settings reported a difference at every change of ANY setting (emulation speed, the
+  // CPU clock), and each such change emptied the fallback JIT and put every chunk of the module back to "to be
+  // checked" (0.6 s, twice: this core's callback and the fallback's). Compiled code cannot depend on a setting
+  // that is forced; every other setting of the list still gets its refresh.
+  const bool forced_off = Config::Get(Config::MAIN_CPU_CORE) == PowerPC::CPUCore::StaticRecomp;
+  return std::ranges::any_of(JIT_SETTINGS, [this, forced_off](const auto& pair) {
+    if (forced_off && (pair.second == &Config::MAIN_FASTMEM ||
+                       pair.second == &Config::MAIN_PAGE_TABLE_FASTMEM))
+      return false;
     return this->*pair.first != Config::Get(*pair.second);
   });
 }

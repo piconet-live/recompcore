@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
+#include "Common/RunSettings.h"
 #include "Core/System.h"
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
@@ -9,13 +10,20 @@
 #include "Core/PowerPC/Interpreter/Interpreter.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompLockstep.h"
 #include "Core/HW/GPFifo.h"
+#include "Core/HW/Memmap.h"
 #include "Core/HW/SystemTimers.h"
 #include "Common/Logging/Log.h"
 
 #include <cstdio>
+#include <cstdlib>
+#include <intrin.h>
+#include "Core/FzgxProbe.h"
+#include "Core/HostHooks.h"
+namespace { struct FzTimer { u64 t = __rdtsc(); ~FzTimer() { FzgxProbe::g_interp_tsc += __rdtsc() - t; } }; }
 
 namespace
 {
+inline StaticRecompCore* core_of(CPUState* cpu) { return static_cast<StaticRecompCore*>(cpu->external_user_data); }
 constexpr u32 LOCKED_CACHE_BASE = 0xE0000000u;
 }
 
@@ -28,12 +36,37 @@ bool StaticRecompCore::HookHostCall(CPUState* cpu, u32 address)
 
 u64 StaticRecompCore::HookExternalRead(CPUState* cpu, u32 ea, u8 size)
 {
+  ++FzgxProbe::g_ext[ea >> 28];
+  // Spike fast path: the locked L1 cache (0xE0000000, GX's scratchpad) straight from Dolphin's backing store.
+  if ((ea >> 28) == 0xEu)
+  {
+    auto& memory = core_of(cpu)->m_system.GetMemory();
+    const u32 off = ea - 0xE0000000u;
+    if (memory.GetL1Cache() && off + size <= memory.GetL1CacheSize())
+    {
+      const u8* p = memory.GetL1Cache() + off;
+      u64 v = 0;
+      for (u8 i = 0; i < size; ++i)
+        v = (v << 8) | p[i];
+      FzgxProbe::Census(3);
+      return v;
+    }
+  }
+  // The host program's window (Core/HostHooks.h): its data is the host's, answered here before anything of the
+  // emulated machine is asked (the MMU would answer the same, after the bookkeeping of a hardware access).
+  if (const HostHooks::Hooks& hooks = HostHooks::Get(); hooks.InWindow(ea))
+    return hooks.window_read(ea, size);
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
   ea = core->TranslateRelAddress(ea);
   if (ea == 0)
     std::fprintf(stderr, "[zero-access] read size=%u guest_pc=%08x ppc_pc=%08x lr=%08x\n", size,
                  cpu->pc, core->m_system.GetPPCState().pc, cpu->lr);
+  FzgxProbe::Census(2);
+  FzgxProbe::CensusAccess(cpu->pc, ea, false);
+  struct ReadTimer { u64 t = __rdtsc(); ~ReadTimer() { if (FzgxProbe::g_census_task >= 0) FzgxProbe::g_census_read_tsc[FzgxProbe::g_census_task] += __rdtsc() - t; } } read_timer;
   core->PropagateGuestMSR();
+  core->FlushDispatchCharge();
+  struct Refresh { StaticRecompCore* c; ~Refresh() { c->RefreshDispatchBudget(); } } refresh{core};
   auto& mmu = core->m_system.GetMMU();
   u64 value;
   switch (size)
@@ -64,6 +97,42 @@ u64 StaticRecompCore::HookExternalRead(CPUState* cpu, u32 ea, u8 size)
 
 void StaticRecompCore::HookExternalWrite(CPUState* cpu, u32 ea, u64 value, u8 size)
 {
+  struct WriteTimer
+  {
+    u64 t = FzgxProbe::g_census_on ? __rdtsc() : 0;
+    bool gather = false;
+    ~WriteTimer()
+    {
+      if (!FzgxProbe::g_census_on)
+        return;
+      const u64 d = __rdtsc() - t;
+      if (gather) { FzgxProbe::g_gather_tsc += d; ++FzgxProbe::g_gather_writes; }
+      else { FzgxProbe::g_hwwrite_tsc += d; ++FzgxProbe::g_hwwrite_count; }
+    }
+  } write_timer;
+  ++FzgxProbe::g_ext[16 + (ea >> 28)];
+  if ((ea >> 28) == 0xEu)
+  {
+    auto& memory = core_of(cpu)->m_system.GetMemory();
+    const u32 off = ea - 0xE0000000u;
+    if (memory.GetL1Cache() && off + size <= memory.GetL1CacheSize())
+    {
+      u8* p = memory.GetL1Cache() + off;
+      for (u8 i = size; i > 0; --i)
+      {
+        p[i - 1] = static_cast<u8>(value);
+        value >>= 8;
+      }
+      FzgxProbe::Census(6);
+      return;
+    }
+  }
+  // the host program's window: see HookExternalRead
+  if (const HostHooks::Hooks& hooks = HostHooks::Get(); hooks.InWindow(ea))
+  {
+    hooks.window_write(ea, value, size);
+    return;
+  }
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
   ea = core->TranslateRelAddress(ea);
   if (ea == 0)
@@ -75,8 +144,12 @@ void StaticRecompCore::HookExternalWrite(CPUState* cpu, u32 ea, u64 value, u8 si
   // special case without an MMU round trip. Keying on the effective page is
   // the same shortcut Dolphin's JITs take (optimizeGatherPipe). GPFifo
   // maintains ppc_state.gather_pipe_ptr internally.
+  core->FlushDispatchCharge();
+  struct Refresh { StaticRecompCore* c; ~Refresh() { c->RefreshDispatchBudget(); } } refresh{core};
   if ((ea & 0xFFFFF000) == 0xCC008000u)
   {
+    FzgxProbe::Census(4);
+    write_timer.gather = true;
     if (core->m_lockstep_verifier->m_ls_journaling)
       core->m_lockstep_verifier->m_journal.native_mmio.push_back({ea, static_cast<u32>(value), size});
     auto& gpfifo = core->m_system.GetGPFifo();
@@ -108,6 +181,8 @@ void StaticRecompCore::HookExternalWrite(CPUState* cpu, u32 ea, u64 value, u8 si
   {
     core->m_lockstep_verifier->m_journal.native_mmio.push_back({ea, static_cast<u32>(value), size});
   }
+  FzgxProbe::Census(5);
+  FzgxProbe::CensusAccess(cpu->pc, ea, true);
   switch (size)
   {
   case 1:
@@ -128,6 +203,33 @@ void StaticRecompCore::HookExternalWrite(CPUState* cpu, u32 ea, u64 value, u8 si
   }
 }
 
+void StaticRecompCore::HookGatherPipeFlush(CPUState* cpu)
+{
+  auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
+  ++FzgxProbe::g_gather_flushes;
+  core->FlushDispatchCharge();
+  core->m_system.GetGPFifo().FastCheckGatherPipe();
+  core->RefreshDispatchBudget();
+}
+
+// Hands the module the write-gather pipe (or takes it away): the address of Dolphin's pipe pointer, the start of
+// the pipe buffer and the flush hook. Not while the lockstep verifier journals hardware writes, which must all
+// pass through HookExternalWrite. FZGX_GATHER_INLINE=0 keeps every pipe write on the hook (for comparisons).
+void StaticRecompCore::PublishGatherPipe()
+{
+  if (!m_set_gather_pipe)
+    return;
+  auto& ppc = m_system.GetPPCState();
+  const char* off = RunSettings::Get("FZGX_GATHER_INLINE");
+  const bool inline_ok = !(off && off[0] == '0') && !m_lockstep_verifier->IsEnabled() &&
+                         ppc.gather_pipe_base_ptr != nullptr;
+  if (inline_ok)
+    m_set_gather_pipe(&ppc.gather_pipe_ptr, ppc.gather_pipe_base_ptr, &HookGatherPipeFlush);
+  else
+    m_set_gather_pipe(nullptr, nullptr, nullptr);
+  std::fprintf(stderr, "[staticrecomp] gather pipe written by generated code: %s\n", inline_ok ? "yes" : "no");
+}
+
 u32 StaticRecompCore::HookExternalRead32(CPUState* cpu, u32 ea, u8 rid)
 {
   // eciwx external-control read. EAR-enable and alignment were checked by the
@@ -136,6 +238,8 @@ u32 StaticRecompCore::HookExternalRead32(CPUState* cpu, u32 ea, u8 rid)
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
   ea = core->TranslateRelAddress(ea);
   core->PropagateGuestMSR();
+  core->FlushDispatchCharge();
+  struct Refresh { StaticRecompCore* c; ~Refresh() { c->RefreshDispatchBudget(); } } refresh{core};
   auto& mmu = core->m_system.GetMMU();
   const u32 value = mmu.Read<u32>(ea);
   if (core->m_lockstep_verifier->m_ls_journaling &&
@@ -152,6 +256,8 @@ void StaticRecompCore::HookExternalWrite32(CPUState* cpu, u32 ea, u32 value, u8 
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
   ea = core->TranslateRelAddress(ea);
   core->PropagateGuestMSR();
+  core->FlushDispatchCharge();
+  struct Refresh { StaticRecompCore* c; ~Refresh() { c->RefreshDispatchBudget(); } } refresh{core};
   auto& mmu = core->m_system.GetMMU();
   if (core->m_lockstep_verifier->m_ls_journaling &&
       StaticRecompLockstep::LsHwAccessInScope(mmu, ea))
@@ -180,6 +286,7 @@ void* StaticRecompCore::HookExternalPointer(CPUState* cpu, u32 ea, u32 size)
 
 u32 StaticRecompCore::HookSPRRead(CPUState* cpu, u16 spr, u32 cia)
 {
+  FzgxProbe::Census(8);
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
   auto& ppc = core->m_system.GetPPCState();
   if (spr >= 1024)
@@ -218,6 +325,7 @@ u32 StaticRecompCore::HookSPRRead(CPUState* cpu, u16 spr, u32 cia)
 
 void StaticRecompCore::HookSPRWrite(CPUState* cpu, u16 spr, u32 value, u32 cia)
 {
+  FzgxProbe::Census(9);
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
   auto& system = core->m_system;
   auto& ppc = system.GetPPCState();
@@ -364,9 +472,11 @@ void StaticRecompCore::HookCacheControl(CPUState* cpu, u8 operation, u32 ea, u32
 
 void StaticRecompCore::HookInstructionFallback(CPUState* cpu, u32 raw, u32 cia)
 {
+  FzgxProbe::Census(7);
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
   cia = core->TranslateRelAddress(cia);
   ++core->m_hook_fallback_instructions;
+  FzgxProbe::PaceEvent(1, cia);
 
   // Lockstep: a block that fell back to the interpreter for an unmodeled
   // instruction (DMA mtspr, cache op, ...) performed side effects not captured
@@ -400,6 +510,21 @@ void StaticRecompCore::HookInstructionFallback(CPUState* cpu, u32 raw, u32 cia)
       // These bypass SingleStepInner, so charge Dolphin's PPCTables cost
       // here (icbi 4, dcbf/dcbst/dcbi 5); their emitted block cost is zero.
       ppc.downcount -= (xo == 982u) ? 4 : 5;
+      cpu->pc = cia + 4u;
+      return;
+    }
+  }
+
+  // Spike fast path: mfspr of BATs, SPRGs, HID0 and HID1 only copies a value
+  // that the native state does not mirror; no SyncOut/interpreter round trip.
+  if ((raw >> 26) == 31u && ((raw >> 1) & 0x3FFu) == 339u)
+  {
+    const u32 spr = (((raw >> 11) & 0x1Fu) << 5) | ((raw >> 16) & 0x1Fu);
+    if ((spr >= 528u && spr <= 543u) || (spr >= 560u && spr <= 575u) ||
+        (spr >= 272u && spr <= 275u) || spr == 1008u || spr == 1009u)
+    {
+      cpu->gpr[(raw >> 21) & 31u] = ppc.spr[spr];
+      ppc.downcount -= 1;
       cpu->pc = cia + 4u;
       return;
     }

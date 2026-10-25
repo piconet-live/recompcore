@@ -21,6 +21,7 @@
 #include "Core/Core.h"
 #include "Core/Debugger/BranchWatch.h"
 #include "Core/HLE/HLE.h"
+#include "Core/HostHooks.h"
 #include "Core/HW/DVD/AMMediaboard.h"
 #include "Core/HW/DVD/DVDInterface.h"
 #include "Core/HW/EXI/EXI_DeviceIPL.h"
@@ -251,8 +252,12 @@ void CBoot::SetupGCMemory(Core::System& system, const Core::CPUThreadGuard& guar
   // Booted from bootrom. 0xE5207C22 = booted from jtag
   PowerPC::MMU::HostWrite<u32>(guard, 0x0D15EA5E, 0x80000020);
 
-  // Physical Memory Size (24MB on retail)
-  PowerPC::MMU::HostWrite<u32>(guard, memory.GetRamSizeReal(), 0x80000028);
+  // Physical Memory Size (24MB on retail). A host program may tell the game less than is emulated (Core/HostHooks.h):
+  // the game then lays itself out in that much and never touches the memory above.
+  u32 reported_ram = memory.GetRamSizeReal();
+  if (const u32 told = HostHooks::Get().reported_ram_size; told != 0 && told < reported_ram)
+    reported_ram = told;
+  PowerPC::MMU::HostWrite<u32>(guard, reported_ram, 0x80000028);
 
   // Console type - DevKit  (retail ID == 0x00000003) see YAGCD 4.2.1.1.2
   // TODO: determine why some games fail when using a retail ID.

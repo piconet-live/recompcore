@@ -9,6 +9,7 @@
 #include <imgui.h>
 
 #include "Core/DolphinAnalytics.h"
+#include "Core/FzgxProbe.h"
 #include "Core/HW/SystemTimers.h"
 #include "Core/System.h"
 
@@ -27,6 +28,7 @@ static bool clear_scissors;
 
 void Statistics::ResetFrame()
 {
+  FzgxProbe::PaceFrameCountsEnd();  // (the pacing log's counts of whole frames carry what this frame counted)
   this_frame = {};
   clear_scissors = true;
   if (scissors.size() > 1)

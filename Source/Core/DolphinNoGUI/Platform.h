@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <string>
 
@@ -65,6 +66,7 @@ protected:
   Common::Flag m_save_state_requested{false};
   Common::Flag m_load_state_requested{false};
 
-  bool m_window_focus = true;  // Should be made atomic if actually implemented
+  // Written by the window's thread, asked by the threads that read input (Host_RendererHasFocus).
+  std::atomic<bool> m_window_focus{true};
   bool m_window_fullscreen = false;
 };

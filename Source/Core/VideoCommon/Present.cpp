@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "VideoCommon/Present.h"
+#include "Core/FzgxProbe.h"
 
 #include "Common/ChunkFile.h"
 #include "Core/Config/GraphicsSettings.h"
@@ -227,6 +228,11 @@ void Presenter::ImmediateSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_
     return;
   }
 
+  // Held pictures keep their own XFB (HeldSwap), so the fetch below replaces none of them; when the queue is full
+  // the oldest is shown first, at once
+  if (m_held_swaps.size() >= MOST_HELD)
+    PresentOldestHeld();
+
   const u64 ticks = m_next_swap_estimated_ticks;
 
   FetchXFB(xfb_addr, fb_width, fb_stride, fb_height, ticks);
@@ -238,13 +244,122 @@ void Presenter::ImmediateSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_
       .emulated_timestamp = ticks,
       .intended_present_time = m_next_swap_estimated_time,
   };
+  m_last_true_moment = present_info.intended_present_time;
 
+  std::optional<TimePoint> due;
+  {
+    std::lock_guard<std::mutex> guard(s_hold_mutex);
+    if (s_hold)
+      due = s_hold(present_info);
+  }
+  if (due)
+  {
+    // the picture takes its XFB (and its content lock) with it: the presenter's own is empty until it is shown
+    m_held_swaps.push_back(HeldSwap{present_info, *due, std::move(m_xfb_entry), m_xfb_rect, m_last_xfb_id,
+                                    m_last_xfb_ticks, m_last_xfb_addr, m_last_xfb_width, m_last_xfb_stride,
+                                    m_last_xfb_height});
+    m_xfb_entry = {};
+    return;
+  }
+
+  // a picture with no time of its own comes after the held ones: they are shown first, at once, in their order
+  if (!m_held_swaps.empty())
+  {
+    HeldSwap now{present_info, Clock::now(), std::move(m_xfb_entry), m_xfb_rect, m_last_xfb_id, m_last_xfb_ticks,
+                 m_last_xfb_addr, m_last_xfb_width, m_last_xfb_stride, m_last_xfb_height};
+    m_xfb_entry = {};
+    while (!m_held_swaps.empty())
+      PresentOldestHeld();
+    m_held_swaps.push_back(std::move(now));
+    PresentOldestHeld();
+    return;
+  }
+
+  FinishImmediateSwap(present_info);
+}
+
+void Presenter::PresentOldestHeld()
+{
+  HeldSwap held = std::move(m_held_swaps.front());
+  m_held_swaps.pop_front();
+  ReleaseXFBContentLock();
+  m_xfb_entry = std::move(held.xfb_entry);
+  m_xfb_rect = held.xfb_rect;
+  m_last_xfb_id = held.xfb_id;
+  m_last_xfb_ticks = held.xfb_ticks;
+  m_last_xfb_addr = held.xfb_addr;
+  m_last_xfb_width = held.xfb_width;
+  m_last_xfb_stride = held.xfb_stride;
+  m_last_xfb_height = held.xfb_height;
+  FinishImmediateSwap(held.info);
+}
+
+std::mutex Presenter::s_hold_mutex;
+Presenter::HoldUntil Presenter::s_hold;
+
+void Presenter::SetImmediateSwapHold(HoldUntil hold)
+{
+  std::lock_guard<std::mutex> guard(s_hold_mutex);
+  s_hold = std::move(hold);
+}
+
+bool Presenter::HoldsPictures() const
+{
+  std::lock_guard<std::mutex> guard(s_hold_mutex);
+  return static_cast<bool>(s_hold);
+}
+
+std::optional<TimePoint> Presenter::PresentHeldSwap()
+{
+  while (!m_held_swaps.empty())
+  {
+    if (Clock::now() < m_held_swaps.front().due)
+      return m_held_swaps.front().due;
+    PresentOldestHeld();
+  }
+  return std::nullopt;
+}
+
+void Presenter::PresentInBetween(RcTcacheEntry entry, const MathUtil::Rectangle<int>& rect, float fraction)
+{
+  if (!entry)
+    return;
+  if (m_held_swaps.size() >= MOST_HELD)
+    PresentOldestHeld();
+  entry->AcquireContentLock();  // (released as a fetched XFB's is, when the next picture is shown)
+  PresentInfo present_info{
+      .frame_count = m_frame_count++,
+      .present_count = m_present_count++,
+      .reason = PresentInfo::PresentReason::Immediate,
+      .emulated_timestamp = m_last_xfb_ticks,
+      .intended_present_time = Clock::now(),
+  };
+  present_info.in_between = fraction;
+  std::optional<TimePoint> due;
+  {
+    std::lock_guard<std::mutex> guard(s_hold_mutex);
+    if (s_hold)
+      due = s_hold(present_info);
+  }
+  const u64 id = entry->id;
+  m_held_swaps.push_back(HeldSwap{present_info, due ? *due : Clock::now(), std::move(entry), rect, id,
+                                  m_last_xfb_ticks, m_last_xfb_addr, m_last_xfb_width, m_last_xfb_stride,
+                                  m_last_xfb_height});
+  if (!due)
+  {
+    while (!m_held_swaps.empty())
+      PresentOldestHeld();
+  }
+}
+
+void Presenter::FinishImmediateSwap(PresentInfo& present_info)
+{
   auto& video_events = GetVideoEvents();
 
   video_events.before_present_event.Trigger(present_info);
 
   Present(&present_info);
-  ProcessFrameDumping(ticks);
+  ProcessFrameDumping(present_info.emulated_timestamp);
 
   video_events.after_present_event.Trigger(present_info);
 }
@@ -954,6 +1069,7 @@ void Presenter::Present(PresentInfo* present_info)
   {
     std::lock_guard<std::mutex> guard(m_swap_mutex);
 
+    const unsigned long long fzgx_before_wait = FzgxProbe::PaceClock();
     if (present_info != nullptr)
     {
       const auto present_time = GetUpdatedPresentationTime(present_info->intended_present_time);
@@ -965,7 +1081,9 @@ void Presenter::Present(PresentInfo* present_info)
       present_info->present_time_accuracy = PresentInfo::PresentTimeAccuracy::PresentInProgress;
     }
 
+    const unsigned long long fzgx_after_wait = FzgxProbe::PaceClock();
     g_gfx->PresentBackbuffer();
+    FzgxProbe::PacePresent(fzgx_before_wait, fzgx_after_wait);
   }
 
   if (m_xfb_entry)

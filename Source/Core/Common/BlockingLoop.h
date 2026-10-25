@@ -3,8 +3,11 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 #include "Common/Event.h"
@@ -131,6 +134,7 @@ public:
 
     while (!m_shutdown.IsSet())
     {
+      m_wake_by.reset();
       payload();
 
       switch (m_running_state.load())
@@ -176,6 +180,20 @@ public:
         [[fallthrough]];
 
       case STATE_SLEEPING:
+        // A time the payload asked for (WakeBy) ends the sleep, and close to it the loop does not sleep at all
+        if (m_wake_by)
+        {
+          const auto left = *m_wake_by - std::chrono::steady_clock::now() - WAKE_SPIN;
+          if (left <= left.zero())
+          {
+            std::this_thread::yield();
+            break;
+          }
+          m_new_work_event.WaitFor(timeout > 0 ? std::min<std::chrono::steady_clock::duration>(
+                                                     left, std::chrono::milliseconds(timeout)) :
+                                                 left);
+          break;
+        }
         // Just relax
         if (timeout > 0)
         {
@@ -228,6 +246,15 @@ public:
 
   bool IsRunning() const { return !m_stopped.IsSet() && !m_shutdown.IsSet(); }
   bool IsDone() const { return m_stopped.IsSet() || m_running_state.load() <= STATE_DONE; }
+  // Called by the payload, on the loop's thread: the loop's next sleep ends by this time at the latest (new work
+  // still ends it at once), and within WAKE_SPIN of the time the loop does not sleep but runs the payload again,
+  // as a sleep's wake-up may come a timer period late. For the next sleep only: each run of the payload asks anew.
+  void WakeBy(std::chrono::steady_clock::time_point time)
+  {
+    if (!m_wake_by || time < *m_wake_by)
+      m_wake_by = time;
+  }
+
   // This function should be triggered regularly over time so
   // that we will fall back from the busy loop to sleeping.
   void AllowSleep() { m_may_sleep.Set(); }
@@ -253,5 +280,8 @@ private:
 
   Flag m_may_sleep;  // If this is set, we fall back from the busy loop to an event based
                      // synchronization.
+
+  static constexpr std::chrono::microseconds WAKE_SPIN{2000};
+  std::optional<std::chrono::steady_clock::time_point> m_wake_by;  // the loop's thread only (WakeBy)
 };
 }  // namespace Common

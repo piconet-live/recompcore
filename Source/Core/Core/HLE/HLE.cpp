@@ -20,14 +20,25 @@
 #include "Core/PowerPC/PPCSymbolDB.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
+#include "Core/FzgxProbe.h"
+#include "Core/HostHooks.h"
 
 namespace HLE
 {
 // Map addresses to the HLE hook index
 static std::map<u32, u32> s_hooked_addresses;
 
+// The host program's function (Core/HostHooks.h): runs it and returns to the caller.
+static void HostHookCall(const Core::CPUThreadGuard& guard)
+{
+  if (const auto& call = HostHooks::Get().call)
+    call(guard);
+  auto& ppc_state = guard.GetSystem().GetPPCState();
+  ppc_state.npc = LR(ppc_state);
+}
+
 // clang-format off
-constexpr std::array<Hook, 23> os_patches{{
+constexpr std::array<Hook, 26> os_patches{{
     // Placeholder, os_patches[0] is the "non-existent function" index
     {"FAKE_TO_SKIP_0",               HLE_Misc::UnimplementedFunction,       HookType::Replace, HookFlag::Generic},
 
@@ -59,7 +70,10 @@ constexpr std::array<Hook, 23> os_patches{{
 
     {"GeckoCodehandler",             HLE_Misc::GeckoCodeHandlerICacheFlush, HookType::Start,   HookFlag::Fixed},
     {"GeckoHandlerReturnTrampoline", HLE_Misc::GeckoReturnTrampoline,       HookType::Replace, HookFlag::Fixed},
-    {"AppLoaderReport",              HLE_OS::HLE_GeneralDebugPrint,         HookType::Start,   HookFlag::Fixed} // apploader needs OSReport-like function
+    {"AppLoaderReport",              HLE_OS::HLE_GeneralDebugPrint,         HookType::Start,   HookFlag::Fixed}, // apploader needs OSReport-like function
+    {"FzgxProfTaskStart",            FzgxProbe::HLE_TaskStart,              HookType::Start,   HookFlag::Fixed}, // spike probe
+    {"FzgxProfTaskEnd",              FzgxProbe::HLE_TaskEnd,                HookType::Start,   HookFlag::Fixed}, // spike probe
+    {"HostHookCall",                 HostHookCall,                          HookType::Replace, HookFlag::Fixed}  // Core/HostHooks.h
 }};
 // clang-format on
 
@@ -105,6 +119,10 @@ void PatchFixedFunctions(Core::System& system)
   // This has to always be installed even if cheats are not enabled because of the possibility of
   // loading a savestate where PC is inside the code handler while cheats are disabled.
   Patch(system, Gecko::HLE_TRAMPOLINE_ADDRESS, "GeckoHandlerReturnTrampoline");
+
+  // The host program's function at its guest address (Core/HostHooks.h).
+  if (const HostHooks::Hooks& hooks = HostHooks::Get(); hooks.call && hooks.call_address != 0)
+    Patch(system, hooks.call_address, "HostHookCall");
 }
 
 void PatchFunctions(Core::System& system)

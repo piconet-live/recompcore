@@ -64,6 +64,9 @@ public:
   // Is exclusive fullscreen supported?
   bool IsFullscreenSupported() const { return m_fullscreen_supported; }
 
+  // The present mode the swap chain was created with (a host program's log names it).
+  VkPresentModeKHR GetPresentMode() const { return m_present_mode; }
+
   // Retrieves the "next" fullscreen state. Safe to call off-thread.
   bool GetCurrentFullscreenState() const { return m_current_fullscreen_state; }
   bool GetNextFullscreenState() const { return m_next_fullscreen_state; }

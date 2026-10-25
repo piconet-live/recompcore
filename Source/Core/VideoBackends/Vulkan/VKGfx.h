@@ -80,6 +80,7 @@ public:
   void PresentBackbuffer() override;
   void SetFullscreen(bool enable_fullscreen) override;
   bool IsFullscreen() const override;
+  std::string DescribeSwapChain() const override;
 
   SurfaceInfo GetSurfaceInfo() const override;
 

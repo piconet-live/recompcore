@@ -230,6 +230,8 @@ private:
                       const AbstractPipeline* current_pipeline);
   void UpdatePipelineConfig();
   void UpdatePipelineObject();
+  // Starts a batch: in the backend's stream (ResetBuffer), or in the CPU buffers while FrameRedraw records.
+  void StartBatch(u32 stride);
 
   const AbstractPipeline*
   GetCustomPipeline(const CustomPixelShaderContents& custom_pixel_shader_contents,
@@ -238,6 +240,8 @@ private:
                     const AbstractPipeline* current_pipeline) const;
 
   bool m_is_flushed = true;
+  bool m_batch_on_cpu = false;  // the batch is built in the CPU buffers (StartBatch)
+  std::vector<u16> m_batch_indices;
   FlushStatistics m_flush_statistics = {};
 
   // CPU access tracking
@@ -253,6 +257,9 @@ private:
 
   Common::EventHook m_frame_end_event;
   Common::EventHook m_after_present_event;
+
+  // FrameRedraw's replay uploads its recorded constants and vertices through the backend's own paths
+  friend struct FrameRedrawAccess;
 };
 
 extern std::unique_ptr<VertexManagerBase> g_vertex_manager;

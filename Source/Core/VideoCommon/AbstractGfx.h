@@ -10,6 +10,7 @@
 
 #include <array>
 #include <memory>
+#include <string>
 #include <vector>
 
 class AbstractFramebuffer;
@@ -70,6 +71,9 @@ public:
   }
   virtual void SetFullscreen(bool enable_fullscreen) {}
   virtual bool IsFullscreen() const { return false; }
+  // What the swap chain is, in a few words for a host program's log: the present mode, and what the backend can do
+  // about tearing or a full screen of its own. Empty: this backend does not say. On the thread that presents.
+  virtual std::string DescribeSwapChain() const { return {}; }
   virtual void BeginUtilityDrawing();
   virtual void EndUtilityDrawing();
   virtual std::unique_ptr<AbstractTexture> CreateTexture(const TextureConfig& config,
@@ -139,6 +143,8 @@ public:
 
   // Stores the last viewport and scissor, the stored data is restored in 'EndUtilityDrawing'
   void StoreViewportAndScissor(const ViewportAndScissor& viewport_and_scissor);
+  // The last stored viewport and scissor: the GX draws' own (FrameRedraw records them)
+  const ViewportAndScissor& GetViewportAndScissor() const { return m_viewport_and_scissor; }
 
   // Sets viewport and scissor to the specified rectangle. rect is assumed to be in framebuffer
   // coordinates, i.e. lower-left origin in OpenGL.

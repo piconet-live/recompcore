@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "VideoBackends/Vulkan/VKTexture.h"
+#include "Core/FzgxProbe.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -45,6 +46,9 @@ VKTexture::VKTexture(const TextureConfig& tex_config, VmaAllocation alloc, VkIma
 
 VKTexture::~VKTexture()
 {
+  if (m_alloc != VK_NULL_HANDLE)
+    FzgxProbe::PaceTexture("given up", FzgxProbe::PaceClock(), m_config.width, m_config.height, m_config.layers,
+                           m_config.levels, static_cast<u32>(m_config.format), m_config.samples);
   StateTracker::GetInstance()->UnbindTexture(m_view);
   g_command_buffer_mgr->DeferImageViewDestruction(m_view);
 
@@ -57,6 +61,15 @@ VKTexture::~VKTexture()
 
 std::unique_ptr<VKTexture> VKTexture::Create(const TextureConfig& tex_config, std::string_view name)
 {
+  struct FzgxMade
+  {
+    const TextureConfig& c;
+    unsigned long long start = FzgxProbe::PaceClock();
+    ~FzgxMade()
+    {
+      FzgxProbe::PaceTexture("made", start, c.width, c.height, c.layers, c.levels, static_cast<u32>(c.format), c.samples);
+    }
+  } fzgx_made{tex_config};
   // Determine image usage, we need to flag as an attachment if it can be used as a rendertarget.
   VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                             VK_IMAGE_USAGE_SAMPLED_BIT;

@@ -3,6 +3,9 @@
 
 #include "Core/HW/SI/SI_DeviceGCController.h"
 
+#include <cstdio>
+#include "Core/FzgxProbe.h"
+
 #include "Common/ChunkFile.h"
 #include "Common/CommonTypes.h"
 #include "Common/Logging/Log.h"
@@ -150,6 +153,7 @@ GCPadStatus CSIDevice_GCController::GetPadStatus()
   }
 
   HandleMoviePadStatus(m_system.GetMovie(), m_device_number, &pad_status);
+  FzgxProbe::OverridePad(m_device_number, &pad_status);
 
   // Our GCAdapter code sets PAD_GET_ORIGIN when a new device has been connected.
   // Watch for this to calibrate real controllers on connection.
@@ -167,7 +171,11 @@ GCPadStatus CSIDevice_GCController::GetPadStatus()
 //  |_ ERR_STATUS (error on last GetData or SendCmd?)
 DataResponse CSIDevice_GCController::GetData(u32& hi, u32& low)
 {
+  if (m_device_number == 0)
+    FzgxProbe::OnPadRead(m_system);
   GCPadStatus pad_status = GetPadStatus();
+  if (m_device_number == 0 && FzgxProbe::g_pace_on)
+    FzgxProbe::PacePad(pad_status);
 
   if (!pad_status.isConnected)
     return DataResponse::ErrorNoResponse;
@@ -281,6 +289,12 @@ CSIDevice_GCController::HandleButtonCombos(const GCPadStatus& pad_status)
 
 void CSIDevice_GCController::SetOrigin(const GCPadStatus& pad_status)
 {
+  // For a player's report (the runner's log): where this pad's sticks stood when their rest position was taken, at
+  // its connection or by X+Y+Start held for three seconds. A stick held then reads as pushed the other way at rest.
+  std::fprintf(stderr, "[pad] port %d: rest position taken: stick %u,%u  C-stick %u,%u  triggers %u,%u (128 is a "
+                       "stick's centre)\n",
+               m_device_number + 1, pad_status.stickX, pad_status.stickY, pad_status.substickX, pad_status.substickY,
+               pad_status.triggerLeft, pad_status.triggerRight);
   m_origin.origin_stick_x = pad_status.stickX;
   m_origin.origin_stick_y = pad_status.stickY;
   m_origin.substick_x = pad_status.substickX;

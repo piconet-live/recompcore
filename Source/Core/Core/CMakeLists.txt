@@ -69,6 +69,8 @@ add_library(core
   Config/ConfigManager.cpp
   Config/ConfigManager.h
   Core.cpp
+  FzgxProbe.cpp
+  FzgxProbe.h
   Core.h
   CoreJobs.cpp
   CoreScreenshot.cpp
@@ -925,6 +927,11 @@ endif()
 if(MSVC)
   # Add precompiled header
   target_link_libraries(core PRIVATE use_pch)
+endif()
+
+if(NOT MSVC)
+  # <intrin.h> for the files that include it (NonMSVC/intrin.h)
+  target_include_directories(core PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/NonMSVC")
 endif()
 
 if(USE_RETRO_ACHIEVEMENTS)

@@ -1,7 +1,11 @@
 // RecompCore: StaticRecomp CPU core - SMC and chunk validation.
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
+#include "Common/RunSettings.h"
+#include "Core/FzgxProbe.h"
+#include "Core/HostHooks.h"
 #include "Core/System.h"
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/JitInterface.h"
@@ -96,6 +100,8 @@ void StaticRecompCore::RefreshRelSections()
     if (m_chunk_state[i] == CHUNK_FAILED && m_failed_chunks != 0)
       --m_failed_chunks;
     m_chunk_state[i] = CHUNK_UNVERIFIED;
+    PublishChunkState(i);
+    m_busy_wait_cache.clear();
     m_effective_chunk_hashes[i] = m_module->chunk_hashes[i];
   }
 }
@@ -164,16 +170,29 @@ int StaticRecompCore::GetAddressLookupIndex(u32 address) const
     return static_cast<int>((address - 0x80000000u) >> 2);
   if (address >= 0x90000000u && address < 0x90000000u + m_lookup_exram_size)
     return static_cast<int>((m_lookup_ram_size >> 2) + ((address - 0x90000000u) >> 2));
+  // the host program's window: checked after memory, which is every other address there is
+  if (address >= m_lookup_window_start && address < m_lookup_window_end)
+    return static_cast<int>((m_lookup_ram_size >> 2) + (m_lookup_exram_size >> 2) +
+                            ((address - m_lookup_window_start) >> 2));
   return -1;
 }
 
 void StaticRecompCore::InitLookupTable(u32 ram_size, u32 exram_size)
 {
-  if (m_lookup_ram_size == ram_size && m_lookup_exram_size == exram_size)
+  const HostHooks::Hooks& hooks = HostHooks::Get();
+  // A window that begins inside main memory or the extended memory is not one (those addresses are memory's).
+  const bool window = hooks.window_end > hooks.window_start && hooks.window_start >= 0x80000000u + ram_size &&
+                      !(hooks.window_start >= 0x90000000u && hooks.window_start < 0x90000000u + exram_size);
+  const u32 window_start = window ? hooks.window_start : 0;
+  const u32 window_end = window ? hooks.window_end : 0;
+  if (m_lookup_ram_size == ram_size && m_lookup_exram_size == exram_size &&
+      m_lookup_window_start == window_start && m_lookup_window_end == window_end)
     return;
 
   m_lookup_ram_size = ram_size;
   m_lookup_exram_size = exram_size;
+  m_lookup_window_start = window_start;
+  m_lookup_window_end = window_end;
 
   if (!m_module)
   {
@@ -181,7 +200,7 @@ void StaticRecompCore::InitLookupTable(u32 ram_size, u32 exram_size)
     return;
   }
 
-  u32 total_instructions = (ram_size + exram_size) >> 2;
+  u32 total_instructions = ((ram_size + exram_size) >> 2) + ((window_end - window_start + 3u) >> 2);
   m_chunk_lookup_table.assign(total_instructions, -1);
 
   for (u32 i = 0; i < m_module->num_chunk_ranges; ++i)
@@ -279,8 +298,32 @@ bool StaticRecompCore::ChunkContainsHostCall(u32 index) const
   return found;
 }
 
+void StaticRecompCore::PublishChunkState(u32 index)
+{
+  if (!m_set_native_valid || !m_module)
+    return;
+  if (index == ~0u)
+  {
+    m_set_native_valid(0u, 0xFFFFFFFCu, 0);
+    return;
+  }
+  // Bit 0: the chunk's guest code is verified, which is what a function body tests at its entry. It mirrors the
+  // chunk state exactly, because the run loop dispatches on that state: a body that refused a dispatch the run loop
+  // had allowed would be dispatched again for ever.
+  // Bit 1: the chunk may also be called through the indirect-call table. That is narrower: not with relocatable
+  // RELs (the table is in linked addresses), not when a forced-fallback range or a host-call address lies in it.
+  const auto& chunk = m_module->chunk_ranges[index];
+  const bool verified = m_chunk_state[index] == CHUNK_VERIFIED;
+  bool callable = verified && !m_has_rel_modules;
+  for (const StaticRecompRange& range : m_forced_fallback_ranges)
+    callable = callable && !(range.start < chunk.end && chunk.start < range.end);
+  callable = callable && !(m_guest.host_call && ChunkContainsHostCall(index));
+  m_set_native_valid(chunk.start, chunk.end, (verified ? 1 : 0) | (callable ? 2 : 0));
+}
+
 void StaticRecompCore::VerifyChunk(u32 index)
 {
+  struct Publish { StaticRecompCore* c; u32 i; ~Publish() { c->PublishChunkState(i); } } publish{this, index};
   const auto& chunk = m_module->chunk_ranges[index];
   auto& memory = m_system.GetMemory();
   const u32 ram_size = memory.GetRamSizeReal();
@@ -289,6 +332,15 @@ void StaticRecompCore::VerifyChunk(u32 index)
   const u32 offset = runtime_start - 0x80000000u;
   const u32 length = chunk.end - chunk.start;
   ++m_verifications;
+  FzgxProbe::PaceEvent(2, chunk.start);
+
+  // Code in the host program's window (Core/HostHooks.h) has no guest memory to compare with: it exists only in
+  // this module, and nothing else could run it. It counts as verified.
+  if (InHostWindow(runtime_start, runtime_start + length))
+  {
+    m_chunk_state[index] = CHUNK_VERIFIED;
+    return;
+  }
 
   if (runtime_start < 0x80000000u || offset >= ram_size || length > ram_size - offset)
   {
@@ -332,6 +384,41 @@ void StaticRecompCore::VerifyChunk(u32 index)
 
 void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
 {
+  // One cache line of main RAM that holds no code of the module and no block of the fallback JIT: nothing to
+  // invalidate. That is every line of a guest DCFlushRange/DCStoreRange over data, thousands a frame in F-Zero GX,
+  // and what Jit64's own dcbx fast path tests (the block bit of the line).
+  static const bool fast_reject = [] {
+    const char* off = RunSettings::Get("FZGX_ICACHE_FAST");  // =0: the old path, for comparisons
+    return !(off && off[0] == '0');
+  }();
+  if (fast_reject && m_module_active && !m_has_rel_modules && length != 0 && length <= 32u &&
+      ((address ^ (address + (length - 1u))) & ~31u) == 0 && address >= 0x80000000u &&
+      (address | 31u) - 0x80000000u < m_lookup_ram_size && !m_chunk_lookup_table.empty())
+  {
+    // The line's eight entries of the lookup table. The line number is taken first and then scaled: MSVC 19.44
+    // compiles `((address & ~31u) - 0x80000000u) >> 2` to one less than its value (it folds the subtraction to
+    // adding 0x7FFFFFFC; a test of the bare expression gives 7 for 0x80000020 and 0x3FFFFFFF for 0x80000000). The
+    // fast path as first written therefore looked one entry before the line, missing code in a line's last word,
+    // and for the line at 0x80000000, which the OS flushes when it installs its exception vectors, read far outside
+    // the table: every boot from the disc crashed here. No saved state reaches that line, so no gate saw it.
+    const std::size_t first_word = static_cast<std::size_t>((address - 0x80000000u) >> 5) << 3;
+    bool code = true;
+    if (first_word + 8 <= m_chunk_lookup_table.size())
+    {
+      const int* const entries = m_chunk_lookup_table.data() + first_word;
+      code = false;
+      for (std::size_t i = 0; i < 8; ++i)
+        code |= entries[i] >= 0;
+    }
+    bool jit_block = false;
+    if (m_fallback_jit)
+    {
+      const u32 line = (address & 0x3FFFFFFFu) >> 5;
+      jit_block = (m_fallback_jit->GetBlockCache()->GetBlockBitSet()[line / 32u] & (1u << (line % 32u))) != 0;
+    }
+    if (!code && !jit_block)
+      return;
+  }
   if (m_fallback_jit)
   {
     m_fallback_jit->GetBlockCache()->InvalidateICache(address, length, false);
@@ -367,6 +454,7 @@ void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
       if (m_chunk_state[i] == CHUNK_FAILED)
         --m_failed_chunks;
       m_chunk_state[i] = CHUNK_UNVERIFIED;
+      PublishChunkState(i);
       ++m_reverify_events;
     }
   }

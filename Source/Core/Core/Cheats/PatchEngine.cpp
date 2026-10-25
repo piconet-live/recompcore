@@ -19,6 +19,7 @@
 #include <fmt/format.h>
 
 #include "Common/Assert.h"
+#include "Common/RunSettings.h"
 #include "Common/Debug/MemoryPatches.h"
 #include "Common/IniFile.h"
 #include "Common/StringUtil.h"
@@ -30,6 +31,7 @@
 #include "Core/Config/ConfigManager.h"
 #include "Core/Core.h"
 #include "Core/Debugger/PPCDebugInterface.h"
+#include "Core/HostHooks.h"
 #include "Core/Cheats/GeckoCode.h"
 #include "Core/Cheats/GeckoCodeConfig.h"
 #include "Core/PowerPC/MMU.h"
@@ -178,8 +180,17 @@ void LoadPatches()
 {
   const auto& sconfig = SConfig::GetInstance();
   Common::IniFile merged = sconfig.LoadGameIni();
-  Common::IniFile globalIni = sconfig.LoadDefaultGameIni();
-  Common::IniFile localIni = sconfig.LoadLocalGameIni();
+  // In a start a launch file rules, a settings file patches the game only when the host program said that the
+  // game's settings files are the user's (RunSettings::FilesMayPatch). Without it neither file is read here: not
+  // the every-frame patches ([OnFrame], applied whether cheats are on or not) nor the Gecko and Action Replay
+  // codes, and not those of the system folder's file either, which stands beside the program for anyone to edit.
+  // The host program's own codes (Core/HostHooks.h) are added below as before.
+  Common::IniFile globalIni, localIni;
+  if (RunSettings::FilesMayPatch())
+  {
+    globalIni = sconfig.LoadDefaultGameIni();
+    localIni = sconfig.LoadLocalGameIni();
+  }
 
   LoadPatchSection("OnFrame", &s_on_frame, globalIni, localIni);
 
@@ -196,8 +207,14 @@ void LoadPatches()
   }
   else
   {
-    Gecko::SetActiveCodes(Gecko::LoadCodes(globalIni, localIni), sconfig.GetGameID(),
-                          sconfig.GetRevision());
+    std::vector<Gecko::GeckoCode> gecko_codes = Gecko::LoadCodes(globalIni, localIni);
+    // the host program's codes (Core/HostHooks.h)
+    if (const auto& more = HostHooks::Get().gecko_codes)
+    {
+      for (Gecko::GeckoCode& code : more())
+        gecko_codes.push_back(std::move(code));
+    }
+    Gecko::SetActiveCodes(gecko_codes, sconfig.GetGameID(), sconfig.GetRevision());
     ActionReplay::LoadAndApplyCodes(globalIni, localIni, sconfig.GetGameID(),
                                     sconfig.GetRevision());
   }
@@ -345,6 +362,10 @@ bool ApplyFramePatches(Core::System& system)
 
   ApplyPatches(guard, s_on_frame);
   ApplyMemoryPatches(guard, s_on_frame_memory);
+
+  // the host program's frame work (Core/HostHooks.h)
+  if (const auto& frame = HostHooks::Get().frame)
+    frame(guard);
 
   // Run the Gecko code handler
   Gecko::RunCodeHandler(guard);

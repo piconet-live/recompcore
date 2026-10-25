@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "VideoCommon/Fifo.h"
+#include "VideoCommon/FrameRedraw.h"
 
 #include <atomic>
+#include <thread>
 #include <cstring>
 
 #include "Common/Assert.h"
@@ -28,6 +30,7 @@
 #include "VideoCommon/DataReader.h"
 #include "VideoCommon/FramebufferManager.h"
 #include "VideoCommon/OpcodeDecoding.h"
+#include "VideoCommon/Present.h"
 #include "VideoCommon/VertexLoaderManager.h"
 #include "VideoCommon/VertexManagerBase.h"
 #include "VideoCommon/VideoBackendBase.h"
@@ -287,6 +290,10 @@ void FifoManager::RunGpuLoop()
 {
   m_gpu_mainloop.Run(
       [this] {
+        // A picture the host holds for its time (Presenter::SetImmediateSwapHold) is presented once the time has
+        // come: here, between the passes below and at the end, never by a wait; the loop's sleep ends by its time
+        PresentHeldPicture();
+
         // Run events from the CPU thread.
         AsyncRequests::GetInstance()->PullEvents();
 
@@ -322,9 +329,31 @@ void FifoManager::RunGpuLoop()
             if (m_config_sync_gpu && m_sync_ticks.load() < m_config_sync_gpu_min_distance)
               break;
 
+            // fzgx: the pass is in flight from here to its stores (WaitForGpuPass); reads turned
+            // off since the loop's check end it before it touches the pointer
+            m_gpu_pass_active.store(true, std::memory_order_seq_cst);
+            if (!fifo.bFF_GPReadEnable.load(std::memory_order_seq_cst))
+            {
+              m_gpu_pass_active.store(false, std::memory_order_seq_cst);
+              break;
+            }
             u32 cyclesExecuted = 0;
             u32 readPtr = fifo.CPReadPointer.load(std::memory_order_relaxed);
+            if (readPtr < fifo.CPBase.load(std::memory_order_relaxed) ||
+                readPtr > fifo.CPEnd.load(std::memory_order_relaxed))
+            {
+              static bool said = false;
+              if (!said)
+              {
+                said = true;
+                ERROR_LOG_FMT(VIDEO, "fzgx: the command list's read pointer {:08x} is outside its list "
+                                     "{:08x} to {:08x}",
+                              readPtr, fifo.CPBase.load(std::memory_order_relaxed),
+                              fifo.CPEnd.load(std::memory_order_relaxed));
+              }
+            }
             ReadDataFromFifo(readPtr);
+            VideoCommon::FrameRedraw::OnBurstRead();  // (before it is decoded)
 
             if (readPtr == fifo.CPEnd.load(std::memory_order_relaxed))
               readPtr = fifo.CPBase.load(std::memory_order_relaxed);
@@ -350,6 +379,7 @@ void FifoManager::RunGpuLoop()
               fifo.SafeCPReadPointer.store(fifo.CPReadPointer.load(std::memory_order_relaxed),
                                            std::memory_order_relaxed);
             }
+            m_gpu_pass_active.store(false, std::memory_order_seq_cst);
 
             command_processor.SetCPStatusFromGPU();
 
@@ -363,6 +393,11 @@ void FifoManager::RunGpuLoop()
                 m_sync_wakeup_event.Set();
               }
             }
+
+            // fzgx: the high refresh rate's replays of a frame a copy closed in this pass, here where no read
+            // pointer is held (FrameRedraw.h)
+            VideoCommon::FrameRedraw::BetweenPasses();
+            PresentHeldPicture();
 
             // This call is pretty important in DualCore mode and must be called in the FIFO Loop.
             // If we don't, s_swapRequested or s_efbAccessRequested won't be set to false
@@ -383,9 +418,30 @@ void FifoManager::RunGpuLoop()
           // Make sure VertexManager finishes drawing any primitives it has stored in it's buffer.
           g_vertex_manager->Flush();
           g_framebuffer_manager->RefreshPeekCache();
+          VideoCommon::FrameRedraw::BetweenPasses();
         }
+        PresentHeldPicture();
       },
       100);
+}
+
+void FifoManager::PresentHeldPicture()
+{
+  if (!g_presenter)
+    return;
+  if (const auto due = g_presenter->PresentHeldSwap())
+    m_gpu_mainloop.WakeBy(*due);
+}
+
+bool FifoManager::WaitForGpuPass()
+{
+  if (!m_system.IsDualCoreMode() || m_use_deterministic_gpu_thread)
+    return false;
+  if (!m_gpu_pass_active.load(std::memory_order_seq_cst))
+    return false;
+  while (m_gpu_pass_active.load(std::memory_order_seq_cst))
+    std::this_thread::yield();
+  return true;
 }
 
 void FifoManager::FlushGpu()
@@ -456,10 +512,12 @@ int FifoManager::RunGpuOnCpu(int ticks)
         reset_simd_state = true;
       }
       ReadDataFromFifo(fifo.CPReadPointer.load(std::memory_order_relaxed));
+      VideoCommon::FrameRedraw::OnBurstRead();
       u32 cycles = 0;
       m_video_buffer_read_ptr = OpcodeDecoder::RunFifo(
           DataReader(m_video_buffer_read_ptr, m_video_buffer_write_ptr), &cycles);
       available_ticks -= cycles;
+      VideoCommon::FrameRedraw::BetweenPasses();
     }
 
     if (fifo.CPReadPointer.load(std::memory_order_relaxed) ==
