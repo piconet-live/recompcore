@@ -37,6 +37,8 @@ add_library(videocommon
   AsyncRequests.cpp
   AsyncRequests.h
   AsyncShaderCompiler.cpp
+  AuroraPresent.cpp
+  AuroraPresent.h
   AsyncShaderCompiler.h
   BoundingBox.cpp
   BoundingBox.h

@@ -44,6 +44,7 @@
 #include "VideoCommon/Assets/CustomTextureData.h"
 #include "VideoCommon/Assets/TextureAssetUtils.h"
 #include "VideoCommon/BPMemory.h"
+#include "VideoCommon/AuroraPresent.h"
 #include "VideoCommon/FrameRedraw.h"
 #include "VideoCommon/FramebufferManager.h"
 #include "VideoCommon/GraphicsModSystem/Runtime/FBInfo.h"
@@ -2376,6 +2377,8 @@ void TextureCacheBase::CopyRenderTargetToTexture(
       CopyEFBToCacheEntry(entry, is_depth_copy, srcRect, scaleByHalf, linear_filter, dstFormat,
                           isIntensity, gamma, clamp_top, clamp_bottom,
                           GetVRAMCopyFilterCoefficients(filter_coefficients));
+      if (is_xfb_copy)
+        VideoCommon::AuroraPresent::OnXFBEntry(entry);
       if (is_xfb_copy && VideoCommon::FrameRedraw::Recording())
       {
         VideoCommon::FrameRedraw::OnXFBEntry(entry, is_depth_copy, srcRect, linear_filter, gamma, clamp_top,

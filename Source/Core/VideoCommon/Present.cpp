@@ -16,6 +16,7 @@
 
 #include "Present.h"
 #include "VideoCommon/AbstractGfx.h"
+#include "VideoCommon/AuroraPresent.h"
 #include "VideoCommon/FrameDumper.h"
 #include "VideoCommon/FramebufferManager.h"
 #include "VideoCommon/OnScreenUI.h"
@@ -1044,6 +1045,10 @@ void Presenter::Present(PresentInfo* present_info)
 
   UpdateDrawRectangle();
 
+  // AuroraPresent: Aurora's newest picture instead of the emulator's (uploaded here, before the utility drawing)
+  MathUtil::Rectangle<int> aurora_rect;
+  const AbstractTexture* aurora_picture = m_xfb_entry ? AuroraPresent::Picture(&aurora_rect) : nullptr;
+
   g_gfx->BeginUtilityDrawing();
   const bool backbuffer_bound = g_gfx->BindBackbuffer({{0.0f, 0.0f, 0.0f, 1.0f}});
 
@@ -1052,10 +1057,12 @@ void Presenter::Present(PresentInfo* present_info)
   {
     // Adjust the source rectangle instead of using an oversized viewport to render the XFB.
     MathUtil::Rectangle<int> render_target_rc = GetTargetRectangle();
-    MathUtil::Rectangle<int> render_source_rc = AdjustForCustomCrop(m_xfb_rect);
+    MathUtil::Rectangle<int> render_source_rc =
+        AdjustForCustomCrop(aurora_picture ? aurora_rect : m_xfb_rect);
     AdjustRectanglesToFitBounds(&render_target_rc, &render_source_rc, m_backbuffer_width,
                                 m_backbuffer_height);
-    RenderXFBToScreen(render_target_rc, m_xfb_entry->texture.get(), render_source_rc);
+    RenderXFBToScreen(render_target_rc, aurora_picture ? aurora_picture : m_xfb_entry->texture.get(),
+                      render_source_rc);
   }
 
   if (m_onscreen_ui)

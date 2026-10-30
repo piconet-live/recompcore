@@ -24,6 +24,7 @@
 #include "VideoCommon/BPMemory.h"
 #include "VideoCommon/BoundingBox.h"
 #include "VideoCommon/Fifo.h"
+#include "VideoCommon/AuroraPresent.h"
 #include "VideoCommon/FrameRedraw.h"
 #include "VideoCommon/FramebufferManager.h"
 #include "VideoCommon/GeometryShaderManager.h"
@@ -348,6 +349,8 @@ static void BPWritten(PixelShaderManager& pixel_shader_manager, XFStateManager& 
         // presentation and before this copy's clear
         if (VideoCommon::FrameRedraw::Recording())
           VideoCommon::FrameRedraw::OnXFBCopy(srcRect);
+        // AuroraPresent: Aurora's frame ends here too (presentation only)
+        VideoCommon::AuroraPresent::OnXFBCopy();
 
         auto& system = Core::System::GetInstance();
 

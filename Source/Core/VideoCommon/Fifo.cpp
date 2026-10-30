@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "VideoCommon/Fifo.h"
+#include "VideoCommon/AuroraPresent.h"
 #include "VideoCommon/FrameRedraw.h"
 
 #include <atomic>
@@ -354,6 +355,8 @@ void FifoManager::RunGpuLoop()
             }
             ReadDataFromFifo(readPtr);
             VideoCommon::FrameRedraw::OnBurstRead();  // (before it is decoded)
+            VideoCommon::AuroraPresent::OnBurstRead(m_video_buffer_write_ptr - GPFifo::GATHER_PIPE_SIZE,
+                                                    GPFifo::GATHER_PIPE_SIZE);
 
             if (readPtr == fifo.CPEnd.load(std::memory_order_relaxed))
               readPtr = fifo.CPBase.load(std::memory_order_relaxed);
@@ -513,6 +516,8 @@ int FifoManager::RunGpuOnCpu(int ticks)
       }
       ReadDataFromFifo(fifo.CPReadPointer.load(std::memory_order_relaxed));
       VideoCommon::FrameRedraw::OnBurstRead();
+      VideoCommon::AuroraPresent::OnBurstRead(m_video_buffer_write_ptr - GPFifo::GATHER_PIPE_SIZE,
+                                              GPFifo::GATHER_PIPE_SIZE);
       u32 cycles = 0;
       m_video_buffer_read_ptr = OpcodeDecoder::RunFifo(
           DataReader(m_video_buffer_read_ptr, m_video_buffer_write_ptr), &cycles);
