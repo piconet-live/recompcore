@@ -1112,7 +1112,10 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     }
   }
 
-  const auto& lastStage = config.tevStages[config.tevStageCount - 1];
+  // Zero TEV stages is invalid (the SDK always flushes at least one) but reachable from a replayed stream with an
+  // incomplete baseline; count - 1 then indexed out of range. Read stage 0.
+  const u32 lastStageIdx = config.tevStageCount != 0 ? config.tevStageCount - 1 : 0;
+  const auto& lastStage = config.tevStages[lastStageIdx];
   const bool prevColorNormalized = colorNormalized[lastStage.colorOp.outReg];
   const bool prevAlphaNormalized = alphaNormalized[lastStage.alphaOp.outReg];
   if (lastStage.colorOp.outReg != 0) {
