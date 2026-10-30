@@ -1115,6 +1115,10 @@ bool store_xf_f32(f32& dst, u32 bits) noexcept {
 
 void handle_bp(u32 value) noexcept {
   u32 regId = value >> 24;
+  // Texture memory can change here (copy, TLUT load, TMEM invalidate): the retail bind memo's generation ends
+  if (regId == 0x52 || regId == 0x65 || regId == 0x66) {
+    end_raw_texture_generation();
+  }
   if (regId == 0xFE) {
     // BP mask write: applies to the next BP register write only
     g_gxState.bpRegCache[regId] = value & 0x00FFFFFF;

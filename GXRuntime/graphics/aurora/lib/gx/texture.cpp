@@ -15,7 +15,9 @@
 #include <xxhash.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -25,6 +27,38 @@
 namespace aurora::gx {
 namespace {
 constexpr Module Log{"aurora::gx::texture"};
+
+// recomp seam: a retail slot (raw registers, data from guest memory) has no object id, so every resolve hashed its
+// texels again. Its bind is kept while its registers are unchanged within one texture generation: a generation ends
+// where texture memory can change under the same registers (a frame, BP 0x52 copies, 0x65 TLUT loads, 0x66 TMEM
+// invalidates) and at every bind invalidation. AURORA_RAW_TEXCACHE=0 turns it off.
+struct RawBindMemo {
+  uint64_t rawGeneration = 0;
+  uint64_t bindGeneration = 0;
+  u32 mode0 = 0, mode1 = 0, image0 = 0, image3 = 0, tlut = 0;
+  bool tlutValid = false;
+  u16 tlutOffset = 0;
+  u32 tlutFormat = 0;
+  gfx::TextureBind bind;
+};
+std::array<RawBindMemo, MaxTextures> s_rawBindMemo;
+uint64_t s_rawGeneration = 1;
+
+bool raw_memo_on() noexcept {
+  static const bool on = [] {
+    const char* v = std::getenv("AURORA_RAW_TEXCACHE");
+    return v == nullptr || v[0] != '0';
+  }();
+  return on;
+}
+
+bool raw_memo_matches(const RawBindMemo& memo, const GXTexObj_& regs, u32 slot, uint64_t bindGeneration) noexcept {
+  return memo.rawGeneration == s_rawGeneration && memo.bindGeneration == bindGeneration && memo.mode0 == regs.mode0 &&
+         memo.mode1 == regs.mode1 && memo.image0 == regs.image0 && memo.image3 == regs.image3 &&
+         memo.tlut == static_cast<u32>(regs.tlut) && memo.tlutValid == g_gxState.loadedTextureTlutValid[slot] &&
+         memo.tlutOffset == g_gxState.loadedTextureTlutTmemOffsets[slot] &&
+         memo.tlutFormat == static_cast<u32>(g_gxState.loadedTextureTlutFormats[slot]);
+}
 
 struct DynamicPaletteKey {
   const void* sourceIdentity = nullptr;
@@ -713,6 +747,7 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
 }
 
 void end_frame() noexcept {
+  end_raw_texture_generation();
   const auto streamingStats = gfx::texture_replacement::process_streaming();
   s_stats.pendingLoads = streamingStats.pendingLoads;
   s_stats.publishes = streamingStats.publishes;
@@ -746,6 +781,7 @@ void end_frame() noexcept {
 }
 
 void shutdown() noexcept {
+  s_rawBindMemo.fill({});
   clear_copy_texture_cache();
   s_copyCache.set_budget(gfx::RenderTextureCacheLimits.bytes);
   s_textureObjectCaches.clear();
@@ -840,6 +876,11 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
     }
 
     // recomp seam: a slot set up by raw BP registers gets its data from guest memory here
+    const bool raw = obj.texObjId == 0 && !obj.has_data() && raw_memo_on() && recomp::has_guest_address_resolver();
+    if (raw && raw_memo_matches(s_rawBindMemo[i], obj, i, s_bindGeneration)) {
+      textureBind = s_rawBindMemo[i].bind;
+      continue;
+    }
     recomp::resolve_texture_data(obj);
     gfx::TextureHandle handle;
     const auto copyIt = g_gxState.copyTextures.find(obj.data);
@@ -869,6 +910,24 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
 
     obj.mFormat = resolved_format_for_handle(handle);
     textureBind = gfx::TextureBind{obj, std::move(handle), s_bindGeneration};
+    if (raw) {
+      const GXTexObj_& regs = g_gxState.loadedTextures[i];
+      s_rawBindMemo[i] = RawBindMemo{
+          .rawGeneration = s_rawGeneration,
+          .bindGeneration = s_bindGeneration,
+          .mode0 = regs.mode0,
+          .mode1 = regs.mode1,
+          .image0 = regs.image0,
+          .image3 = regs.image3,
+          .tlut = static_cast<u32>(regs.tlut),
+          .tlutValid = g_gxState.loadedTextureTlutValid[i],
+          .tlutOffset = g_gxState.loadedTextureTlutTmemOffsets[i],
+          .tlutFormat = static_cast<u32>(g_gxState.loadedTextureTlutFormats[i]),
+          .bind = textureBind,
+      };
+    }
   }
 }
+
+void end_raw_texture_generation() noexcept { ++s_rawGeneration; }
 } // namespace aurora::gx

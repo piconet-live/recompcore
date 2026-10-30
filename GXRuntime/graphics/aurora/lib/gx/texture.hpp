@@ -43,6 +43,10 @@ void invalidate_bindings() noexcept;
 uint64_t current_bind_generation() noexcept;
 void invalidate_replacement(uint64_t replacementId) noexcept;
 void end_frame() noexcept;
+} // namespace texture
+// recomp seam: ends the retail bind memo's generation (texture.cpp)
+void end_raw_texture_generation() noexcept;
+namespace texture {
 void shutdown() noexcept;
 
 GXState::CopyTextureRef resolve_copy_texture(const GXState::CopyTextureKey& key) noexcept;
