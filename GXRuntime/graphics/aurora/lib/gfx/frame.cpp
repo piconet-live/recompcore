@@ -1,3 +1,4 @@
+#include "efb_readback.hpp"
 #include "frame.hpp"
 
 #include "pipeline_cache.hpp"
@@ -742,3 +743,11 @@ float calculate_fps() noexcept {
 
 const AuroraStats* aurora_get_stats() { return &aurora::gfx::detail::resources().stats; }
 float aurora_get_fps() { return aurora::gfx::calculate_fps(); }
+
+void aurora_request_framebuffer_readback() { aurora::gfx::efb_readback::request(); }
+
+bool aurora_take_framebuffer_readback(const uint8_t** rgba, uint32_t* width, uint32_t* height) {
+  return aurora::gfx::efb_readback::take(rgba, width, height);
+}
+
+void aurora_pump_framebuffer_readback() { aurora::gfx::enqueue_process_events(); }

@@ -2,6 +2,7 @@
 #include <aurora/time.hpp>
 
 #ifdef AURORA_ENABLE_GX
+#include "gfx/efb_readback.hpp"
 #include "gfx/resources.hpp"
 #include "gfx/frame.hpp"
 #include "gfx/recording.hpp"
@@ -374,6 +375,7 @@ void end_frame() noexcept {
       g_queue.Submit(1, &buffer);
     }
     webgpu::gpu_prof::after_submit();
+    gfx::efb_readback::after_submit();
     if (canPresent && g_surface) {
       ZoneScopedN("Present");
       wgpu::ConvertibleStatus status = wgpu::Status::Error;
