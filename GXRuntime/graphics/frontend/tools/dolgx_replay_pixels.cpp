@@ -23,6 +23,7 @@
 
 #include <aurora/gfx.h>
 #include <dolphin/gx.h>
+#include <dolphin/gx/GXAurora.h>
 
 #include <algorithm>
 #include <chrono>
@@ -213,8 +214,8 @@ int dolgx_replay_pixels_main(const char* trace_path,
   // of each digest line.
   const AuroraBackendConfig config = {
       .app_name = "dolgx_replay",
-      .window_width = 1024,
-      .window_height = 768,
+      .window_width = options.window_width,
+      .window_height = options.window_height,
       .vsync = false,
       .allow_texture_dumps = false,
       .info_logging = false,
@@ -238,6 +239,23 @@ int dolgx_replay_pixels_main(const char* trace_path,
   static std::vector<std::uint8_t> gx_fifo(64u * 1024u);
   GXInit(gx_fifo.data(), static_cast<u32>(gx_fifo.size()));
   GXFlush();
+  if (options.viewport_policy >= 0)
+    AuroraSetViewportPolicy(
+        static_cast<AuroraViewportPolicy>(options.viewport_policy));
+
+  // --timing: wall-clock split of each frame. feed = the main thread inside
+  // the backend entry points (retail FIFO decode, state, draw recording);
+  // present = aurora_backend_present (end_frame: drain + hand-off/submit);
+  // readback = present -> EFB readback mapped (render-worker encode + GPU
+  // execution + the readback copy). MEM_UPDATE copies are excluded.
+  using Clock = std::chrono::steady_clock;
+  auto ns_since = [](Clock::time_point t0) {
+    return static_cast<double>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0)
+            .count());
+  };
+  double feed_ns = 0.0;
+  unsigned pass = 0;
 
   std::vector<std::string> lines;
   std::uint32_t current_frame = 0;
@@ -265,7 +283,10 @@ int dolgx_replay_pixels_main(const char* trace_path,
   auto present_and_capture = [&]() {
     frame_open = false;
     aurora_request_framebuffer_readback();
+    const auto present_t0 = Clock::now();
     aurora_backend_present();
+    const double present_ns = ns_since(present_t0);
+    const auto readback_t0 = Clock::now();
     const std::uint8_t* rgba = nullptr;
     u32 width = 0;
     u32 height = 0;
@@ -282,6 +303,17 @@ int dolgx_replay_pixels_main(const char* trace_path,
       fail("EFB readback never completed");
       return;
     }
+    if (options.timing) {
+      const double readback_ns = ns_since(readback_t0);
+      const AuroraStats* st = aurora_get_stats();
+      std::printf("timing pass %u frame %u feed_ms %.3f present_ms %.3f "
+                  "readback_ms %.3f draws %u merged %u verts %u indices %u\n",
+                  pass, current_frame, feed_ns * 1e-6, present_ns * 1e-6,
+                  readback_ns * 1e-6, st->drawCallCount, st->mergedDrawCallCount,
+                  st->lastVertSize, st->lastIndexSize);
+      std::fflush(stdout);
+    }
+    feed_ns = 0.0;
     const std::uint64_t hash =
         fnv1a(rgba, static_cast<std::size_t>(width) * height * 4u);
     char line[96];
@@ -301,6 +333,9 @@ int dolgx_replay_pixels_main(const char* trace_path,
     }
   };
 
+  for (pass = 0; ok && pass < options.repeat; ++pass) {
+  if (pass > 0)
+    reader.rewind();
   trace::RecordView record;
   while (ok && reader.next(record)) {
     ++record_index;
@@ -324,7 +359,9 @@ int dolgx_replay_pixels_main(const char* trace_path,
         fail("malformed GX_WRITE");
         break;
       }
+      const auto t0 = Clock::now();
       aurora_backend_gx_write(value, size);
+      feed_ns += ns_since(t0);
       break;
     }
     case trace::RecordKind::CallDisplayList: {
@@ -334,8 +371,10 @@ int dolgx_replay_pixels_main(const char* trace_path,
         fail("malformed CALL_DL");
         break;
       }
+      const auto t0 = Clock::now();
       aurora_backend_call_display_list(bytes.data(),
                                        static_cast<u32>(bytes.size()));
+      feed_ns += ns_since(t0);
       break;
     }
     case trace::RecordKind::SetArray: {
@@ -388,6 +427,7 @@ int dolgx_replay_pixels_main(const char* trace_path,
   }
   if (ok && frame_open)
     present_and_capture();
+  } // pass
   if (reader.truncated())
     std::fprintf(stderr,
                  "dolgx_replay: trace ends mid-record (interrupted "

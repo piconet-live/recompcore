@@ -8,7 +8,18 @@
 // Mode A only.
 
 #include <cstdint>
+#include <cstdlib>
 #include <string>
+
+#if defined(_WIN32)
+// POSIX setenv/unsetenv for the replay mains (Windows has _putenv_s).
+inline int setenv(const char* name, const char* value, int overwrite) {
+  if (!overwrite && std::getenv(name) != nullptr)
+    return 0;
+  return _putenv_s(name, value);
+}
+inline int unsetenv(const char* name) { return _putenv_s(name, ""); }
+#endif
 
 struct PixelReplayOptions {
   const char* golden_path = nullptr;  // exact line-compare against a golden
@@ -16,6 +27,11 @@ struct PixelReplayOptions {
   const char* png_dir = nullptr;      // dump PNGs here
   unsigned png_every = 1;             // dump every Nth frame (and the last)
   bool quiet = false;
+  unsigned window_width = 1024;       // --window WxH (framebuffer size)
+  unsigned window_height = 768;
+  int viewport_policy = -1;           // --viewport fit|stretch|native (-1: Aurora default)
+  unsigned repeat = 1;                // --repeat N: replay the whole trace N times
+  bool timing = false;                // --timing: per-frame CPU/submit/readback times
 };
 
 int dolgx_replay_pixels_main(const char* trace_path,

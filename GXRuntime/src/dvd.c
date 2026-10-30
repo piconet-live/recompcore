@@ -7,6 +7,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_WIN32)
+// MSVC has no fseeko/off_t in C11 mode; the 64-bit seek is _fseeki64.
+#define off_t long long
+#define fseeko(f, o, w) _fseeki64((f), (o), (w))
+#endif
+
 // GameCube disc header fields (big-endian, in the first sector).
 #define DISC_MAGIC_OFFSET 0x1Cu
 #define DISC_MAGIC        0xC2339F3Du

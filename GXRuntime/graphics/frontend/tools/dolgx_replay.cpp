@@ -42,6 +42,10 @@ int usage(std::FILE* out) {
       "  --pixel-digest <golden>       exact line-compare of pixel digests\n"
       "  --write-pixel-digest <path>   write pixel digest lines to <path>\n"
       "  --png-dir <dir>        with --pixels, dump one PNG per frame\n"
+      "  --window <W>x<H>       with --pixels, framebuffer size (1024x768)\n"
+      "  --viewport <policy>    with --pixels: fit, stretch or native\n"
+      "  --repeat <N>           with --pixels, replay the trace N times\n"
+      "  --timing               with --pixels, per-frame timing lines\n"
       "  --help                 this text\n"
       "exit: 0 ok, 1 replay/comparison failure, 2 usage or I/O error\n");
   return out == stdout ? 0 : 2;
@@ -252,6 +256,33 @@ int main(int argc, char** argv) {
     } else if (std::strcmp(arg, "--png-every") == 0 && i + 1 < argc) {
       pixel_options.png_every =
           static_cast<unsigned>(std::strtoul(argv[++i], nullptr, 10));
+    } else if (std::strcmp(arg, "--window") == 0 && i + 1 < argc) {
+      unsigned w = 0, h = 0;
+      if (std::sscanf(argv[++i], "%ux%u", &w, &h) != 2 || w == 0 || h == 0) {
+        std::fprintf(stderr, "dolgx_replay: --window wants WxH\n");
+        return usage(stderr);
+      }
+      pixel_options.window_width = w;
+      pixel_options.window_height = h;
+    } else if (std::strcmp(arg, "--viewport") == 0 && i + 1 < argc) {
+      const char* v = argv[++i];
+      if (std::strcmp(v, "fit") == 0)
+        pixel_options.viewport_policy = 0;
+      else if (std::strcmp(v, "stretch") == 0)
+        pixel_options.viewport_policy = 1;
+      else if (std::strcmp(v, "native") == 0)
+        pixel_options.viewport_policy = 2;
+      else {
+        std::fprintf(stderr, "dolgx_replay: --viewport fit|stretch|native\n");
+        return usage(stderr);
+      }
+    } else if (std::strcmp(arg, "--repeat") == 0 && i + 1 < argc) {
+      pixel_options.repeat =
+          static_cast<unsigned>(std::strtoul(argv[++i], nullptr, 10));
+      if (pixel_options.repeat == 0)
+        pixel_options.repeat = 1;
+    } else if (std::strcmp(arg, "--timing") == 0) {
+      pixel_options.timing = true;
     } else if (arg[0] != '-' && trace_path == nullptr) {
       trace_path = arg;
     } else {
