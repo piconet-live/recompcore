@@ -118,6 +118,18 @@ if(GXRUNTIME_ENABLE_AURORA)
             PRIVATE "${GXRUNTIME_AURORA_DIR}/lib")
         target_link_libraries(dolgx_replay
             PRIVATE GXRuntime::aurora)
+        # aurora-present: Aurora as a presenter inside an emulator that keeps the game's GPU (Piconet's runner
+        # loads it at run time: gxruntime/aurora_present.h)
+        add_library(gxruntime_aurora_present SHARED
+            backends/aurora/aurora_present.cpp)
+        set_target_properties(gxruntime_aurora_present PROPERTIES
+            OUTPUT_NAME aurora-present PREFIX "")
+        target_include_directories(gxruntime_aurora_present
+            PRIVATE "${GXRUNTIME_AURORA_DIR}/lib" "${CMAKE_CURRENT_SOURCE_DIR}/backends/aurora")
+        target_compile_definitions(gxruntime_aurora_present
+            PRIVATE GXRUNTIME_HAS_AURORA_RECOMP=1)
+        target_link_libraries(gxruntime_aurora_present
+            PRIVATE GXRuntime::aurora)
     else()
         target_compile_definitions(gxruntime_aurora
             PRIVATE GXRUNTIME_HAS_AURORA_RECOMP=0)

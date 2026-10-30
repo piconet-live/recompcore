@@ -222,6 +222,11 @@ bool dol_aurora_initialize(int argc, char** argv,
         config.userPath = dir;
         config.cachePath = dir;
     }
+    if (backend_config->data_dir != nullptr && backend_config->data_dir[0] != '\0') {
+        config.userPath = backend_config->data_dir;
+        config.cachePath = backend_config->data_dir;
+    }
+    config.embedded = backend_config->embedded;
 
     const AuroraInfo info = aurora_initialize(argc, argv, &config);
     gx_aurora::g_initialized = info.window != nullptr;
@@ -348,7 +353,9 @@ bool dol_aurora_initialize(int argc, char** argv,
     gx_aurora::g_audio_low_log_push = 0;
     gx_aurora::g_audio_sample_rate = 32000;
 
-    if (SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+    if (backend_config->embedded) {
+        // (no audio device: the program that embeds Aurora has its own sound)
+    } else if (SDL_InitSubSystem(SDL_INIT_AUDIO)) {
         SDL_AudioSpec spec{};
         spec.format = SDL_AUDIO_S16;
         spec.channels = 2;
