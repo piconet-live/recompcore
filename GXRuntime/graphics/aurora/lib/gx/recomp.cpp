@@ -66,8 +66,11 @@ std::uint32_t texture_byte_size(const GXTexObj_& obj) noexcept {
     return 0;
   }
   const bool mips = obj.has_mips() || retail_texture_has_mips(obj);
+  // GXGetTexBufferSize's maxLod is the SDK's count of levels (GXInitTexObjLOD's max_lod + 1): with the max LOD
+  // register itself, a mipmapped texture whose max LOD is 0 measured 0 bytes and was never resolved (F-Zero's
+  // exhaust glows: I8 32x32, a mip filter, max LOD 0).
   return GXGetTexBufferSize(static_cast<u16>(width), static_cast<u16>(height), obj.format(), mips ? GX_TRUE : GX_FALSE,
-                            static_cast<u8>(mips ? max_lod_for_buffer_size(obj) : 0));
+                            static_cast<u8>(mips ? std::min<std::uint32_t>(max_lod_for_buffer_size(obj) + 1, 255u) : 0));
 }
 
 bool resolve_texture_data(GXTexObj_& obj) noexcept {

@@ -40,6 +40,7 @@ extern "C" {
 void aurora_backend_present(void);
 bool aurora_backend_should_quit(void);
 void aurora_backend_gx_write(u64 value, u8 size);
+void aurora_backend_gx_write_burst(const u8* data, u32 size);
 void aurora_backend_call_display_list(const void* data, u32 size);
 void aurora_backend_set_array(u32 attr, const void* data, u32 size, u8 stride);
 void aurora_backend_set_guest_address_resolver(
@@ -351,12 +352,20 @@ int dolgx_replay_pixels_main(const char* trace_path,
     }
   };
 
+  BurstGather burst;
+  burst.cap = std::min(options.burst, 256u);
+  auto burst_sink = [](const std::uint8_t* bytes, unsigned n) {
+    aurora_backend_gx_write_burst(bytes, n);
+    return true;
+  };
   for (pass = 0; ok && pass < options.repeat; ++pass) {
   if (pass > 0)
     reader.rewind();
   trace::RecordView record;
   while (ok && reader.next(record)) {
     ++record_index;
+    if (record.kind != trace::RecordKind::GxWrite)
+      burst.flush(burst_sink);
     switch (record.kind) {
     case trace::RecordKind::FrameBegin: {
       std::uint32_t frame_index = 0;
@@ -379,7 +388,10 @@ int dolgx_replay_pixels_main(const char* trace_path,
         fail("malformed GX_WRITE");
         break;
       }
-      aurora_backend_gx_write(value, size);
+      if (burst.cap != 0)
+        burst.add(value, size, burst_sink);
+      else
+        aurora_backend_gx_write(value, size);
       break;
     }
     case trace::RecordKind::CallDisplayList: {
@@ -443,6 +455,7 @@ int dolgx_replay_pixels_main(const char* trace_path,
       break;
     }
   }
+  burst.flush(burst_sink);
   if (ok && frame_open)
     present_and_capture();
   } // pass

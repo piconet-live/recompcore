@@ -335,6 +335,9 @@ void shadow_frontend_call_display_list(const void* data, u32 size) {
     }
 }
 
+void shadow_frontend_write_bytes(std::span<const std::uint8_t> fragment,
+                                 u64 value);
+
 void shadow_frontend_write(u64 value, u8 size) {
     if (!g_shadow_frontend_enabled || g_shadow_frontend_failed)
         return;
@@ -361,7 +364,17 @@ void shadow_frontend_write(u64 value, u8 size) {
     default:
         return;
     }
-    const std::span<const std::uint8_t> fragment(bytes, size);
+    shadow_frontend_write_bytes(std::span<const std::uint8_t>(bytes, size), value);
+}
+
+// A run of FIFO bytes (a burst, as the gather pipe hands them on; one write's
+// bytes above). value: the write's value when the run is one write, for the
+// rejection log.
+void shadow_frontend_write_bytes(std::span<const std::uint8_t> fragment,
+                                 u64 value) {
+    if (!g_shadow_frontend_enabled || g_shadow_frontend_failed)
+        return;
+    const std::size_t size = fragment.size();
     if (g_gx_core_enabled) {
         if (!g_shadow_frontend.write_fifo(fragment) ||
             !g_shadow_frontend.flush(&g_core_sink)) {
@@ -947,6 +960,23 @@ void aurora_backend_gx_write(u64 value, u8 size) {
     case 8: GXCmd1u64(value); break;
     default: break;
     }
+}
+
+// A burst of FIFO bytes (big-endian, as the gather pipe hands them on, 32 at a
+// time): one call for many writes. Unlike aurora_backend_gx_write it does not
+// rewrite cull-all draws into masked ones: Aurora's command processor reads
+// cull mode 3 as GX_CULL_ALL and draws nothing for it, as the hardware does.
+void aurora_backend_gx_write_burst(const u8* data, u32 size) {
+    if (!gx_aurora::g_initialized || data == nullptr || size == 0)
+        return;
+    gx_aurora::g_fifo_bytes += size;
+#if GXRUNTIME_HAS_AURORA_RECOMP
+    gx_aurora::shadow_frontend_write_bytes(
+        std::span<const std::uint8_t>(data, size), 0);
+    if (gx_aurora::g_gx_core_enabled)
+        return;
+#endif
+    aurora::gx::fifo::write_data(data, size);
 }
 
 void aurora_backend_set_array(u32 attr, const void* data, u32 size, u8 stride) {

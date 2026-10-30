@@ -21,6 +21,7 @@
 #include <aurora/gfx.h>
 #include <dolphin/gx/GXAurora.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -80,10 +81,41 @@ bool mem1_resolver(void* user, u32 address, u32 size,
   return true;
 }
 
+// DOLGX_SKIP_TEX=ADDR[,ADDR...] (physical, hex): plans sampling any of these
+// textures are not drawn, to find which draws make an effect.
+bool skipped_by_texture(const gxc::DrawPlan& plan) {
+  static std::vector<std::uint32_t> skip = [] {
+    std::vector<std::uint32_t> list;
+    if (const char* v = std::getenv("DOLGX_SKIP_TEX")) {
+      for (const char* p = v; *p != '\0';) {
+        char* end = nullptr;
+        list.push_back(static_cast<std::uint32_t>(std::strtoul(p, &end, 16)));
+        p = (*end == ',') ? end + 1 : end;
+        if (end == p && *p != '\0')
+          break;
+      }
+    }
+    return list;
+  }();
+  if (skip.empty())
+    return false;
+  auto hit = [&](std::uint32_t a) {
+    return std::find(skip.begin(), skip.end(), a & 0x01FFFFFFu) != skip.end();
+  };
+  if (plan.has_texture && hit(plan.tex_address))
+    return true;
+  for (const auto& t : plan.textures)
+    if (t.valid && hit(t.address))
+      return true;
+  return false;
+}
+
 void plan_observer(const gxc::DrawPlan& plan, void* user) {
   auto* ctx = static_cast<CoreContext*>(user);
   if (!plan.ok)
     return; // skip reasons are tallied in the sink's gap counters
+  if (skipped_by_texture(plan))
+    return;
   if (aurora::gfx::gxcore::submit_draw_plan(plan))
     ++ctx->submitted;
   else
@@ -298,12 +330,21 @@ int dolgx_replay_core_main(const char* trace_path,
     }
   };
 
+  BurstGather burst;
+  burst.cap = std::min(options.burst, 256u);
+  auto burst_sink = [&](const std::uint8_t* bytes, unsigned n) {
+    return frontend.write_fifo({bytes, n}) && frontend.flush(&sink);
+  };
   for (pass = 0; ok && pass < options.repeat; ++pass) {
   if (pass > 0)
     reader.rewind();
   trace::RecordView record;
   while (ok && reader.next(record)) {
     ++record_index;
+    if (record.kind != trace::RecordKind::GxWrite && !burst.flush(burst_sink)) {
+      fail("frontend rejected FIFO: " + frontend_error_detail(frontend));
+      break;
+    }
     switch (record.kind) {
     case trace::RecordKind::FrameBegin: {
       std::uint32_t frame_index = 0;
@@ -329,6 +370,11 @@ int dolgx_replay_core_main(const char* trace_path,
       std::uint8_t bytes[8] = {};
       if (size != 1u && size != 2u && size != 4u && size != 8u) {
         fail("GX_WRITE with unsupported size");
+        break;
+      }
+      if (burst.cap != 0) {
+        if (!burst.add(value, size, burst_sink))
+          fail("frontend rejected FIFO: " + frontend_error_detail(frontend));
         break;
       }
       for (unsigned i = 0; i < size; ++i)
@@ -403,6 +449,8 @@ int dolgx_replay_core_main(const char* trace_path,
       break;
     }
   }
+  if (ok && !burst.flush(burst_sink))
+    fail("frontend rejected FIFO: " + frontend_error_detail(frontend));
   if (ok && frame_open)
     present_and_capture();
   } // pass

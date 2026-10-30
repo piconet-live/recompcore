@@ -1,11 +1,13 @@
 #include "fifo.hpp"
 #include "command_processor.hpp"
+#include "gx.hpp"
 #include "../internal.hpp"
 
 #include <cstdlib>
 #include <cstring>
 
 namespace aurora::gx::fifo {
+extern u32 g_drawLogCount; // command_processor.cpp (AURORA_DRAW_LOG)
 static Module Log("aurora::gx::fifo");
 
 namespace detail {
@@ -72,8 +74,11 @@ void drain() {
   if (detail::sBufferSize == 0) {
     return;
   }
+  end_raw_texture_generation();
+  g_drawLogCount = 0;
   process(detail::sBufferData, detail::sBufferSize, true);
   detail::sBufferSize = 0;
+  report_raw_texture_stats();
 }
 
 const uint8_t* get_buffer_data() { return detail::sBufferData; }

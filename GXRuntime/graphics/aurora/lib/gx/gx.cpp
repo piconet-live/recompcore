@@ -15,8 +15,11 @@
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
 #include <tracy/Tracy.hpp>
+#include <xxhash.h>
 
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <bit>
 #include <cfloat>
 #include <cmath>
@@ -90,6 +93,115 @@ void do_clear_static_texture_cache() noexcept {
   for (auto& [_, cache] : s_tlutObjectCaches) {
     cache.staticTextureUsers.clear();
   }
+}
+
+// Retail textures (texObjId 0: set up by raw BP registers and resolved from guest memory by recomp::
+// resolve_texture_data, which marks them no_cache). They have no SDK object id or version, so the id cache above
+// never holds them, and every draw used to decode and create its textures again. They are cached here by content
+// instead, as gxcore's TextureKey does: the guest pointer, the registers that shape the texels, and a hash of the
+// texel (and palette) bytes. A content change under the same address is a new entry and evicts the old one.
+struct RawTextureKey {
+  const void* data = nullptr;
+  u32 image0 = 0;
+  u32 byteSize = 0;
+  u32 mipCount = 0;
+  u32 format = 0;
+  const void* tlutData = nullptr;
+  u32 tlutFormat = 0;
+  u32 tlutEntries = 0;
+  u64 hash = 0;
+  bool operator==(const RawTextureKey&) const = default;
+  template <typename H>
+  friend H AbslHashValue(H h, const RawTextureKey& k) {
+    return H::combine(std::move(h), k.data, k.image0, k.byteSize, k.mipCount, k.format, k.tlutData, k.tlutFormat,
+                      k.tlutEntries, k.hash);
+  }
+};
+absl::flat_hash_map<RawTextureKey, gfx::TextureHandle> s_rawTextureCache;
+// a texture's identity (its key without the content hash) to its current entry: new content under the same identity
+// replaces the old entry. Keyed by identity, not by address alone: one address sampled with two mip counts (F-Zero's
+// CMPR course textures) is two textures, and an address-only key made them evict each other every frame.
+absl::flat_hash_map<RawTextureKey, RawTextureKey> s_rawTextureAtAddress;
+constexpr size_t MaxRawTextures = 4096;
+
+// The content hash is taken once per texture generation, not per draw. A generation ends where the hardware's
+// texture memory could change under the same registers: at each frame's drain, at a TMEM invalidate (BP 0x66), a
+// TLUT load (BP 0x65) and an EFB copy (BP 0x52). Within one, a slot whose registers are unchanged keeps its bind.
+u64 s_rawTextureGeneration = 1;
+struct RawBindMemo {
+  u64 generation = 0;
+  u32 mode0 = 0, mode1 = 0, image0 = 0, image3 = 0;
+  bool tlutValid = false;
+  u16 tlutOffset = 0;
+  u32 tlutFormat = 0;
+  u32 tlut = 0;
+  gfx::TextureBind bind;
+};
+std::array<RawBindMemo, MaxTextures> s_rawBindMemo;
+struct RawTextureStats {
+  u64 resolves = 0, memoHits = 0, hashed = 0, hashedBytes = 0, hits = 0, creates = 0;
+} s_rawStats;
+
+// AURORA_RAW_TEXCACHE=0: the cache off (every retail texture decoded and created at every bind, as before it), for
+// before-and-after timings.
+bool raw_texture_cache_on() noexcept {
+  static const bool on = [] {
+    const char* v = std::getenv("AURORA_RAW_TEXCACHE");
+    return v == nullptr || v[0] != '0';
+  }();
+  return on;
+}
+
+template <typename Create>
+gfx::TextureHandle resolve_raw_cached(const GXTexObj_& obj, const GXTlutObj_* tlut, Create&& create) {
+  const u32 size = recomp::texture_byte_size(obj);
+  RawTextureKey key{
+      .data = obj.data,
+      .image0 = obj.image0,
+      .byteSize = size,
+      .mipCount = obj.mip_count(),
+      .format = obj.format(),
+  };
+  u64 h = XXH3_64bits(obj.data, size);
+  s_rawStats.hashedBytes += size;
+  if (tlut != nullptr) {
+    key.tlutData = tlut->data;
+    key.tlutFormat = static_cast<u32>(tlut->format);
+    key.tlutEntries = tlut->numEntries;
+    h = XXH3_64bits_withSeed(tlut->data, static_cast<size_t>(tlut->numEntries) * 2, h);
+    s_rawStats.hashedBytes += static_cast<u64>(tlut->numEntries) * 2;
+  }
+  key.hash = h;
+  ++s_rawStats.hashed;
+  if (const auto it = s_rawTextureCache.find(key); it != s_rawTextureCache.end()) {
+    ++s_rawStats.hits;
+    return it->second;
+  }
+  RawTextureKey identity = key;
+  identity.hash = 0;
+  if (const auto at = s_rawTextureAtAddress.find(identity); at != s_rawTextureAtAddress.end()) {
+    s_rawTextureCache.erase(at->second);
+  }
+  if (s_rawTextureCache.size() >= MaxRawTextures) {
+    s_rawTextureCache.clear();
+    s_rawTextureAtAddress.clear();
+  }
+  static const bool createLog = [] {
+    const char* v = std::getenv("AURORA_TEXCACHE_STATS");
+    return v != nullptr && v[0] == '2';
+  }();
+  if (createLog) {
+    std::fprintf(stderr, "[texcache-create] data %p %ux%u fmt %u mips %u bytes %u tlut %d replaced %d\n", obj.data,
+                 obj.width(), obj.height(), obj.format(), obj.mip_count(), size, tlut != nullptr ? 1 : 0,
+                 s_rawTextureAtAddress.contains(identity) ? 1 : 0);
+  }
+  gfx::TextureHandle handle = create();
+  ++s_rawStats.creates;
+  if (handle) {
+    s_rawTextureCache.emplace(key, handle);
+    s_rawTextureAtAddress[identity] = key;
+  }
+  return handle;
 }
 
 DynamicPaletteKey make_dynamic_palette_key(const GXTexObj_& obj, const GXState::CopyTextureRef& source) {
@@ -173,6 +285,14 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
     }
   }
 
+  if (obj.texObjId == 0 && obj.no_cache() && raw_texture_cache_on()) {
+    return resolve_raw_cached(obj, nullptr, [&] {
+      return gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), obj.format(),
+                                        {static_cast<const uint8_t*>(obj.data), UINT32_MAX}, false,
+                                        "GX Retail Texture");
+    });
+  }
+
   gfx::TextureHandle handle;
   if (const auto replacement = gfx::texture_replacement::find_replacement(obj); replacement.has_value()) {
     handle = *replacement;
@@ -206,6 +326,22 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
         return entry.handle;
       }
     }
+  }
+
+  if (obj.texObjId == 0 && obj.no_cache() && raw_texture_cache_on()) {
+    return resolve_raw_cached(obj, &tlut, [&]() -> gfx::TextureHandle {
+      auto converted = gfx::convert_texture_palette(
+          obj.format(), obj.width(), obj.height(), obj.mip_count(), {static_cast<const u8*>(obj.data), UINT32_MAX},
+          tlut.format, tlut.numEntries, {static_cast<const u8*>(tlut.data), static_cast<size_t>(tlut.numEntries) * 2});
+      if (converted.data.empty()) {
+        return {};
+      }
+      auto h = gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), GX_TF_RGBA8_PC,
+                                          {converted.data.data(), converted.data.size()}, false,
+                                          "GX Retail Palette Texture");
+      h->hasArbitraryMips = converted.hasArbitraryMips;
+      return h;
+    });
   }
 
   gfx::TextureHandle handle;
@@ -445,8 +581,36 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
     }
 
     GXTexObj_ obj = g_gxState.loadedTextures[i];
-    recomp::resolve_texture_data(obj);
     auto& textureBind = g_gxState.textures[i];
+    // a retail slot (raw registers, data from guest memory) unchanged within this texture generation
+    const bool raw = obj.texObjId == 0 && !obj.has_data() && raw_texture_cache_on();
+    ++s_rawStats.resolves;
+    static const bool copyLog = std::getenv("AURORA_COPY_LOG") != nullptr;
+    if (copyLog) {
+      // the samples of textures in the copies' region (F-Zero's face board: 0x01235FA0-0x01240040)
+      const u32 phys = (obj.image3 & 0x001FFFFFu) << 5;
+      if (phys >= 0x01200000u && phys < 0x01280000u) {
+        GXTexObj_ probe = obj;
+        recomp::resolve_texture_data(probe);
+        std::fprintf(stderr, "[copy-use] slot %u phys %08X data %p %ux%u fmt %u memo %d copy %s\n", i, phys,
+                     probe.data, probe.width(), probe.height(), probe.format(),
+                     raw && s_rawBindMemo[i].generation == s_rawTextureGeneration ? 1 : 0,
+                     g_gxState.copyTextures.contains(probe.data) ? "found" : "none");
+      }
+    }
+    if (raw) {
+      const auto& memo = s_rawBindMemo[i];
+      if (memo.generation == s_rawTextureGeneration && memo.mode0 == obj.mode0 && memo.mode1 == obj.mode1 &&
+          memo.image0 == obj.image0 && memo.image3 == obj.image3 && memo.tlut == static_cast<u32>(obj.tlut) &&
+          memo.tlutValid == g_gxState.loadedTextureTlutValid[i] &&
+          memo.tlutOffset == g_gxState.loadedTextureTlutTmemOffsets[i] &&
+          memo.tlutFormat == static_cast<u32>(g_gxState.loadedTextureTlutFormats[i])) {
+        ++s_rawStats.memoHits;
+        textureBind = memo.bind;
+        continue;
+      }
+    }
+    recomp::resolve_texture_data(obj);
     if (obj.texObjId != 0 && obj.texObjId == textureBind.texObj.texObjId &&
         obj.texDataVersion == textureBind.texObj.texDataVersion) {
       // Texture bind unchanged
@@ -490,7 +654,40 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
 
     obj.mFormat = resolved_format_for_handle(handle);
     textureBind = gfx::TextureBind{obj, std::move(handle)};
+    if (raw) {
+      const GXTexObj_& regs = g_gxState.loadedTextures[i];
+      s_rawBindMemo[i] = RawBindMemo{
+          .generation = s_rawTextureGeneration,
+          .mode0 = regs.mode0,
+          .mode1 = regs.mode1,
+          .image0 = regs.image0,
+          .image3 = regs.image3,
+          .tlutValid = g_gxState.loadedTextureTlutValid[i],
+          .tlutOffset = g_gxState.loadedTextureTlutTmemOffsets[i],
+          .tlutFormat = static_cast<u32>(g_gxState.loadedTextureTlutFormats[i]),
+          .tlut = static_cast<u32>(regs.tlut),
+          .bind = textureBind,
+      };
+    }
   }
+}
+
+void end_raw_texture_generation() noexcept { ++s_rawTextureGeneration; }
+
+void report_raw_texture_stats() noexcept {
+  static const bool on = std::getenv("AURORA_TEXCACHE_STATS") != nullptr;
+  if (on) {
+    std::fprintf(stderr,
+                 "[texcache] resolves=%llu memo_hits=%llu hashed=%llu hashed_kb=%llu hits=%llu creates=%llu "
+                 "entries=%zu\n",
+                 static_cast<unsigned long long>(s_rawStats.resolves),
+                 static_cast<unsigned long long>(s_rawStats.memoHits),
+                 static_cast<unsigned long long>(s_rawStats.hashed),
+                 static_cast<unsigned long long>(s_rawStats.hashedBytes / 1024),
+                 static_cast<unsigned long long>(s_rawStats.hits), static_cast<unsigned long long>(s_rawStats.creates),
+                 s_rawTextureCache.size());
+  }
+  s_rawStats = {};
 }
 
 static inline wgpu::BlendFactor to_blend_factor(GXBlendFactor fac, bool isDst) {
@@ -928,6 +1125,9 @@ void shutdown() noexcept {
   }
   s_textureObjectCaches.clear();
   s_tlutObjectCaches.clear();
+  s_rawTextureCache.clear();
+  s_rawTextureAtAddress.clear();
+  s_rawBindMemo.fill({});
   g_gxState.loadedTextures.fill({});
   g_gxState.loadedTluts.fill({});
   g_gxState.loadedTmemTluts.fill({});

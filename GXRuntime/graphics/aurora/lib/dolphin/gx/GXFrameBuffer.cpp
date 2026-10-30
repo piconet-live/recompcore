@@ -9,6 +9,8 @@
 #include "../vi/vi_internal.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 
 namespace {
@@ -78,6 +80,17 @@ void copy_tex(const void* dest, GXBool clear) noexcept {
   const auto clearColor = clear && g_gxState.colorUpdate;
   const auto clearAlpha = clear && g_gxState.alphaUpdate;
   const auto clearDepth = clear && g_gxState.depthUpdate;
+  static const bool copyLog = std::getenv("AURORA_COPY_LOG") != nullptr;
+  if (copyLog) {
+    std::fprintf(stderr,
+                 "[copy] phys %08X dest %p src %d,%d %dx%d mapped %d,%d %dx%d dst %ux%u fmt %u pixfmt %u clear %d "
+                 "colorUpd %d alphaUpd %d new %d\n",
+                 g_gxState.texCopyDestPhysical, dest, g_gxState.texCopySrc.x, g_gxState.texCopySrc.y,
+                 g_gxState.texCopySrc.width, g_gxState.texCopySrc.height, rect.x, rect.y, rect.width, rect.height,
+                 dstWidth, dstHeight, static_cast<unsigned>(texCopyFmt), static_cast<unsigned>(g_gxState.pixelFmt),
+                 clear ? 1 : 0, g_gxState.colorUpdate ? 1 : 0, g_gxState.alphaUpdate ? 1 : 0,
+                 handle.revision == 0 ? 1 : 0);
+  }
   gfx::resolve_pass(handle.handle, rect, clearColor, clearAlpha, clearDepth, g_gxState.clearColor, clear_depth_value(),
                     texCopyFmt);
   ++handle.revision;

@@ -417,6 +417,9 @@ void set_render_scissor(const gfx::ClipRect& scissor) noexcept;
 void copy_tex(const void* dest, GXBool clear) noexcept;
 const gfx::TextureBind& get_texture(GXTexMapID id) noexcept;
 void resolve_sampled_textures(const ShaderInfo& info) noexcept;
+// The retail texture cache's generation ends (gx.cpp): a frame's drain, a TMEM invalidate, a TLUT load, a copy.
+void end_raw_texture_generation() noexcept;
+void report_raw_texture_stats() noexcept;
 
 inline float clear_depth_value() {
   const float normalizedDepth = static_cast<float>(g_gxState.clearDepth) / 16777215.f;

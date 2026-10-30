@@ -32,6 +32,36 @@ struct PixelReplayOptions {
   int viewport_policy = -1;           // --viewport fit|stretch|native (-1: Aurora default)
   unsigned repeat = 1;                // --repeat N: replay the whole trace N times
   bool timing = false;                // --timing: per-frame CPU/submit/readback times
+  unsigned burst = 0;                 // --burst N: GX writes handed on N bytes at a time, as the
+                                      // gather pipe does (32); 0: one write at a time
+};
+
+// --burst: GX_WRITE records gathered into runs of N bytes (big-endian, as the
+// gather pipe writes them), handed on when full and before any other record.
+struct BurstGather {
+  unsigned cap = 0;
+  unsigned n = 0;
+  std::uint8_t bytes[256] = {};
+  template <typename Sink>
+  bool add(std::uint64_t value, unsigned size, Sink&& sink) {
+    for (unsigned i = 0; i < size; ++i) {
+      bytes[n++] = static_cast<std::uint8_t>(value >> ((size - 1u - i) * 8u));
+      if (n == cap) {
+        if (!sink(bytes, n))
+          return false;
+        n = 0;
+      }
+    }
+    return true;
+  }
+  template <typename Sink>
+  bool flush(Sink&& sink) {
+    if (n == 0)
+      return true;
+    const unsigned had = n;
+    n = 0;
+    return sink(bytes, had);
+  }
 };
 
 int dolgx_replay_pixels_main(const char* trace_path,

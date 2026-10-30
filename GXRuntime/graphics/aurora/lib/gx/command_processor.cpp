@@ -17,6 +17,8 @@
 #include <utility>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
 
@@ -375,6 +377,7 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
 
 // Forward declarations for register handlers
 static void handle_bp(u32 value, bool bigEndian);
+u32 g_drawLogCount = 0;
 static void handle_cp(u8 addr, u32 value, bool bigEndian);
 static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian);
 static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndian);
@@ -654,6 +657,10 @@ static void handle_bp(u32 value, bool bigEndian) {
   // Mask off the register ID from the value for field extraction
   // (the regId is stored in bits 24-31, data is in bits 0-23)
 
+  // the retail texture cache's generation ends where texture memory can change (gx.cpp)
+  if (regId == 0x52 || regId == 0x65 || regId == 0x66) {
+    end_raw_texture_generation();
+  }
   if (regId == 0xFE) {
     g_gxState.bpRegCache[regId] = value & 0x00FFFFFF;
     return;
@@ -1775,48 +1782,56 @@ static bool has_indexed_arrays() {
 static void calculate_indexed_array_sizes(GXVtxFmt fmt, u16 vtxCount, const u8* vertices, bool bigEndian,
                                           std::array<u32, GX_VA_MAX_ATTR>& arraySizes) {
   arraySizes.fill(0);
+  // The index fields' places in a vertex first (one pass over the attributes), then a tight loop per field over the
+  // vertices: the per-vertex walk over every attribute was half the drain's time on F-Zero's course display lists.
+  struct IndexField {
+    u32 attr;
+    u32 offset;
+    u32 bytes;
+  };
+  std::array<IndexField, 3 * (GX_VA_TEX7 - GX_VA_PNMTXIDX + 1)> fields;
+  u32 fieldCount = 0;
   const auto& vtxFmt = g_gxState.vtxFmts[fmt];
-  const u8* cursor = vertices;
-
-  for (u16 v = 0; v < vtxCount; ++v) {
-    for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
-      const auto attr = static_cast<GXAttr>(i);
-      switch (g_gxState.vtxDesc[i]) {
-      case GX_NONE:
-        break;
-      case GX_DIRECT:
-        cursor += comp_type_size(attr, vtxFmt.attrs[i].type) * comp_cnt_count(attr, vtxFmt.attrs[i].cnt);
-        break;
-      case GX_INDEX8: {
-        const u32 count = (i == GX_VA_NRM && vtxFmt.attrs[i].cnt == GX_NRM_NBT3) ? 3u : 1u;
-        for (u32 n = 0; n < count; ++n) {
-          const u32 index = *cursor++;
-          if (i >= GX_VA_POS && i <= GX_VA_TEX7) {
-            const auto& array = g_gxState.arrays[i];
-            const u32 required = (index + 1u) * array.stride;
-            if (required > arraySizes[i]) {
-              arraySizes[i] = required;
-            }
-          }
+  u32 offset = 0;
+  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+    const auto attr = static_cast<GXAttr>(i);
+    switch (g_gxState.vtxDesc[i]) {
+    case GX_NONE:
+      break;
+    case GX_DIRECT:
+      offset += comp_type_size(attr, vtxFmt.attrs[i].type) * comp_cnt_count(attr, vtxFmt.attrs[i].cnt);
+      break;
+    case GX_INDEX8:
+    case GX_INDEX16: {
+      const u32 bytes = g_gxState.vtxDesc[i] == GX_INDEX8 ? 1u : 2u;
+      const u32 count = (i == GX_VA_NRM && vtxFmt.attrs[i].cnt == GX_NRM_NBT3) ? 3u : 1u;
+      for (u32 n = 0; n < count; ++n) {
+        if (i >= GX_VA_POS && i <= GX_VA_TEX7) {
+          fields[fieldCount++] = {static_cast<u32>(i), offset, bytes};
         }
-        break;
+        offset += bytes;
       }
-      case GX_INDEX16: {
-        const u32 count = (i == GX_VA_NRM && vtxFmt.attrs[i].cnt == GX_NRM_NBT3) ? 3u : 1u;
-        for (u32 n = 0; n < count; ++n) {
-          const u32 index = read_u16(cursor, bigEndian);
-          cursor += 2;
-          if (i >= GX_VA_POS && i <= GX_VA_TEX7) {
-            const auto& array = g_gxState.arrays[i];
-            const u32 required = (index + 1u) * array.stride;
-            if (required > arraySizes[i]) {
-              arraySizes[i] = required;
-            }
-          }
-        }
-        break;
+      break;
+    }
+    }
+  }
+  const u32 vtxSize = offset;
+  for (u32 f = 0; f < fieldCount; ++f) {
+    const auto& field = fields[f];
+    u32 maxIndex = 0;
+    const u8* cursor = vertices + field.offset;
+    if (field.bytes == 1) {
+      for (u16 v = 0; v < vtxCount; ++v, cursor += vtxSize) {
+        maxIndex = std::max<u32>(maxIndex, *cursor);
       }
+    } else {
+      for (u16 v = 0; v < vtxCount; ++v, cursor += vtxSize) {
+        maxIndex = std::max<u32>(maxIndex, read_u16(cursor, bigEndian));
       }
+    }
+    if (vtxCount != 0) {
+      const u32 required = (maxIndex + 1u) * g_gxState.arrays[field.attr].stride;
+      arraySizes[field.attr] = std::max(arraySizes[field.attr], required);
     }
   }
 }
@@ -1943,6 +1958,50 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
   populate_pipeline_config(config, prim, fmt);
   const auto info = build_shader_info(config.shaderConfig);
   resolve_sampled_textures(info);
+  // AURORA_DRAW_LOG=N: the first N draws of each frame's drain, their state
+  static const u32 drawLogMax = [] {
+    const char* v = std::getenv("AURORA_DRAW_LOG");
+    return v != nullptr ? static_cast<u32>(std::strtoul(v, nullptr, 10)) : 0u;
+  }();
+  if (g_drawLogCount < drawLogMax) {
+    const auto& vp = g_gxState.logicalViewport;
+    const auto& sc = g_gxState.logicalScissor;
+    std::fprintf(stderr,
+                 "[draw %u] prim %u verts %u vp %.1f,%.1f %.1fx%.1f z %.3f-%.3f sc %d,%d %dx%d zc %d zu %d zf %u cu %d "
+                 "au %d blend %u %u %u cull %u tev %u chans %u texgens %u tex",
+                 g_drawLogCount, static_cast<unsigned>(prim), vtxCount, vp.left, vp.top, vp.width, vp.height, vp.znear,
+                 vp.zfar, sc.x, sc.y, sc.width, sc.height, g_gxState.depthCompare ? 1 : 0, g_gxState.depthUpdate ? 1 : 0,
+                 static_cast<unsigned>(g_gxState.depthFunc), g_gxState.colorUpdate ? 1 : 0,
+                 g_gxState.alphaUpdate ? 1 : 0, static_cast<unsigned>(g_gxState.blendMode),
+                 static_cast<unsigned>(g_gxState.blendFacSrc), static_cast<unsigned>(g_gxState.blendFacDst),
+                 static_cast<unsigned>(g_gxState.cullMode), g_gxState.numTevStages, g_gxState.numChans,
+                 g_gxState.numTexGens);
+    for (u32 t = 0; t < MaxTextures; ++t) {
+      if (info.sampledTextures.test(t)) {
+        std::fprintf(stderr, " t%u:%08X%s", t, (g_gxState.loadedTextures[t].image3 & 0x001FFFFFu) << 5,
+                     g_gxState.textures[t] ? "" : "(empty)");
+      }
+    }
+    std::fprintf(stderr, "\n");
+  }
+  ++g_drawLogCount;
+  // AURORA_IND_LOG: each draw with indirect stages, its textures as resolved
+  static const bool indLog = std::getenv("AURORA_IND_LOG") != nullptr;
+  if (indLog && g_gxState.numIndStages > 0) {
+    std::fprintf(stderr, "[ind] prim %u verts %u indStages %u tevStages %u cull %u blend %u src %u dst %u", static_cast<unsigned>(prim),
+                 vtxCount, g_gxState.numIndStages, g_gxState.numTevStages, static_cast<unsigned>(g_gxState.cullMode),
+                 static_cast<unsigned>(g_gxState.blendMode), static_cast<unsigned>(g_gxState.blendFacSrc),
+                 static_cast<unsigned>(g_gxState.blendFacDst));
+    for (u32 t = 0; t < MaxTextures; ++t) {
+      if (info.sampledTextures.test(t)) {
+        const auto& b = g_gxState.textures[t];
+        std::fprintf(stderr, " | t%u phys %08X fmt %u %ux%u %s%s", t,
+                     (g_gxState.loadedTextures[t].image3 & 0x001FFFFFu) << 5, b.texObj.format(), b.texObj.width(),
+                     b.texObj.height(), b ? "bound" : "EMPTY", info.sampledIndTextures.test(t) ? " ind" : "");
+      }
+    }
+    std::fprintf(stderr, "\n");
+  }
   const auto bindGroups = build_bind_groups(info);
   const auto pipeline = gfx::pipeline_ref(config);
 

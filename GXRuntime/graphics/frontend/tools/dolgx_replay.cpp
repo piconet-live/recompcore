@@ -46,6 +46,8 @@ int usage(std::FILE* out) {
       "  --viewport <policy>    with --pixels: fit, stretch or native\n"
       "  --repeat <N>           with --pixels, replay the trace N times\n"
       "  --timing               with --pixels, per-frame timing lines\n"
+      "  --burst <N>            hand GX writes on N bytes at a time (32: the\n"
+      "                         gather pipe's bursts); 0: one write at a time\n"
       "  --help                 this text\n"
       "exit: 0 ok, 1 replay/comparison failure, 2 usage or I/O error\n");
   return out == stdout ? 0 : 2;
@@ -80,6 +82,14 @@ struct Histogram {
 
 void histogram_observe(const DolGxRecompTraceEvent& event, void* user) {
   auto* h = static_cast<Histogram*>(user);
+  // DOLGX_EVENTS=1 with --histogram: every decode event but the FIFO byte
+  // counts, one line each, numbered by draw ("draw N kind a b c d"), to find
+  // the draws of one effect by their state.
+  static const bool events = std::getenv("DOLGX_EVENTS") != nullptr;
+  if (events && event.kind != DOL_GX_RECOMP_EVENT_FIFO_BYTES)
+    std::printf("ev draw %llu kind %u a %08X b %08X c %08X d %08X\n",
+                (unsigned long long)h->draws, (unsigned)event.kind, event.a,
+                event.b, event.c, event.d);
   switch (event.kind) {
   case DOL_GX_RECOMP_EVENT_BP_REG: {
     const std::uint32_t reg = event.a;
@@ -281,6 +291,9 @@ int main(int argc, char** argv) {
           static_cast<unsigned>(std::strtoul(argv[++i], nullptr, 10));
       if (pixel_options.repeat == 0)
         pixel_options.repeat = 1;
+    } else if (std::strcmp(arg, "--burst") == 0 && i + 1 < argc) {
+      pixel_options.burst =
+          static_cast<unsigned>(std::strtoul(argv[++i], nullptr, 10));
     } else if (std::strcmp(arg, "--timing") == 0) {
       pixel_options.timing = true;
     } else if (arg[0] != '-' && trace_path == nullptr) {
