@@ -843,6 +843,7 @@ void evict_tlut_object(u32 tlutObjId) noexcept {
 }
 
 void clear_copy_texture_cache() noexcept {
+  release_xfb_copy();
   g_gxState.copyTextures.clear();
   s_copyCache.clear();
   update_cache_stats();

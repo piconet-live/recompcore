@@ -309,7 +309,23 @@ TextureWithSampler create_render_texture(uint32_t width, uint32_t height, bool m
   };
 }
 
+static TextureWithSampler g_presentOverride;
+
+void set_present_override(const wgpu::Texture& texture, const wgpu::TextureView& view, wgpu::Extent3D size,
+                          wgpu::TextureFormat format) noexcept {
+  g_presentOverride = {
+      .texture = texture,
+      .view = view,
+      .size = size,
+      .format = format,
+      .sampler = g_frameBuffer.sampler,
+  };
+}
+
 const TextureWithSampler& present_source() noexcept {
+  if (g_presentOverride.texture) {
+    return g_presentOverride;
+  }
   return g_graphicsConfig.msaaSamples > 1 ? g_frameBufferResolved : g_frameBuffer;
 }
 
@@ -1098,6 +1114,7 @@ void shutdown() {
   g_ResampleUniformBuffer = {};
   g_resampledFrameBuffer = {};
   g_frameBuffer = {};
+  g_presentOverride = {};
   g_frameBufferResolved = {};
   g_depthBuffer = {};
   g_normalBuffer = {};
@@ -1138,6 +1155,7 @@ static void resize_swapchain_internal(uint32_t width, uint32_t height, uint32_t 
     g_surface.Configure(&surfaceConfiguration);
   }
   g_frameBuffer = create_render_texture(width, height, true);
+  g_presentOverride = {};
   g_frameBufferResolved = create_render_texture(width, height, false);
   g_depthBuffer = create_depth_texture(width, height);
   if (g_graphicsConfig.normalBuffer) {

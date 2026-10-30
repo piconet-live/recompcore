@@ -8,7 +8,11 @@
 #include "../../gx/texture.hpp"
 #include "../vi/vi_internal.hpp"
 
+#include "../../gfx/tex_copy_conv.hpp"
+
 #include <algorithm>
+#include <array>
+#include <cstdlib>
 #include <cmath>
 
 namespace {
@@ -52,6 +56,63 @@ void copy_tex(const void* dest, GXBool clear) noexcept {
   const auto clearDepth = clear && g_gxState.depthUpdate;
   gfx::resolve_pass_into(copy.handle, rect, clearColor, clearAlpha, clearDepth, g_gxState.clearColor,
                          clear_depth_value(), texCopyFmt, g_gxState.pixelFmt);
+}
+// The display copy's texture: released with the copy textures (size change, shutdown), never by a static destructor
+static gfx::TextureHandle g_xfbCopy;
+void release_xfb_copy() noexcept { g_xfbCopy.reset(); }
+
+void copy_xfb(u32 copyValue) noexcept {
+  // Bits of BP 0x52 (Dolphin's UPE_Copy): 0 clamp top, 1 clamp bottom, 7-8 gamma, 10 y-scale invert, 11 clear
+  static const bool enabled = [] {
+    const char* v = std::getenv("AURORA_XFB");
+    return v == nullptr || v[0] != '0';
+  }();
+  // The vertical (deflicker) filter as the hardware applies it: AURORA_XFB_FILTER=1. By default the coefficients are
+  // summed into the middle row, as Dolphin's default "Disable Copy Filter" (brightness kept, no blur).
+  static const bool hwFilter = [] {
+    const char* v = std::getenv("AURORA_XFB_FILTER");
+    return v != nullptr && v[0] == '1';
+  }();
+  const bool clear = (copyValue >> 11 & 1) != 0;
+  const auto rect = map_logical_scissor(g_gxState.texCopySrc);
+  const u32 yScaleReg = g_gxState.bpRegCache[0x4E] & 0x1FF;
+  float yScale = 1.f;
+  if (yScaleReg != 0) {
+    yScale = (copyValue >> 10 & 1) != 0 ? 256.f / static_cast<float>(yScaleReg) : static_cast<float>(yScaleReg) / 256.f;
+  }
+  // As the hardware: 1 + (height - 1) * scale lines
+  const u32 lines = std::max<u32>(
+      static_cast<u32>(1.f + static_cast<float>(g_gxState.texCopySrc.height - 1) * yScale), 1);
+  const u32 width = static_cast<u32>(std::max(rect.width, 1));
+  static constexpr float GammaRcp[4] = {1.f, 1.f / 1.7f, 1.f / 2.2f, 1.f / 2.2f};
+  const u32 c0 = g_gxState.bpRegCache[0x53], c1 = g_gxState.bpRegCache[0x54];
+  // Seven 6-bit coefficients (0x53: 0-3, 0x54: 4-6), summed into rows above, at and below (Dolphin's RAM sums)
+  const auto k = [&](u32 i) { return static_cast<float>((i < 4 ? c0 >> (6 * i) : c1 >> (6 * (i - 4))) & 0x3F); };
+  const bool clampTop = (copyValue & 1) != 0, clampBottom = (copyValue >> 1 & 1) != 0;
+  const auto [efbW, efbH] = gfx::get_render_target_size();
+  const float above = k(0) + k(1), middle = k(2) + k(3) + k(4), below = k(5) + k(6);
+  const std::array<float, 8> params{
+      hwFilter ? above : 0.f,
+      hwFilter ? middle : above + middle + below,
+      hwFilter ? below : 0.f,
+      GammaRcp[copyValue >> 7 & 3],
+      static_cast<float>(clampTop ? rect.y : 0),
+      static_cast<float>((clampBottom ? rect.y + rect.height : static_cast<int32_t>(efbH)) - 1),
+      0.f,
+      0.f,
+  };
+  const auto clearColor = clear && g_gxState.colorUpdate;
+  const auto clearAlpha = clear && g_gxState.alphaUpdate && efb_has_alpha(g_gxState.pixelFmt);
+  const auto clearDepth = clear && g_gxState.depthUpdate;
+  if (!enabled) {
+    return; // stage 3's behaviour: the EFB is presented, and not cleared here
+  }
+  auto& s_xfb = g_xfbCopy;
+  if (!s_xfb || s_xfb->size.width != width || s_xfb->size.height != lines) {
+    s_xfb = gfx::new_render_texture(width, lines, GX_TF_RGBA8, "XFB copy");
+  }
+  gfx::resolve_pass_into(s_xfb, rect, clearColor, clearAlpha, clearDepth, g_gxState.clearColor, clear_depth_value(),
+                         gfx::tex_copy_conv::XfbCopyFormat, g_gxState.pixelFmt, &params);
 }
 } // namespace aurora::gx
 

@@ -271,6 +271,11 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
         passInfo.resolveTarget->format == passInfo.colorAttachments[SceneColorAttachmentIndex].format;
     if (needsConversion) {
       tex_copy_conv::run(cmd, convReq);
+      if (passInfo.resolveFormat == tex_copy_conv::XfbCopyFormat) {
+        // The display copy is what the hardware shows: present it (render worker, as the present and readback)
+        webgpu::set_present_override(passInfo.resolveTarget->texture, passInfo.resolveTarget->sampleTextureView,
+                                     dstSize, passInfo.resolveTarget->format);
+      }
     } else if (needsScaling || needsOpaqueAlpha || !sameFormat) {
       tex_copy_conv::blit(cmd, convReq);
     } else {

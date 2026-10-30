@@ -337,6 +337,66 @@ var<private> positions: array<vec2f, 3> = array(
 }
 )"sv;
 
+// The display (XFB) copy, as Dolphin's EFB-to-texture copy shader (TextureConverterShaderGen): rows above, at and
+// below summed with the copy filter's coefficients (in 64ths), clamped to 255, then gamma; alpha passes through.
+// Rows outside the clamp rows repeat the edge row. The source is sampled at the destination texel's centre.
+static constexpr std::string_view XfbShader = R"(
+@group(0) @binding(0) var src_samp: sampler;
+@group(0) @binding(1) var src: texture_2d<f32>;
+
+struct XfbParams {
+    offset: vec2f,
+    scale: vec2f,
+    coef: vec4f,
+    clamp_tb: vec4f,
+};
+@group(0) @binding(2) var<uniform> xf: XfbParams;
+
+struct VertexOutput {
+    @builtin(position) pos: vec4f,
+    @location(0) uv: vec2f,
+};
+
+var<private> positions: array<vec2f, 3> = array(
+    vec2f(-1.0, 1.0),
+    vec2f(-1.0, -3.0),
+    vec2f(3.0, 1.0),
+);
+var<private> uvs: array<vec2f, 3> = array(
+    vec2f(0.0, 0.0),
+    vec2f(0.0, 2.0),
+    vec2f(2.0, 0.0),
+);
+
+@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
+    var out: VertexOutput;
+    out.pos = vec4f(positions[vi], 0.0, 1.0);
+    out.uv = uvs[vi] * xf.scale + xf.offset;
+    return out;
+}
+
+fn row(uv: vec2f, dy: f32) -> vec4u {
+    let texSize = vec2f(textureDimensions(src));
+    let v = clamp(uv.y + dy * xf.clamp_tb.z, xf.clamp_tb.x, xf.clamp_tb.y);
+    let coord = clamp(vec2i(floor(vec2f(uv.x, v) * texSize)), vec2i(0), vec2i(texSize) - vec2i(1));
+    return vec4u(round(textureLoad(src, coord, 0) * 255.0));
+}
+
+@fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
+    let c = vec3u(xf.coef.xyz);
+    let prev = row(in.uv, -1.0);
+    let cur = row(in.uv, 0.0);
+    let next = row(in.uv, 1.0);
+    let sum = prev.rgb * c.x + cur.rgb * c.y + next.rgb * c.z;
+    var rgb = min(sum >> vec3u(6u), vec3u(255u));
+    var outc = vec3f(rgb) / 255.0;
+    if (xf.coef.w != 1.0) {
+        outc = round(pow(outc, vec3f(xf.coef.w)) * 255.0) / 255.0;
+    }
+    return vec4f(outc, f32(cur.a) / 255.0);
+}
+)"sv;
+
 struct ConvPipeline {
   GXTexFmt fmt;
   std::string_view fragShader;
@@ -559,6 +619,9 @@ void initialize() {
   };
   g_depthBindGroupLayout = g_device.CreateBindGroupLayout(&depthBindGroupLayoutDescriptor);
 
+  g_pipelines[XfbCopyFormat] =
+      create_pipeline({XfbCopyFormat, {}, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv XFB"}, XfbShader,
+                      g_bindGroupLayout);
   g_blitPipeline = create_pipeline(
       {GX_TF_RGBA8, FragPassthrough, webgpu::g_graphicsConfig.surfaceConfiguration.format, "TexCopyConv Blit"},
       ShaderPreamble, g_bindGroupLayout);

@@ -464,6 +464,10 @@ void set_render_viewport(const gfx::Viewport& viewport) noexcept;
 void set_logical_scissor(const gfx::ClipRect& scissor) noexcept;
 void set_render_scissor(const gfx::ClipRect& scissor) noexcept;
 void copy_tex(const void* dest, GXBool clear) noexcept;
+// A display (XFB) copy, BP 0x52 with bit 14: the copy filter, gamma and vertical scale applied on the GPU; the result
+// becomes the present source (as the hardware shows the XFB, not the EFB). AURORA_XFB=0 presents the EFB.
+void copy_xfb(u32 copyValue) noexcept;
+void release_xfb_copy() noexcept;
 const gfx::TextureBind& get_texture(GXTexMapID id) noexcept;
 void resolve_sampled_textures(const ShaderInfo& info) noexcept;
 

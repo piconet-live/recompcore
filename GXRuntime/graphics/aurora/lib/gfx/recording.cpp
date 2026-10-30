@@ -849,7 +849,7 @@ PipelineRef pipeline_ref(const clear::PipelineConfig& config) {
 
 void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
                        Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat,
-                       GXPixelFmt sourceFormat) {
+                       GXPixelFmt sourceFormat, const std::array<float, 8>* xfbParams) {
   // Resolve current render pass
   auto& prevPass = current_render_passes()[g_recorder.currentRenderPass];
   prevPass.resolveTarget = std::move(texture);
@@ -863,7 +863,19 @@ void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bo
       .scale = {static_cast<float>(rect.width) / srcW, static_cast<float>(rect.height) / srcH},
       .opaqueAlpha = !gx::efb_has_alpha(sourceFormat),
   };
-  prevPass.resolveUniformRange = push_uniform(uniforms);
+  if (xfbParams != nullptr) {
+    // The display copy: filter coefficients and 1/gamma as given; the clamp rows (EFB pixels) as UV row centres
+    const auto& p = *xfbParams;
+    const tex_copy_conv::XfbUniform xfb{
+        .offset = {uniforms.offset.x, uniforms.offset.y},
+        .scale = {uniforms.scale.x, uniforms.scale.y},
+        .coef = {p[0], p[1], p[2], p[3]},
+        .clamp = {(p[4] + 0.5f) / srcH, (p[5] + 0.5f) / srcH, 1.f / srcH, 0.f},
+    };
+    prevPass.resolveUniformRange = push_uniform(xfb);
+  } else {
+    prevPass.resolveUniformRange = push_uniform(uniforms);
+  }
   enqueue_pass(current_frame_packet(), g_recorder.currentRenderPass);
 
   // Populate new render pass from previous
