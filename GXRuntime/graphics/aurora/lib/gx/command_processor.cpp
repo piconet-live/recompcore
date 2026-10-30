@@ -717,6 +717,15 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
   const bool canMerge = lastDraw != nullptr && lastDraw->instanceCount == 1 &&
                         (lastDraw->indexCount != 0 || lastDraw->vtxCount >= 3);
 
+  // Patch 19: no room left in this frame's buffers: the draw is left out, as a whole (indices: at most 3 of 4 bytes a vertex,
+  // for it and for the draw it merges into)
+  const size_t mostIndices = (static_cast<size_t>(vtxCount) + (canMerge ? lastDraw->vtxCount : 0)) * 3 * 4;
+  if (!gfx::draw_fits(totalVtxBytes, mostIndices))
+    UNLIKELY {
+      reader.skip(totalVtxBytes);
+      return;
+    }
+
   // Push raw vertex data to buffer. Merged draws must remain contiguous with the previous range.
   const auto vertexData = reader.take(totalVtxBytes);
   gfx::Range vertRange = gfx::push_verts(vertexData.data(), vertexData.size(), canMerge ? 0 : 4);

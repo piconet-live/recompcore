@@ -29,7 +29,7 @@
 extern "C" {
 #endif
 
-#define AURORA_PRESENT_ABI 1
+#define AURORA_PRESENT_ABI 2
 
 typedef struct AuroraPresentConfig {
   uint32_t abi;            // AURORA_PRESENT_ABI
@@ -42,6 +42,7 @@ typedef struct AuroraPresentConfig {
   const char* log_path;    // a CSV line a frame: copy, times (NULL: none)
   uint32_t width, height;  // the hidden window's size (Aurora's EFB is the game's own 640x528 whatever it is)
   uint32_t most_behind;    // frames Aurora may be behind before it stops for the run (0: 4; and 256 MB at most)
+  uint32_t scale;          // the render scale: the game's 640x528 EFB drawn at this many times its size (0: 1)
 } AuroraPresentConfig;
 
 typedef struct AuroraPresentPicture {
@@ -60,6 +61,9 @@ typedef struct AuroraPresentStats {
   uint32_t stopped;         // 1: Aurora fell behind or failed and stopped for the run
   uint32_t failed;          // 1: Aurora could not start
   double feed_ms_median, present_ms_median, readback_ms_median;  // Aurora's thread, per frame
+  uint64_t overflow_drops;  // draws left out because a frame's buffer was full
+  uint32_t fatal;           // 1: a fatal error of Aurora's stopped it (the thread is parked; the game goes on)
+  uint32_t scale;           // the render scale in use
 } AuroraPresentStats;
 
 // Starts Aurora's thread. Returns 1, or 0 when the ABI differs (nothing started). Aurora's own start (the window,

@@ -283,6 +283,8 @@ public:
   [[nodiscard]] uint8_t* data() noexcept { return m_data; }
   [[nodiscard]] const uint8_t* data() const noexcept { return m_data; }
   [[nodiscard]] size_t size() const noexcept { return m_length; }
+  [[nodiscard]] size_t capacity() const noexcept { return m_capacity; }
+  [[nodiscard]] bool fixed() const noexcept { return !m_owned; }
   [[nodiscard]] bool empty() const noexcept { return m_length == 0; }
 
   void append(const void* data, size_t size) {

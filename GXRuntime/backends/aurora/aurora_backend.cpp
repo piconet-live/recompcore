@@ -115,6 +115,8 @@ long long_env(const char* name, long fallback) {
     return end == text ? fallback : value;
 }
 
+AuroraBackendFatalHandler s_fatal_handler = nullptr;
+
 void log_callback(AuroraLogLevel level, const char* module, const char* message,
                   unsigned int) {
     const char* level_name = "info";
@@ -127,8 +129,12 @@ void log_callback(AuroraLogLevel level, const char* module, const char* message,
     }
     std::fprintf(level >= LOG_ERROR ? stderr : stdout, "[aurora:%s:%s] %s\n",
                  level_name, module ? module : "core", message ? message : "");
-    if (level == LOG_FATAL)
+    if (level == LOG_FATAL) {
+        // Embedded in a game: its race must not end with Aurora (aurora_present parks this thread and stops for the run)
+        if (s_fatal_handler != nullptr)
+            s_fatal_handler(message ? message : "");
         std::abort();
+    }
 }
 
 void poll_events() {
@@ -401,3 +407,5 @@ void dol_aurora_shutdown(void) {
 }
 
 } // extern "C"
+
+void aurora_backend_set_fatal_handler(AuroraBackendFatalHandler handler) { gx_aurora::s_fatal_handler = handler; }

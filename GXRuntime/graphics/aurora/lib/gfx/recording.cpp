@@ -1,5 +1,8 @@
 #include "recording.hpp"
 
+#include <atomic>
+#include <cstdlib>
+
 #include "encoding.hpp"
 #include "frame.hpp"
 #include "lru_cache.hpp"
@@ -283,7 +286,28 @@ void seal_pass(FramePacket& frame, uint32_t passIndex) {
   pass.sealed = true;
 }
 
+// Patch 19: a frame's fixed staging buffers never abort the process. What has no room is dropped and counted; a draw is
+// dropped whole before anything of it is pushed (draw_fits), so a dropped draw leaves no half-merged state behind.
+std::atomic<uint64_t> g_overflowDrops{0};
+void note_overflow(const char* what, size_t size, size_t length) {
+  if (g_overflowDrops.fetch_add(1, std::memory_order_relaxed) == 0) {
+    Log.error("frame buffer full ({}: {} bytes used, {} more wanted): what has no room is left out of the frame", what,
+              size, length);
+  }
+}
+bool has_room(const ByteBuffer& target, size_t length, size_t alignment, size_t keep = 0) {
+  if (!target.fixed()) {
+    return true;
+  }
+  const size_t begin = alignment != 0 ? AURORA_ALIGN(target.size(), alignment) : target.size();
+  return begin + length + keep <= target.capacity();
+}
+
 Range push(ByteBuffer& target, const uint8_t* data, size_t length, size_t alignment) {
+  if (!has_room(target, length, alignment, gx::MaxUniformSize)) {
+    note_overflow("push", target.size(), length);
+    return {};
+  }
   if (alignment != 0) {
     const size_t begin = target.size();
     const size_t alignedBegin = AURORA_ALIGN(begin, alignment);
@@ -1240,6 +1264,29 @@ void finish() {
   }
 }
 
+bool draw_fits(size_t vertexBytes, size_t indexBytes) noexcept {
+  if (!g_recorder.active()) {
+    return true;
+  }
+  // AURORA_TEST_VERTEX_LIMIT=<bytes> (a test): a frame's vertex buffer as if it were this small
+  static const size_t testLimit = [] {
+    const char* v = std::getenv("AURORA_TEST_VERTEX_LIMIT");
+    return v != nullptr ? static_cast<size_t>(std::strtoull(v, nullptr, 10)) : size_t{0};
+  }();
+  auto& frame = current_frame_packet();
+  const bool fits = has_room(frame.verts, vertexBytes, 4, gx::MaxUniformSize) &&
+                    has_room(frame.indices, indexBytes, 4, gx::MaxUniformSize) &&
+                    has_room(frame.uniforms, 2 * gx::MaxUniformSize, resources().limits.minUniformBufferOffsetAlignment,
+                             gx::MaxUniformSize) &&
+                    (testLimit == 0 || frame.verts.size() + vertexBytes <= testLimit);
+  if (!fits) {
+    note_overflow("draw", frame.verts.size(), vertexBytes);
+  }
+  return fits;
+}
+
+uint64_t overflow_drops() noexcept { return g_overflowDrops.load(std::memory_order_relaxed); }
+
 Range push_verts(const uint8_t* data, size_t length, size_t alignment) {
   ZoneScoped;
   if (!check_recording("push_verts")) {
@@ -1320,3 +1367,5 @@ void pop_debug_group() {
   aurora::gfx::g_recorder.debugGroupStack.pop_back();
 #endif
 }
+
+uint64_t aurora_overflow_drops() { return aurora::gfx::overflow_drops(); }

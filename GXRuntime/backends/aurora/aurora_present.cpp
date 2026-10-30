@@ -11,6 +11,7 @@
 #include <aurora/gfx.h>
 #include <dolphin/gx.h>
 #include <dolphin/gx/GXAurora.h>
+#include <dolphin/vi.h>
 
 #include <algorithm>
 #include <atomic>
@@ -186,7 +187,8 @@ struct State {
   std::uint32_t ram_size = 0;
   std::string data_dir, shot_prefix, log_path;
   std::vector<std::uint64_t> shots;
-  std::uint32_t width = 640, height = 528, most_behind = 4;
+  std::uint32_t width = 640, height = 528, most_behind = 4, scale = 1;
+  std::atomic<bool> fatal{false};  // a fatal error of Aurora's: its thread is parked, never joined, Aurora never shut down
   // the bytes waiting at most (a frame is 1 KB in menus, 100-300 KB in a race): the bound on what falling behind costs
   static constexpr std::size_t most_bytes_behind = 256u << 20;
   std::size_t bytes_waiting = 0;  // (under lock)
@@ -291,8 +293,21 @@ void stop_for_run(const char* why) {
   s->stats.stopped = 1;
 }
 
+// In place of Aurora's abort, on whichever thread of Aurora's it happened: an abort would end the game and its race,
+// and nothing of the race depends on Aurora. The thread never returns (Aurora's state is not to be trusted from here),
+// Aurora is stopped for the run and the emulator's own picture comes back.
+[[noreturn]] void on_fatal(const char* message) {
+  std::fprintf(stderr, "[aurora-present] fatal error, Aurora stopped for the run: %s\n", message);
+  std::fflush(stderr);
+  s->fatal = true;
+  stop_for_run("a fatal error");
+  for (;;)
+    std::this_thread::sleep_for(std::chrono::hours(24));
+}
+
 void run() {
   install_mtx_check();
+  aurora_backend_set_fatal_handler(on_fatal);
   aurora_backend_set_guest_address_resolver(ram_resolver, nullptr);
   const AuroraBackendConfig config = {
       .app_name = "Piconet Aurora",
@@ -330,7 +345,23 @@ void run() {
   const char* blocking = std::getenv("AURORA_DRAWS_BLOCKING");
   AuroraSetDrawsBlocking(blocking != nullptr && blocking[0] == '1');
   GXFlush();
-  AuroraSetViewportPolicy(static_cast<AuroraViewportPolicy>(2));  // native: the game's own viewport, unscaled
+  if (s->scale > 1) {
+    // The render scale, as Aurora's own games ask for it: the game's EFB (640x528) is the logical frame buffer, and
+    // viewports, scissors and copies map from it to a content frame buffer this many times its size. The (hidden)
+    // window keeps its size.
+    static GXRenderModeObj mode = GXNtsc480IntDf;
+    mode.fbWidth = 640;
+    mode.efbHeight = 528;
+    mode.xfbHeight = 528;
+    VIConfigure(&mode);
+    VISetFrameBufferScale(static_cast<float>(s->scale));
+    AuroraSetViewportPolicy(AURORA_VIEWPORT_STRETCH);
+  } else {
+    AuroraSetViewportPolicy(AURORA_VIEWPORT_NATIVE);  // the game's own viewport, unscaled
+  }
+  // AURORA_TEST_FATAL=<copy> (a test): a stream Aurora cannot decode at this copy, for the way a fatal error goes
+  const char* test_fatal_text = std::getenv("AURORA_TEST_FATAL");
+  const std::uint64_t test_fatal = test_fatal_text != nullptr ? std::strtoull(test_fatal_text, nullptr, 10) : 0;
 
   {
     std::lock_guard g{s->lock};
@@ -355,6 +386,11 @@ void run() {
       waiting = s->queue.size();
     }
     const auto start = Clock::now();
+    if (test_fatal != 0 && f.copy == test_fatal) {
+      static const std::uint8_t bad[32] = {0x01, 0x01, 0x01, 0x01};
+      aurora_backend_gx_write_burst(bad, sizeof bad);
+      aurora_backend_present();
+    }
     for (std::size_t off = 0; off < f.bytes.size(); off += 32768) {
       const std::size_t n = std::min<std::size_t>(32768, f.bytes.size() - off);
       aurora_backend_gx_write_burst(f.bytes.data() + off, static_cast<u32>(n));
@@ -441,6 +477,7 @@ int aurora_present_start(const AuroraPresentConfig* config) {
     s->height = config->height;
   if (config->most_behind)
     s->most_behind = config->most_behind;
+  s->scale = std::clamp<std::uint32_t>(config->scale, 1u, 8u);
   if (const char* v = std::getenv("AURORA_MOST_BEHIND"); v != nullptr && std::atoi(v) > 0)  // (tests)
     s->most_behind = static_cast<std::uint32_t>(std::atoi(v));
   s->building.reserve(512u * 1024u);
@@ -516,6 +553,9 @@ void aurora_present_stats(AuroraPresentStats* out) {
   out->feed_ms_median = median(s->feed_ms);
   out->present_ms_median = median(s->present_ms);
   out->readback_ms_median = median(s->readback_ms);
+  out->overflow_drops = aurora_overflow_drops();
+  out->fatal = s->fatal ? 1 : 0;
+  out->scale = s->scale;
 }
 
 void aurora_present_stop(void) {
@@ -526,6 +566,12 @@ void aurora_present_stop(void) {
     s->quit = true;
   }
   s->wake.notify_one();
+  if (s->fatal) {
+    // (a thread of Aurora's is parked for good: nothing of Aurora can be waited for or shut down; the process ends soon)
+    if (s->thread.joinable())
+      s->thread.detach();
+    return;
+  }
   if (s->thread.joinable())
     s->thread.join();
   // (s is kept: a picture taken before the stop may still be read; the process ends soon after)

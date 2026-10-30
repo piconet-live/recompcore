@@ -35,6 +35,7 @@ struct Settings
   // and <shot_prefix>-dolphin-<copy>.png (the emulator's own XFB, read back without a wait)
   std::string shot_prefix;
   std::vector<u64> shots;
+  u32 scale = 0;         // the render scale (0: the emulator's own internal resolution)
   std::string log_path;  // Aurora's thread: a CSV line a frame (empty: none); the presents' beside it (-shown.csv)
 };
 

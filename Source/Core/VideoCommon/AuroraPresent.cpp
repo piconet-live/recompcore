@@ -21,6 +21,7 @@
 #include "VideoCommon/AbstractGfx.h"
 #include "VideoCommon/AbstractTexture.h"
 #include "VideoCommon/FrameRedrawFrame.h"
+#include "VideoCommon/FramebufferManager.h"
 #include "VideoCommon/TextureConfig.h"
 
 #ifdef _WIN32
@@ -31,7 +32,7 @@ namespace VideoCommon::AuroraPresent
 {
 namespace
 {
-// gxruntime/aurora_present.h, as the library exports it (ABI 1)
+// gxruntime/aurora_present.h, as the library exports it (ABI 2)
 struct LibConfig
 {
   u32 abi;
@@ -44,6 +45,7 @@ struct LibConfig
   const char* log_path;
   u32 width, height;
   u32 most_behind;
+  u32 scale;
 };
 struct LibPicture
 {
@@ -56,8 +58,11 @@ struct LibStats
   u64 frames_in, frames_drawn, pictures, pictures_taken, bytes_in, most_behind;
   u32 stopped, failed;
   double feed_ms_median, present_ms_median, readback_ms_median;
+  u64 overflow_drops;
+  u32 fatal;
+  u32 scale;
 };
-constexpr u32 LIB_ABI = 1;
+constexpr u32 LIB_ABI = 2;
 
 struct Library
 {
@@ -159,6 +164,9 @@ void Start()
   c.log_path = s_settings.log_path.empty() ? nullptr : s_settings.log_path.c_str();
   c.width = 640;
   c.height = 528;
+  // the same internal resolution as the emulator's own, unless the host asks for another
+  c.scale = s_settings.scale ? s_settings.scale :
+                               (g_framebuffer_manager ? g_framebuffer_manager->GetEFBScale() : 1);
   if (!s_lib.start(&c))
   {
     s_load_problem = "the library's interface is not this emulator's (ABI 1)";
@@ -188,10 +196,10 @@ std::string MakeReport()
   std::string lag;
   for (size_t i = 0; i < s_lag.size(); ++i)
     lag += fmt::format("{}{}", i ? " " : "", s_lag[i]);
-  return fmt::format("aurora: {} frames in ({} KB), {} drawn, {} pictures, {} shown; presents {}: {} with Aurora's "
+  return fmt::format("aurora: scale {}, {} draws left out (buffers full){}; {} frames in ({} KB), {} drawn, {} pictures, {} shown; presents {}: {} with Aurora's "
                      "picture, {} the emulator's own; picture behind by 0..9+ copies: {}; most frames waiting {}; "
                      "Aurora's thread a frame (medians): feed {:.2f} ms, present {:.2f} ms, readback {:.2f} ms{}{}{}{}",
-                     st.frames_in, st.bytes_in / 1024, st.frames_drawn, st.pictures, s_pictures_taken, s_presents,
+                     st.scale, st.overflow_drops, st.fatal ? ", STOPPED BY A FATAL ERROR" : "", st.frames_in, st.bytes_in / 1024, st.frames_drawn, st.pictures, s_pictures_taken, s_presents,
                      s_presents - s_presents_own, s_presents_own, lag, st.most_behind, st.feed_ms_median,
                      st.present_ms_median, st.readback_ms_median, st.stopped ? "; STOPPED (fell behind or failed)" : "",
                      st.failed ? "; Aurora could not start" : "",

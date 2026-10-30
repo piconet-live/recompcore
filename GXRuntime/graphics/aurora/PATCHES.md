@@ -29,6 +29,7 @@ ports do not need it); **local** = tools and diagnostics for GXRuntime's harness
 | 15 | Draw diagnostics (`AURORA_DRAW_LOG`, `_TCG`, `AURORA_IND_LOG`, `AURORA_SKIP_TEX`) + fixup | local | 4172723df3, e6a85563d4 |
 | 16 | Embedded in another program (`AuroraConfig::embedded`): hidden window for life, no gamepad/joystick/haptic/sensor devices | local (until PresentTarget, upstream 12943d1) | c4e0fd4 (gxr/r3) |
 | 17 | Window letterbox from the frame's own present source, worked out on the render worker | upstream | 2aa1d92 (gxr/r3) |
+| 19 | A frame's fixed staging buffers never abort: draws with no room are dropped whole and counted (`AURORA_TEST_VERTEX_LIMIT`); the display copy's lines scale with the render target | upstream, to discuss | new (gxr/r3) |
 | 18 | Larger vertex (32 MiB), index (8 MiB) and storage (16 MiB) buffers: a retail frame overflowed 5 MiB of vertices (course 37) and the fixed staging buffer aborted | upstream, to discuss | new |
 
 ## Not carried, and why

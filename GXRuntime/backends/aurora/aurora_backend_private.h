@@ -165,6 +165,9 @@ void aurora_backend_load_tlut_guest(u8 slot, u32 guest_address, const void* data
 void aurora_backend_set_copy_destination(const void* data);
 void aurora_backend_set_copy_destination_guest(u32 guest_address, const void* data);
 void aurora_backend_set_guest_address_resolver(DolPlatformGuestAddressResolverFn resolve, void* user);
+// What a fatal error of Aurora's calls in place of aborting the process (it does not return; null: abort)
+typedef void (*AuroraBackendFatalHandler)(const char* message);
+void aurora_backend_set_fatal_handler(AuroraBackendFatalHandler handler);
 void aurora_backend_configure_vi(u32 tv_mode, u16 fb_width, u16 efb_height, u16 xfb_height, u16 vi_width, u16 vi_height);
 
 bool aurora_backend_pad_init(void);

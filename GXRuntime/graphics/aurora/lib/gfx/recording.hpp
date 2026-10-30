@@ -113,6 +113,9 @@ void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bo
                        GXPixelFmt sourceFormat, const std::array<float, 8>* xfbParams = nullptr);
 uint32_t align_uniform(uint32_t value);
 Vec2<uint32_t> get_render_target_size() noexcept;
+// Patch 19: is there room in this frame's buffers for a draw of these sizes (false: it was counted; leave it out)
+bool draw_fits(size_t vertexBytes, size_t indexBytes) noexcept;
+uint64_t overflow_drops() noexcept;
 void set_viewport(const Viewport& viewport) noexcept;
 void set_scissor(const ClipRect& scissor) noexcept;
 void push_debug_group(std::string label);

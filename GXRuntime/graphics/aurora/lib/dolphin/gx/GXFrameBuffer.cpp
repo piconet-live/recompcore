@@ -82,7 +82,7 @@ void copy_xfb(u32 copyValue) noexcept {
   }
   // As the hardware: 1 + (height - 1) * scale lines
   const u32 lines = std::max<u32>(
-      static_cast<u32>(1.f + static_cast<float>(g_gxState.texCopySrc.height - 1) * yScale), 1);
+      static_cast<u32>(1.f + static_cast<float>(rect.height - 1) * yScale), 1);
   const u32 width = static_cast<u32>(std::max(rect.width, 1));
   static constexpr float GammaRcp[4] = {1.f, 1.f / 1.7f, 1.f / 2.2f, 1.f / 2.2f};
   const u32 c0 = g_gxState.bpRegCache[0x53], c1 = g_gxState.bpRegCache[0x54];
