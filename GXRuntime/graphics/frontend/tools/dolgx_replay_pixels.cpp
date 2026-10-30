@@ -36,6 +36,76 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
+namespace {
+#if defined(_WIN32)
+// AURORA_MTX_CHECK=1 (diagnostic): msvcp140's _Mtx_unlock is replaced with a copy that first checks that the
+// calling thread owns the mutex. Unlocking a mutex the thread does not own (a freed one among them) prints the
+// mutex, its fields and the caller's stack, then breaks (under cdb: every thread's stack). Layout of the STL's
+// _Mtx_internal_imp_t as this msvcp140 has it: SRWLOCK at +0x10, owner thread id at +0x48, count at +0x4C.
+extern "C" int mtx_unlock_checked(void* mtx) {
+  auto* p = static_cast<unsigned char*>(mtx);
+  auto* tid = reinterpret_cast<volatile long*>(p + 0x48);
+  auto* count = reinterpret_cast<volatile int*>(p + 0x4C);
+  if (*tid != static_cast<long>(GetCurrentThreadId())) {
+    std::fprintf(stderr, "[mtx-check] unlock of a mutex this thread does not own: %p owner %08lx count %08x thread %08lx\n",
+                 mtx, static_cast<unsigned long>(*tid), static_cast<unsigned>(*count),
+                 static_cast<unsigned long>(GetCurrentThreadId()));
+    void* frames[32];
+    const USHORT n = RtlCaptureStackBackTrace(0, 32, frames, nullptr);
+    for (USHORT i = 0; i < n; ++i) {
+      HMODULE mod = nullptr;
+      char name[MAX_PATH] = "?";
+      if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                             static_cast<LPCSTR>(frames[i]), &mod)) {
+        GetModuleFileNameA(mod, name, MAX_PATH);
+      }
+      const char* base = std::strrchr(name, '\\');
+      std::fprintf(stderr, "[mtx-check]   #%u %s+0x%llx\n", i, base ? base + 1 : name,
+                   static_cast<unsigned long long>(static_cast<unsigned char*>(frames[i]) -
+                                                   reinterpret_cast<unsigned char*>(mod)));
+    }
+    std::fflush(stderr);
+    __debugbreak();
+  }
+  if (--*count == 0) {
+    *tid = -1;
+    ReleaseSRWLockExclusive(reinterpret_cast<PSRWLOCK>(p + 0x10));
+  }
+  return 0;
+}
+
+void install_mtx_check() {
+  const char* v = std::getenv("AURORA_MTX_CHECK");
+  if (v == nullptr || v[0] == '0')
+    return;
+  HMODULE msvcp = GetModuleHandleA("msvcp140.dll");
+  auto* target = msvcp ? reinterpret_cast<unsigned char*>(GetProcAddress(msvcp, "_Mtx_unlock")) : nullptr;
+  if (target == nullptr) {
+    std::fprintf(stderr, "[mtx-check] msvcp140 _Mtx_unlock not found\n");
+    return;
+  }
+  // mov rax, imm64; jmp rax
+  unsigned char patch[12] = {0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0};
+  const auto addr = reinterpret_cast<unsigned long long>(&mtx_unlock_checked);
+  std::memcpy(patch + 2, &addr, 8);
+  DWORD old = 0;
+  VirtualProtect(target, sizeof(patch), PAGE_EXECUTE_READWRITE, &old);
+  std::memcpy(target, patch, sizeof(patch));
+  VirtualProtect(target, sizeof(patch), old, &old);
+  FlushInstructionCache(GetCurrentProcess(), target, sizeof(patch));
+  std::fprintf(stderr, "[mtx-check] _Mtx_unlock checked\n");
+}
+#else
+void install_mtx_check() {}
+#endif
+} // namespace
+
 extern "C" {
 void aurora_backend_present(void);
 bool aurora_backend_should_quit(void);
@@ -186,6 +256,7 @@ int dolgx_replay_pixels_main(const char* trace_path,
   // Unbuffered stdout: a crash in the GPU stack must not swallow the lines
   // (and Aurora's info log) printed before it.
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  install_mtx_check();
   setenv("AURORA_SYNC_PIPELINES", "1", 0);
   // The backend arms its recorder/shadow from these; a replay must never
   // re-record or shadow-decode.

@@ -18,6 +18,11 @@ bool g_inFlight = false;
 bool g_ready = false;
 // In-flight copy geometry (worker-written, callback-read under g_mutex).
 wgpu::Buffer g_buffer;
+// The buffer of the last completed map. complete_map runs inside Dawn's map callback, where dropping the last
+// reference destroys the buffer while Dawn still holds a mutex inside it (it unlocks freed memory afterwards: the
+// heap use-after-free behind the occasional access violation, exit code 5). It is released on the next
+// after_submit instead, outside any callback.
+wgpu::Buffer g_retiredBuffer;
 uint32_t g_copyWidth = 0;
 uint32_t g_copyHeight = 0;
 uint32_t g_copyBytesPerRow = 0;
@@ -61,7 +66,7 @@ void complete_map(wgpu::MapAsyncStatus status, wgpu::StringView message) {
              status != wgpu::MapAsyncStatus::Aborted) {
     Log.warn("EFB readback mapping failed: {}", message);
   }
-  g_buffer = {};
+  g_retiredBuffer = std::move(g_buffer);
   g_inFlight = false;
 }
 } // namespace
@@ -77,8 +82,11 @@ void after_submit() noexcept {
   // done), and complete_map takes g_mutex (std::mutex throws on the re-lock).
   wgpu::Buffer mapBuffer;
   uint64_t mapSize = 0;
+  wgpu::Buffer retired;
   {
     std::lock_guard lock{g_mutex};
+    // Dropped after g_mutex is released, outside any Dawn callback
+    retired = std::move(g_retiredBuffer);
     if (g_inFlight) {
       // Previous copy still mapping; keep the request armed for next frame.
       return;
