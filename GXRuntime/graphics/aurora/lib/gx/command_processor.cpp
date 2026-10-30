@@ -430,8 +430,80 @@ static u32 calc_vtx_size(GXVtxFmt fmt) noexcept {
 // matrices and TEV stages with SU scale and texture size; AURORA_IND_LOG logs draws with indirect stages;
 // AURORA_SKIP_TEX=ADDR[,ADDR...] (physical, hex) drops draws sampling any of those textures.
 u32 g_drawLogCount = 0;
-
 static u32 texture_phys(u32 slot) noexcept { return (g_gxState.loadedTextures[slot].image3 & 0x001FFFFFu) << 5; }
+// AURORA_DUMP_COPY=<copy> (aurora_present): every draw of that frame, whole: TEV, texture formats, samplers, indirect.
+extern "C" {
+volatile int g_auroraDrawDump = 0;
+}
+
+static void dump_draw(GXPrimitive prim, u16 vtxCount, const ShaderInfo& info) noexcept {
+  static u32 n = 0;
+  const auto& st = g_gxState;
+  std::fprintf(stderr, "[dump %u] prim %u verts %u blend %u %u %u lop %u zc %d zu %d zf %u cu %d au %d cull %u tev %u ind %u tg %u chans %u ac %u/%u op %u %u/%u fog %u\n",
+               n++, (unsigned)prim, vtxCount, (unsigned)st.blendMode, (unsigned)st.blendFacSrc, (unsigned)st.blendFacDst,
+               (unsigned)st.blendOp, st.depthCompare, st.depthUpdate, (unsigned)st.depthFunc, st.colorUpdate, st.alphaUpdate,
+               (unsigned)st.cullMode, st.numTevStages, st.numIndStages, st.numTexGens, st.numChans,
+               (unsigned)st.alphaCompare.comp0, st.alphaCompare.ref0, (unsigned)st.alphaCompare.op,
+               (unsigned)st.alphaCompare.comp1, st.alphaCompare.ref1, (unsigned)st.fog.type);
+  for (u32 t = 0; t < MaxTextures; ++t) {
+    if (!info.sampledTextures.test(t)) {
+      continue;
+    }
+    const auto& b = st.textures[t];
+    const auto& o = b.texObj;
+    std::fprintf(stderr, "  t%u phys %08X %ux%u fmt %u wrap %u %u min %u mag %u lod %.3f-%.3f bias %.3f aniso %u mips %u arb %d%s ind %d\n", t,
+                 texture_phys(t), o.width(), o.height(), (unsigned)o.format(), (unsigned)o.wrap_s(), (unsigned)o.wrap_t(),
+                 (unsigned)o.min_filter(), (unsigned)o.mag_filter(), o.min_lod(), o.max_lod(), o.lod_bias(),
+                 (unsigned)o.max_aniso(), b.ref ? (unsigned)b.ref->mipCount : 0u, b.ref ? (int)b.ref->hasArbitraryMips : 0,
+                 b.ref ? "" : " EMPTY", (int)info.sampledIndTextures.test(t));
+    static const char* hex = std::getenv("AURORA_DUMP_TEX");
+    if (hex != nullptr && std::strtoul(hex, nullptr, 16) == texture_phys(t)) {
+      const void* data = nullptr;
+      u32 avail = 0;
+      const u32 size = o.width() * o.height();
+      if (recomp::resolve_guest_address(texture_phys(t), size, recomp::AddressSpace::Physical, recomp::ResourceKind::Texture, &data, &avail)) {
+        std::fprintf(stderr, "  texdata ");
+        for (u32 i = 0; i < size && i < avail; ++i) {
+          std::fprintf(stderr, "%02x", static_cast<const u8*>(data)[i]);
+        }
+        std::fprintf(stderr, "\n");
+      }
+    }
+  }
+  for (u32 i = 0; i < st.numTexGens && i < MaxTexCoord; ++i) {
+    const auto& g = st.tcgs[i];
+    std::fprintf(stderr, "  tg%u type %u src %u mtx %u post %u norm %u su %ux%u\n", i, (unsigned)g.type, (unsigned)g.src,
+                 (unsigned)g.mtx, (unsigned)g.postMtx, g.normalize ? 1u : 0u, st.texCoordScales[i].scaleS + 1u,
+                 st.texCoordScales[i].scaleT + 1u);
+  }
+  for (u32 s = 0; s < st.numTevStages && s < MaxTevStages; ++s) {
+    const auto& g = st.tevStages[s];
+    std::fprintf(stderr, "  st%u tc %d map %d chan %d C(%u %u %u %u op%u b%u s%u r%u cl%d) A(%u %u %u %u op%u b%u s%u r%u cl%d) k %u %u swap %u %u ind(stg %u fmt %u bias %u alpha %u mtx %u wrap %u %u orig %d prev %d)\n", s,
+                 (int)g.texCoordId, (int)g.texMapId, (int)g.channelId, (unsigned)g.colorPass.a, (unsigned)g.colorPass.b,
+                 (unsigned)g.colorPass.c, (unsigned)g.colorPass.d, (unsigned)g.colorOp.op, (unsigned)g.colorOp.bias,
+                 (unsigned)g.colorOp.scale, (unsigned)g.colorOp.outReg, g.colorOp.clamp, (unsigned)g.alphaPass.a,
+                 (unsigned)g.alphaPass.b, (unsigned)g.alphaPass.c, (unsigned)g.alphaPass.d, (unsigned)g.alphaOp.op,
+                 (unsigned)g.alphaOp.bias, (unsigned)g.alphaOp.scale, (unsigned)g.alphaOp.outReg, g.alphaOp.clamp,
+                 (unsigned)g.kcSel, (unsigned)g.kaSel, (unsigned)g.tevSwapRas, (unsigned)g.tevSwapTex,
+                 (unsigned)g.indTexStage, (unsigned)g.indTexFormat, (unsigned)g.indTexBiasSel, (unsigned)g.indTexAlphaSel,
+                 (unsigned)g.indTexMtxId, (unsigned)g.indTexWrapS, (unsigned)g.indTexWrapT, g.indTexUseOrigLOD, g.indTexAddPrev);
+  }
+  for (u32 i = 0; i < st.numIndStages && i < MaxIndStages; ++i) {
+    const auto& g = st.indStages[i];
+    std::fprintf(stderr, "  ind%u tc %d map %d scale %u %u\n", i, (int)g.texCoordId, (int)g.texMapId, (unsigned)g.scaleS,
+                 (unsigned)g.scaleT);
+  }
+  for (u32 i = 0; i < MaxIndTexMtxs && st.numIndStages != 0; ++i) {
+    const auto& m = st.indTexMtxs[i].mtx;
+    std::fprintf(stderr, "  imtx%u %.4f %.4f %.4f / %.4f %.4f %.4f exp %d\n", i, m.m0.x, m.m1.x, m.m2.x, m.m0.y, m.m1.y,
+                 m.m2.y, st.indTexMtxs[i].scaleExp);
+  }
+  for (u32 i = 0; i < 3; ++i) {
+    const auto& c = st.colorRegs[i + 1];
+    const auto& k = st.kcolors[i];
+    std::fprintf(stderr, "  c%u %.3f %.3f %.3f %.3f k%u %.3f %.3f %.3f %.3f\n", i, c.x(), c.y(), c.z(), c.w(), i, k.x(), k.y(), k.z(), k.w());
+  }
+}
 
 // False when the draw is to be skipped
 static bool diagnose_draw(GXPrimitive prim, u16 vtxCount, const ShaderInfo& info) noexcept {
@@ -456,6 +528,9 @@ static bool diagnose_draw(GXPrimitive prim, u16 vtxCount, const ShaderInfo& info
     return list;
   }();
   const auto& st = g_gxState;
+  if (g_auroraDrawDump != 0) {
+    dump_draw(prim, vtxCount, info);
+  }
   if (g_drawLogCount < drawLogMax) {
     const auto& vp = st.logicalViewport;
     const auto& sc = st.logicalScissor;

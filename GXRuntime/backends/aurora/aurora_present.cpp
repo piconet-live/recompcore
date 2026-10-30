@@ -37,6 +37,8 @@
 #pragma comment(lib, "dbghelp.lib")
 #endif
 
+extern "C" volatile int g_auroraDrawDump;  // command_processor.cpp (AURORA_DUMP_COPY)
+
 namespace {
 using Clock = std::chrono::steady_clock;
 
@@ -394,6 +396,11 @@ void run() {
       waiting = s->queue.size();
     }
     const auto start = Clock::now();
+    static const std::uint64_t dump_copy = [] {
+      const char* v = std::getenv("AURORA_DUMP_COPY");
+      return v != nullptr ? std::strtoull(v, nullptr, 10) : 0ull;
+    }();
+    g_auroraDrawDump = dump_copy != 0 && f.copy == dump_copy;
     if (test_fatal != 0 && f.copy == test_fatal) {
       on_fatal("AURORA_TEST_FATAL");
     }

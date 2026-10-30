@@ -33,6 +33,8 @@ ports do not need it); **local** = tools and diagnostics for GXRuntime's harness
 | 18 | Larger vertex (32 MiB), index (8 MiB) and storage (16 MiB) buffers: a retail frame overflowed 5 MiB of vertices (course 37) and the fixed staging buffer aborted | upstream, to discuss | new |
 | 20 | Every logic op, as Dolphin's approximation table has them (INV, SET, INVCOPY exact through what the shader outputs): a cached pipeline with GX_LO_INV was fatal at every later start | upstream | gxr/r3 |
 | 21 | A byte that is no command never stops Aurora: one byte and on, as Dolphin's decoder (0xC0 and up were taken for draws); the first ones logged with the last commands read | upstream | gxr/r3 |
+| 22 | Indirect texturing as the hardware: a negative coordinate wraps up into 0..size (WGSL `%` kept the sign: course 9's whole surface speckled, 26 to 47.5 dB); the indirect sample rounded to its 8-bit value before the format's shift | upstream | gxr/r3 |
+| 23 | Draw dump of one frame (`AURORA_DUMP_COPY`, `AURORA_DUMP_TEX`): TEV, samplers, texture formats, indirect stages, matrices | local | gxr/r3 |
 
 ## Not carried, and why
 
