@@ -320,15 +320,10 @@ int main(int argc, char** argv) {
     }
     pixel_options.quiet = quiet;
     if (core) {
-#if DOLGX_REPLAY_HAS_CORE
-      return dolgx_replay_core_main(trace_path, pixel_options);
-#else
       std::fprintf(stderr,
-                   "dolgx_replay: this build has no --core support (built "
-                   "without Aurora; use the StrikersRecomp GUI tree's "
-                   "dolgx_replay)\n");
+                   "dolgx_replay: --core is gone: gxcore was dropped with "
+                   "the move to upstream Aurora (use --pixels)\n");
       return 2;
-#endif
     }
 #if DOLGX_REPLAY_HAS_PIXELS
     return dolgx_replay_pixels_main(trace_path, pixel_options);

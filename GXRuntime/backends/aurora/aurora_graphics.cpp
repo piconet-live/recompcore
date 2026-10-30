@@ -14,32 +14,9 @@
 #include <cstring>
 #include <span>
 
-#if GXRUNTIME_HAS_AURORA_RECOMP
-// gxcore substrate submission lives in the Aurora fork (lib/gfx/gxcore_draw.cpp),
-// linked into this binary via aurora::gx.
-namespace aurora::gfx::gxcore {
-bool submit_draw_plan(const gxruntime::gxcore::DrawPlan& plan);
-void copy_efb_to_texture(const gxruntime::gxcore::EfbCopyCommand& cmd);
-void reset_texture_cache();
-} // namespace aurora::gfx::gxcore
-#endif
 
 namespace gx_aurora {
 
-#if GXRUNTIME_HAS_AURORA_RECOMP
-void core_plan_observer(const gxruntime::gxcore::DrawPlan& plan, void*) {
-    if (!plan.ok)
-        return; // skip reasons are tallied in the sink gap counters
-    if (aurora::gfx::gxcore::submit_draw_plan(plan))
-        ++g_core_submitted;
-    else
-        ++g_core_rejected;
-}
-
-void core_copy_observer(const gxruntime::gxcore::EfbCopyCommand& cmd, void*) {
-    aurora::gfx::gxcore::copy_efb_to_texture(cmd);
-}
-#endif
 
 void write_aurora_command(u16 command) {
     GXParam1u8(GX_AURORA);
@@ -298,21 +275,6 @@ void shadow_frontend_call_display_list(const void* data, u32 size) {
         return;
     const std::span<const std::uint8_t> bytes(
         static_cast<const std::uint8_t*>(data), size);
-    if (g_gx_core_enabled) {
-        if (!g_shadow_frontend.write_display_list(bytes, &g_core_sink)) {
-            g_shadow_frontend_failed = true;
-            std::fprintf(stderr,
-                         "[gx-core] frontend rejected HLE display list "
-                         "(%u bytes): %s (opcode=0x%02X)\n",
-                         size,
-                         g_shadow_frontend.last_error() != nullptr
-                             ? g_shadow_frontend.last_error()
-                             : "none",
-                         static_cast<unsigned>(
-                             g_shadow_frontend.last_error_opcode()));
-        }
-        return;
-    }
     if (!g_shadow_frontend.write_display_list(bytes, &g_shadow_packet_sink)) {
         g_shadow_frontend_failed = true;
         std::fprintf(stderr,
@@ -375,27 +337,6 @@ void shadow_frontend_write_bytes(std::span<const std::uint8_t> fragment,
     if (!g_shadow_frontend_enabled || g_shadow_frontend_failed)
         return;
     const std::size_t size = fragment.size();
-    if (g_gx_core_enabled) {
-        if (!g_shadow_frontend.write_fifo(fragment) ||
-            !g_shadow_frontend.flush(&g_core_sink)) {
-            g_shadow_frontend_failed = true;
-            std::fprintf(stderr,
-                         "[gx-core] frontend rejected FIFO after %llu byte(s): "
-                         "%s (opcode=0x%02X offset=%llu); consumer=%s\n",
-                         g_fifo_bytes,
-                         g_shadow_frontend.last_error() != nullptr
-                             ? g_shadow_frontend.last_error()
-                             : "none",
-                         static_cast<unsigned>(
-                             g_shadow_frontend.last_error_opcode()),
-                         static_cast<unsigned long long>(
-                             g_shadow_frontend.last_error_offset()),
-                         g_core_sink.failure_reason() != nullptr
-                             ? g_core_sink.failure_reason()
-                             : "none");
-        }
-        return;
-    }
     if (!g_shadow_frontend.write_fifo(fragment) ||
         !g_shadow_frontend.flush(&g_shadow_packet_sink)) {
         g_shadow_frontend_failed = true;
@@ -602,29 +543,6 @@ extern "C" {
 void aurora_backend_present(void) {
     if (!gx_aurora::g_initialized)
         return;
-#if GXRUNTIME_HAS_AURORA_RECOMP
-    if (gx_aurora::g_gx_core_enabled && !gx_aurora::g_shadow_frontend_failed)
-        gx_aurora::g_core_sink.flush_frame();
-    if (gx_aurora::g_gx_core_enabled) {
-        static int s_cutscene_diag = -1;
-        if (s_cutscene_diag < 0)
-            s_cutscene_diag = std::getenv("STRIKERS_CUTSCENE_DIAG") != nullptr ? 1 : 0;
-        if (s_cutscene_diag) {
-            static gxruntime::gxcore::GapCounters s_prev{};
-            const gxruntime::gxcore::GapCounters& c = gx_aurora::g_core_sink.counters();
-            std::fprintf(stderr,
-                "[cutscene] present=%llu planned=%llu skipped=%llu cull=%llu "
-                "missing_vcd=%llu vtx_fail=%llu\n",
-                gx_aurora::g_present_count + 1,
-                c.draws_planned - s_prev.draws_planned,
-                c.draws_skipped - s_prev.draws_skipped,
-                c.cull_all_draws - s_prev.cull_all_draws,
-                c.missing_vcd - s_prev.missing_vcd,
-                c.vertex_decode_failures - s_prev.vertex_decode_failures);
-            s_prev = c;
-        }
-    }
-#endif
     if (gx_aurora::g_frame_open) {
         aurora_end_frame();
         gx_aurora::g_frame_open = false;
@@ -649,7 +567,7 @@ void aurora_backend_present(void) {
     }
 #if GXRUNTIME_HAS_AURORA_RECOMP
     gx_aurora::g_trace_present_scope_frame = gx_aurora::g_present_count;
-    if (gx_aurora::g_shadow_frontend_enabled && !gx_aurora::g_gx_core_enabled) {
+    if (gx_aurora::g_shadow_frontend_enabled) {
         gx_aurora::g_shadow_packet_sink.flush_assembly();
         const AuroraStats* astats = aurora_get_stats();
         const unsigned long long fe_draw_total = gx_aurora::g_shadow_packet_sink.draw_packets();
@@ -855,10 +773,6 @@ void aurora_backend_call_display_list(const void* data, u32 size) {
     gx_aurora::shadow_frontend_call_display_list(data, size);
     if (gx_aurora::trace_should_record())
         gx_aurora::g_trace_writer.call_display_list(0u, data, size);
-    if (gx_aurora::g_gx_core_enabled) {
-        gx_aurora::g_fifo_bytes += size;
-        return;
-    }
 #endif
     gx_aurora::flush_pending_resource_metadata();
     aurora::gx::fifo::write_data(data, size);
@@ -873,8 +787,6 @@ void aurora_backend_gx_write(u64 value, u8 size) {
     gx_aurora::shadow_frontend_write(value, size);
     if (gx_aurora::trace_should_record())
         gx_aurora::g_trace_writer.gx_write(size, value);
-    if (gx_aurora::g_gx_core_enabled)
-        return;
 #endif
 
     static u32 s_last_zmode = 0x40000017;
@@ -973,8 +885,6 @@ void aurora_backend_gx_write_burst(const u8* data, u32 size) {
 #if GXRUNTIME_HAS_AURORA_RECOMP
     gx_aurora::shadow_frontend_write_bytes(
         std::span<const std::uint8_t>(data, size), 0);
-    if (gx_aurora::g_gx_core_enabled)
-        return;
 #endif
     aurora::gx::fifo::write_data(data, size);
 }
@@ -1071,8 +981,6 @@ void aurora_backend_set_guest_address_resolver(
         gx_aurora::g_shadow_packet_sink.reset();
         gx_aurora::g_shadow_packet_sink.set_guest_resolver(
             &gx_aurora::g_shadow_frontend.state().resolver);
-        if (gx_aurora::g_gx_core_enabled)
-            gx_aurora::g_core_sink.set_guest_resolver(&gx_aurora::g_shadow_frontend.state().resolver);
         gx_aurora::g_shadow_frontend_failed = false;
     } else {
         gx_aurora::g_shadow_frontend.reset(nullptr);

@@ -12,20 +12,12 @@
 #if GXRUNTIME_HAS_AURORA_RECOMP
 #include "gxruntime/aurora_recomp/retail_gx_frontend.hpp"
 #include "gxruntime/aurora_recomp/trace.hpp"
-#include "gxruntime/gxcore/gxcore.hpp"
 #endif
 
 #include <gx/fifo.hpp>
 #include <gx/gx.hpp>
 #include <gx/recomp.hpp>
 
-#if GXRUNTIME_HAS_AURORA_RECOMP
-namespace aurora::gfx::gxcore {
-bool submit_draw_plan(const gxruntime::gxcore::DrawPlan& plan);
-void copy_efb_to_texture(const gxruntime::gxcore::EfbCopyCommand& cmd);
-void reset_texture_cache();
-}
-#endif
 
 namespace gx_aurora {
 
@@ -34,7 +26,6 @@ extern bool g_frame_open;
 extern bool g_should_quit;
 extern bool g_graphics_log;
 extern bool g_force_untextured;
-extern bool g_gx_core_enabled;
 extern bool g_draw_opcode_pending;
 extern bool g_audio_queue_log;
 extern bool g_frame_pacing_log;
@@ -80,14 +71,9 @@ extern gxruntime::aurora_recomp::RetailGxFrontend g_shadow_frontend;
 extern gxruntime::aurora_recomp::ConsumingAuroraRenderSink g_shadow_packet_sink;
 extern bool g_shadow_frontend_enabled;
 extern bool g_shadow_frontend_failed;
-extern gxruntime::gxcore::GxCoreSink g_core_sink;
-extern unsigned long long g_core_submitted;
-extern unsigned long long g_core_rejected;
 
 
 
-void core_plan_observer(const gxruntime::gxcore::DrawPlan& plan, void*);
-void core_copy_observer(const gxruntime::gxcore::EfbCopyCommand& cmd, void*);
 
 extern unsigned long long g_shadow_last_draw_total;
 extern unsigned long long g_shadow_last_vertex_total;

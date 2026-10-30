@@ -57,12 +57,11 @@ option(GXRUNTIME_ENABLE_AURORA
 option(GXRUNTIME_ENABLE_AURORA_RECOMP
        "Build GXRuntime-owned Aurora recomp-mode frontend/sink modules" ON)
 set(GXRUNTIME_AURORA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/graphics/aurora"
-    CACHE PATH "Path to the GXRuntime-owned Aurora fork (graphics/aurora)")
+    CACHE PATH "Path to the vendored Aurora (graphics/aurora: upstream pin + patches, see UPSTREAM.md)")
 
 if(GXRUNTIME_ENABLE_AURORA_RECOMP)
     enable_language(CXX)
     add_subdirectory(graphics/frontend)
-    add_subdirectory(graphics/gxcore)
 endif()
 
 if(GXRUNTIME_ENABLE_AURORA)
@@ -106,25 +105,19 @@ if(GXRUNTIME_ENABLE_AURORA)
             PRIVATE GXRUNTIME_HAS_AURORA_RECOMP=1)
         target_link_libraries(gxruntime_aurora
             PUBLIC GXRuntime::retail_gx_frontend GXRuntime::trace_io)
-        # 63/Mfin live cutover: the backend drives a GxCoreSink directly (bypasses
-        # live Aurora gx under DOL_GX_CORE), so it needs the gxcore headers and
-        # symbols — not just the transitive link through aurora::gx.
-        target_link_libraries(gxruntime_aurora PRIVATE GXRuntime::gxcore)
         # pixel replay (Mode B) — the same dolgx_replay tool gains
         # --pixels when built in an Aurora-enabled tree (the StrikersRecomp
         # GUI build); build-headless keeps the digest-only tool.
-        # --core (Mode B2) routes draws through the gxcore modules
-        # instead of the live Aurora gx layer; it reaches into the fork's
-        # lib/ for the gxcore_draw submission seam.
+        # Draws go through Aurora's own GX layer (lib/gx); gxcore was dropped
+        # with the move to upstream Aurora (2026-10-30).
         target_sources(dolgx_replay PRIVATE
-            graphics/frontend/tools/dolgx_replay_pixels.cpp
-            graphics/frontend/tools/dolgx_replay_core.cpp)
+            graphics/frontend/tools/dolgx_replay_pixels.cpp)
         target_compile_definitions(dolgx_replay
-            PRIVATE DOLGX_REPLAY_HAS_PIXELS=1 DOLGX_REPLAY_HAS_CORE=1)
+            PRIVATE DOLGX_REPLAY_HAS_PIXELS=1)
         target_include_directories(dolgx_replay
             PRIVATE "${GXRUNTIME_AURORA_DIR}/lib")
         target_link_libraries(dolgx_replay
-            PRIVATE GXRuntime::aurora GXRuntime::gxcore)
+            PRIVATE GXRuntime::aurora)
     else()
         target_compile_definitions(gxruntime_aurora
             PRIVATE GXRUNTIME_HAS_AURORA_RECOMP=0)

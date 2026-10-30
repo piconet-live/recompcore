@@ -15,7 +15,6 @@ bool g_frame_open = false;
 bool g_should_quit = false;
 bool g_graphics_log = false;
 bool g_force_untextured = false;
-bool g_gx_core_enabled = true;
 bool g_draw_opcode_pending = false;
 bool g_audio_queue_log = false;
 bool g_frame_pacing_log = false;
@@ -40,9 +39,6 @@ gxruntime::aurora_recomp::RetailGxFrontend g_shadow_frontend;
 gxruntime::aurora_recomp::ConsumingAuroraRenderSink g_shadow_packet_sink;
 bool g_shadow_frontend_enabled = false;
 bool g_shadow_frontend_failed = false;
-gxruntime::gxcore::GxCoreSink g_core_sink;
-unsigned long long g_core_submitted = 0;
-unsigned long long g_core_rejected = 0;
 
 unsigned long long g_shadow_last_draw_total = 0;
 unsigned long long g_shadow_last_vertex_total = 0;
@@ -302,24 +298,9 @@ bool dol_aurora_initialize(int argc, char** argv,
                      gx_aurora::g_trace_path.c_str(), gx_aurora::g_trace_first_frame,
                      gx_aurora::g_trace_last_frame);
     }
-    {
-        const char* core_env = std::getenv("DOL_GX_CORE");
-        gx_aurora::g_gx_core_enabled = !(core_env != nullptr && core_env[0] == '0');
-    }
     gx_aurora::g_shadow_frontend_enabled =
         std::getenv("DOL_AURORA_RECOMP_FRONTEND_SHADOW") != nullptr ||
-        gx_aurora::g_shadow_transform_log_enabled || gx_aurora::g_trace_armed || gx_aurora::g_gx_core_enabled;
-    if (gx_aurora::g_gx_core_enabled) {
-        gx_aurora::g_core_sink.set_plan_observer(gx_aurora::core_plan_observer, nullptr);
-        gx_aurora::g_core_sink.set_copy_observer(gx_aurora::core_copy_observer, nullptr);
-        gx_aurora::g_core_submitted = 0;
-        gx_aurora::g_core_rejected = 0;
-        aurora::gfx::gxcore::reset_texture_cache();
-        std::fprintf(stderr,
-                     "[gx-core] renderer = gxcore (default): draws route "
-                     "through the Dolphin-ported gxcore, live Aurora gx layer "
-                     "bypassed\n");
-    }
+        gx_aurora::g_shadow_transform_log_enabled || gx_aurora::g_trace_armed;
     gx_aurora::g_shadow_frontend_failed = false;
     gx_aurora::g_shadow_frontend.reset(nullptr);
     gx_aurora::g_shadow_frontend.set_packet_drain_enabled(gx_aurora::g_shadow_frontend_enabled);
@@ -399,13 +380,6 @@ void dol_aurora_shutdown(void) {
     }
 #if GXRUNTIME_HAS_AURORA_RECOMP
     gx_aurora::trace_close_and_log();
-    if (gx_aurora::g_gx_core_enabled) {
-        std::fprintf(stderr,
-                     "[gx-core] shutdown: submitted=%llu rejected=%llu "
-                     "failed=%d\n",
-                     gx_aurora::g_core_submitted, gx_aurora::g_core_rejected,
-                     gx_aurora::g_shadow_frontend_failed ? 1 : 0);
-    }
 #endif
     if (gx_aurora::g_audio_stream != nullptr) {
         SDL_DestroyAudioStream(gx_aurora::g_audio_stream);

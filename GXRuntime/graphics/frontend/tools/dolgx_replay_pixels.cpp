@@ -6,7 +6,7 @@
 // state interceptions), aurora_backend_call_display_list, and
 // aurora_backend_set_array — over a MEM1 image reconstructed from MEM_UPDATE
 // records, presents at each PRESENT_STATS, and reads the EFB back through
-// the aurora 0006 patch. AURORA_SYNC_PIPELINES=1 is forced so draws are
+// Aurora patch 09. Draws block on their pipelines (AuroraSetDrawsBlocking) so they are
 // never skipped while a pipeline compiles (cold and warm runs must render
 // identical frames; the double-replay hash compare is the M3 gate).
 //
@@ -257,17 +257,11 @@ int dolgx_replay_pixels_main(const char* trace_path,
   // (and Aurora's info log) printed before it.
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   install_mtx_check();
-  setenv("AURORA_SYNC_PIPELINES", "1", 0);
   // The backend arms its recorder/shadow from these; a replay must never
   // re-record or shadow-decode.
   unsetenv("DOL_AURORA_RECOMP_TRACE_OUT");
   unsetenv("DOL_AURORA_RECOMP_TRACE_FRAMES");
   unsetenv("DOL_AURORA_RECOMP_FRONTEND_SHADOW");
-  // This tool drives the live Aurora backend directly (EFB readback via the
-  // Aurora substrate). Since the 63/Mfin default flip made gxcore the
-  // backend's default renderer, pin it off here so this Aurora-path pixel
-  // golden stays stable; the gxcore pixel path is gated by --core double-replay.
-  setenv("DOL_GX_CORE", "0", 1);
 
   trace::TraceReader reader;
   if (!reader.open(trace_path)) {
@@ -313,6 +307,13 @@ int dolgx_replay_pixels_main(const char* trace_path,
   // SDK draw, so flush explicitly.
   static std::vector<std::uint8_t> gx_fifo(64u * 1024u);
   GXInit(gx_fifo.data(), static_cast<u32>(gx_fifo.size()));
+  // Draws wait for their pipelines (upstream's AuroraSetDrawsBlocking), so
+  // cold and warm runs draw the same frames; AURORA_SYNC_PIPELINES=0 lets
+  // draws skip while pipelines compile, for experiments.
+  {
+    const char* sync = std::getenv("AURORA_SYNC_PIPELINES");
+    AuroraSetDrawsBlocking(sync == nullptr || sync[0] != '0');
+  }
   GXFlush();
   if (options.viewport_policy >= 0)
     AuroraSetViewportPolicy(
