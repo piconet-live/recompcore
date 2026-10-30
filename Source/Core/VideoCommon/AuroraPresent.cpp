@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <memory>
 #include <mutex>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -75,6 +76,12 @@ std::atomic<bool> s_on{false};      // configured, the library loaded
 std::atomic<bool> s_started{false}; // Aurora's thread started (the GPU thread's first burst)
 bool s_ever = false;                // on at some time (for the report)
 u64 s_copies = 0;                   // the XFB copies so far (the GPU thread's)
+// the GPU thread's: the bytes read and not yet handed to Aurora (the frame so far, and after a cut the bytes of the
+// next frame that came in the same bursts), the end of the last burst in the video buffer, the copy a cut waits for
+std::vector<u8> s_pending;
+const u8* s_fed_end = nullptr;
+u64 s_cut_copy = 0;
+u64 s_bad_cuts = 0;  // a command end outside the bytes handed in (never seen: the frame is cut at the burst's end)
 
 // the presenter's (the GPU thread's)
 std::unique_ptr<AbstractTexture> s_texture;
@@ -179,11 +186,12 @@ std::string MakeReport()
     lag += fmt::format("{}{}", i ? " " : "", s_lag[i]);
   return fmt::format("aurora: {} frames in ({} KB), {} drawn, {} pictures, {} shown; presents {}: {} with Aurora's "
                      "picture, {} the emulator's own; picture behind by 0..9+ copies: {}; most frames waiting {}; "
-                     "Aurora's thread a frame (medians): feed {:.2f} ms, present {:.2f} ms, readback {:.2f} ms{}{}",
+                     "Aurora's thread a frame (medians): feed {:.2f} ms, present {:.2f} ms, readback {:.2f} ms{}{}{}",
                      st.frames_in, st.bytes_in / 1024, st.frames_drawn, st.pictures, s_pictures_taken, s_presents,
                      s_presents - s_presents_own, s_presents_own, lag, st.most_behind, st.feed_ms_median,
                      st.present_ms_median, st.readback_ms_median, st.stopped ? "; STOPPED (fell behind or failed)" : "",
-                     st.failed ? "; Aurora could not start" : "");
+                     st.failed ? "; Aurora could not start" : "",
+                     s_bad_cuts ? fmt::format("; {} frame cuts outside the stream", s_bad_cuts) : "");
 }
 
 // Aurora's thread ended (it reads the guest's RAM: before the RAM goes), the report kept.
@@ -204,6 +212,8 @@ void StopAll()
 }
 }  // namespace
 
+bool g_cut_pending = false;
+
 void Configure(const Settings& settings)
 {
   if (!settings.on)
@@ -215,6 +225,10 @@ void Configure(const Settings& settings)
   s_ever = true;
   s_report.clear();
   s_copies = 0;
+  s_pending.clear();
+  s_fed_end = nullptr;
+  s_bad_cuts = 0;
+  g_cut_pending = false;
   if (!Load(settings.library))
   {
     ERROR_LOG_FMT(VIDEO, "AuroraPresent: {}; the emulator's own pictures are shown", s_load_problem);
@@ -243,7 +257,8 @@ void OnBurstRead(const u8* bytes, u32 size)
     if (!s_started)
       return;
   }
-  s_lib.write(bytes, size);
+  s_pending.insert(s_pending.end(), bytes, bytes + size);
+  s_fed_end = bytes + size;
 }
 
 void OnXFBEntry(const RcTcacheEntry& entry)
@@ -260,9 +275,28 @@ void OnXFBCopy()
   if (!s_started)
     return;
   ++s_copies;
-  s_lib.frame(s_copies);
+  s_cut_copy = s_copies;
+  g_cut_pending = true;
   if (!s_settings.shot_prefix.empty())
     FrameRedraw::TakeStills(s_copies, false);
+}
+
+void OnCommandEnd(const u8* end)
+{
+  g_cut_pending = false;
+  if (!s_started)
+    return;
+  // the bytes after the copy's command that came in the bursts already read: the next frame's first
+  size_t tail = 0;
+  if (s_fed_end && end && end <= s_fed_end && static_cast<size_t>(s_fed_end - end) <= s_pending.size())
+    tail = static_cast<size_t>(s_fed_end - end);
+  else
+    ++s_bad_cuts;
+  const size_t frame = s_pending.size() - tail;
+  if (frame)
+    s_lib.write(s_pending.data(), static_cast<u32>(frame));
+  s_lib.frame(s_cut_copy);
+  s_pending.erase(s_pending.begin(), s_pending.begin() + frame);
 }
 
 const AbstractTexture* Picture(MathUtil::Rectangle<int>* rect)

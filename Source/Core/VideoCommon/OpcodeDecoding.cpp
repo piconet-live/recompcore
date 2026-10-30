@@ -19,6 +19,7 @@
 #include "Core/FifoPlayer/FifoRecorder.h"
 #include "Core/HW/Memmap.h"
 #include "Core/System.h"
+#include "VideoCommon/AuroraPresent.h"
 #include "VideoCommon/BPMemory.h"
 #include "VideoCommon/CPMemory.h"
 #include "VideoCommon/CommandProcessor.h"
@@ -235,6 +236,10 @@ public:
       {
         Core::System::GetInstance().GetFifoRecorder().WriteGPCommand(data, size);
       }
+      // AuroraPresent: an XFB copy's command ended (of the FIFO stream itself: a display list's copy cuts at the
+      // end of its call)
+      if (VideoCommon::AuroraPresent::CutPending() && !m_in_display_list)
+        VideoCommon::AuroraPresent::OnCommandEnd(data + size);
     }
   }
 

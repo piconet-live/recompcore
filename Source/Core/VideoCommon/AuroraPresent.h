@@ -7,8 +7,8 @@
 // copies to RAM): Aurora is handed a copy of the command stream the GPU thread reads, reads the guest's RAM and
 // writes nothing the emulated machine can see, and its picture only replaces the XFB's texture when the presenter
 // draws the window. Whatever Aurora does, the race is the same.
-//  - the feed: every burst the FIFO loop reads, in order (OnBurstRead), and each copy to the XFB (OnXFBCopy). The
-//    library copies them and returns; nothing waits for Aurora;
+//  - the feed: every burst the FIFO loop reads, in order (OnBurstRead), cut into frames at the end of each XFB copy's
+//    command (OnXFBCopy, OnCommandEnd). The library copies each frame and returns; nothing waits for Aurora;
 //  - the picture: the newest one Aurora finished, uploaded into a texture of its own at each present (Picture). A
 //    present before Aurora has a picture, or after it stopped (it fell too far behind), shows the emulator's own;
 //  - the library is loaded at run time (Windows: LoadLibrary), so this emulator's build never links Dawn or
@@ -49,7 +49,17 @@ bool On();
 void OnBurstRead(const u8* bytes, u32 size);
 // TextureCacheBase, the XFB copy's own entry (before OnXFBCopy): the emulator's picture of a test shot.
 void OnXFBEntry(const RcTcacheEntry& entry);
+// The XFB copy's BP write: Aurora's frame ends at the end of this command (OnCommandEnd), not at the end of the burst
+// it came in: a frame handed to Aurora holds whole commands only (it decodes each frame to its last byte).
 void OnXFBCopy();
+// OpcodeDecoder, after each command of the FIFO stream itself (not of a display list) while a cut is pending: `end`
+// is the command's end in the video buffer, whose bytes up to the last burst read were handed in already.
+extern bool g_cut_pending;
+inline bool CutPending()
+{
+  return g_cut_pending;
+}
+void OnCommandEnd(const u8* end);
 
 // The presenter (the GPU thread): Aurora's newest picture, or null (show the emulator's own). `rect` is the
 // picture's: the display copy's size.
