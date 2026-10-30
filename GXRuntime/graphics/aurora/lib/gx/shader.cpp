@@ -9,6 +9,7 @@
 #include <dolphin/gx/GXEnum.h>
 
 #include <absl/container/flat_hash_set.h>
+#include <cstdlib>
 #include <mutex>
 #include <string_view>
 #include <utility>
@@ -1018,6 +1019,18 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
         "\n    let offset_ndc = (offset_px * 2.0) / ubuf.render_viewport_size;"
         "\n    let clip_base = select(clip_a, clip_b, use_b);"
         "\n    out.pos = vec4f(clip_base.xy + offset_ndc * clip_base.w, clip_base.zw);";
+  }
+  // Pixel centre: the GX rasteriser samples at 7/12 of a pixel, the host GPU at 1/2. Moving every vertex up
+  // and left by 1/12 pixel puts primitives on the pixels the hardware covers (Dolphin's pixelcentercorrection
+  // in VertexShaderManager). Without it, edges and sprites at exact half-pixel positions land one pixel off.
+  // AURORA_PIXEL_CENTER=0 turns it off.
+  static const bool s_pixelCenter = [] {
+    const char* value = std::getenv("AURORA_PIXEL_CENTER");
+    return value == nullptr || value[0] != '0';
+  }();
+  if (s_pixelCenter) {
+    vtxXfrAttrsPre += "\n    out.pos = vec4f(out.pos.xy + vec2f(-1.0, 1.0) * (2.0 / 12.0) / max(ubuf.render_viewport_size, "
+                      "vec2f(1.0)) * out.pos.w, out.pos.zw);";
   }
   if constexpr (UseReversedZ) {
     vtxXfrAttrsPre += "\n    out.pos.z = -out.pos.z;";
