@@ -139,7 +139,12 @@ void init() {
 
 void shutdown() { stop_worker(); }
 
-void begin_frame() noexcept { sFrameActive = true; }
+extern u32 g_drawLogCount; // command_processor.cpp (AURORA_DRAW_LOG)
+
+void begin_frame() noexcept {
+  g_drawLogCount = 0;
+  sFrameActive = true;
+}
 
 void end_frame() noexcept {
   sFrameActive = false;

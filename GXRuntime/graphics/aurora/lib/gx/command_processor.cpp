@@ -17,6 +17,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <span>
 #include <vector>
 
@@ -404,6 +406,99 @@ static u32 calc_vtx_size(GXVtxFmt fmt) noexcept {
   return vtxSize;
 }
 
+
+// Diagnostics (environment switches, all off by default; GXRuntime's renderer investigations):
+// AURORA_DRAW_LOG=N logs the first N draws of each drain with their state; AURORA_DRAW_LOG_TCG=1 adds texgens,
+// matrices and TEV stages with SU scale and texture size; AURORA_IND_LOG logs draws with indirect stages;
+// AURORA_SKIP_TEX=ADDR[,ADDR...] (physical, hex) drops draws sampling any of those textures.
+u32 g_drawLogCount = 0;
+
+static u32 texture_phys(u32 slot) noexcept { return (g_gxState.loadedTextures[slot].image3 & 0x001FFFFFu) << 5; }
+
+// False when the draw is to be skipped
+static bool diagnose_draw(GXPrimitive prim, u16 vtxCount, const ShaderInfo& info) noexcept {
+  static const u32 drawLogMax = [] {
+    const char* v = std::getenv("AURORA_DRAW_LOG");
+    return v != nullptr ? static_cast<u32>(std::strtoul(v, nullptr, 10)) : 0u;
+  }();
+  static const bool tcgLog = std::getenv("AURORA_DRAW_LOG_TCG") != nullptr;
+  static const bool indLog = std::getenv("AURORA_IND_LOG") != nullptr;
+  static const std::vector<u32> skipTex = [] {
+    std::vector<u32> list;
+    if (const char* v = std::getenv("AURORA_SKIP_TEX")) {
+      for (const char* p = v; *p != '\0';) {
+        char* end = nullptr;
+        list.push_back(static_cast<u32>(std::strtoul(p, &end, 16)));
+        if (end == p) {
+          break;
+        }
+        p = (*end == ',') ? end + 1 : end;
+      }
+    }
+    return list;
+  }();
+  const auto& st = g_gxState;
+  if (g_drawLogCount < drawLogMax) {
+    const auto& vp = st.logicalViewport;
+    const auto& sc = st.logicalScissor;
+    std::fprintf(stderr,
+                 "[draw %u] prim %u verts %u vp %.1f,%.1f %.1fx%.1f z %.3f-%.3f sc %d,%d %dx%d zc %d zu %d zf %u cu %d "
+                 "au %d blend %u %u %u cull %u tev %u chans %u texgens %u tex",
+                 g_drawLogCount, static_cast<unsigned>(prim), vtxCount, vp.left, vp.top, vp.width, vp.height, vp.znear,
+                 vp.zfar, sc.x, sc.y, sc.width, sc.height, st.depthCompare ? 1 : 0, st.depthUpdate ? 1 : 0,
+                 static_cast<unsigned>(st.depthFunc), st.colorUpdate ? 1 : 0, st.alphaUpdate ? 1 : 0,
+                 static_cast<unsigned>(st.blendMode), static_cast<unsigned>(st.blendFacSrc),
+                 static_cast<unsigned>(st.blendFacDst), static_cast<unsigned>(st.cullMode), st.numTevStages,
+                 st.numChans, st.numTexGens);
+    for (u32 t = 0; t < MaxTextures; ++t) {
+      if (info.sampledTextures.test(t)) {
+        std::fprintf(stderr, " t%u:%08X%s", t, texture_phys(t), st.textures[t] ? "" : "(empty)");
+      }
+    }
+    if (tcgLog) {
+      for (u32 i = 0; i < st.numTexGens && i < MaxTexCoord; ++i) {
+        const auto& tcg = st.tcgs[i];
+        std::fprintf(stderr, " | tg%u type %u src %u mtx %u post %u norm %u", i, static_cast<unsigned>(tcg.type),
+                     static_cast<unsigned>(tcg.src), static_cast<unsigned>(tcg.mtx),
+                     static_cast<unsigned>(tcg.postMtx), tcg.normalize ? 1u : 0u);
+      }
+      for (u32 s = 0; s < st.numTevStages && s < MaxTevStages; ++s) {
+        const auto& stage = st.tevStages[s];
+        if (stage.texCoordId == GX_TEXCOORD_NULL || stage.texMapId == GX_TEXMAP_NULL) {
+          continue;
+        }
+        const auto c = static_cast<u32>(stage.texCoordId) & 7u;
+        const auto mp = static_cast<u32>(stage.texMapId) & 7u;
+        const auto& tcs = st.texCoordScales[c];
+        const auto& tb = st.textures[mp];
+        std::fprintf(stderr, " | st%u c%u->m%u su %ux%u tex %ux%u", s, c, mp, tcs.scaleS + 1u, tcs.scaleT + 1u,
+                     tb.texObj.width(), tb.texObj.height());
+      }
+    }
+    std::fprintf(stderr, "\n");
+  }
+  ++g_drawLogCount;
+  if (indLog && st.numIndStages > 0) {
+    std::fprintf(stderr, "[ind] prim %u verts %u indStages %u tevStages %u", static_cast<unsigned>(prim), vtxCount,
+                 st.numIndStages, st.numTevStages);
+    for (u32 t = 0; t < MaxTextures; ++t) {
+      if (info.sampledTextures.test(t)) {
+        std::fprintf(stderr, " | t%u phys %08X %s%s", t, texture_phys(t), st.textures[t] ? "bound" : "EMPTY",
+                     info.sampledIndTextures.test(t) ? " ind" : "");
+      }
+    }
+    std::fprintf(stderr, "\n");
+  }
+  if (!skipTex.empty()) {
+    for (u32 t = 0; t < MaxTextures; ++t) {
+      if (info.sampledTextures.test(t) && std::ranges::find(skipTex, texture_phys(t)) != skipTex.end()) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 // recomp seam: an array resolved from guest memory is sized to the end of that memory region, so a draw pushes only
 // the part its indices reach. The index fields' places in a vertex first (one pass over the attributes), then a
 // tight loop per field over the vertices. A draw that needs more of an array than was pushed re-pushes it, which
@@ -532,6 +627,10 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     if (cache.bindGroups.textureBindGroup != prevBindGroup) {
       state.dirty |= DirtyUniform;
     }
+  }
+
+  if (!diagnose_draw(prim, vtxCount, cache.shaderInfo)) {
+    return;
   }
 
   const bool uniformValid = (state.dirty & DirtyUniform) == 0 && cache.uniformRange.size != 0;
