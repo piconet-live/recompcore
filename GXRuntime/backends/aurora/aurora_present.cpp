@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <csignal>
+#include <exception>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -30,6 +32,8 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
 #endif
 
 namespace {
@@ -218,6 +222,55 @@ double median(std::vector<double> v) {
 
 // The guest's RAM as Aurora's seam asks for it: an address in any of RAM's segments, the bytes there and how many
 // follow. Read only.
+#ifdef _WIN32
+DWORD s_aurora_thread_id = 0;
+#endif
+#ifdef _WIN32
+// AURORA_CRASH_TRACE=1 (a test): the stack of an abort, a terminate or an access violation, as symbols, on stderr
+void print_stack(const char* what) {
+  std::fprintf(stderr, "[aurora-present] %s, thread %lu:\n", what, GetCurrentThreadId());
+  HANDLE process = GetCurrentProcess();
+  SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
+  SymInitialize(process, nullptr, TRUE);
+  void* frames[48];
+  const USHORT n = CaptureStackBackTrace(1, 48, frames, nullptr);
+  for (USHORT i = 0; i < n; ++i) {
+    char buffer[sizeof(SYMBOL_INFO) + 256] = {};
+    auto* sym = reinterpret_cast<SYMBOL_INFO*>(buffer);
+    sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+    sym->MaxNameLen = 255;
+    DWORD64 off = 0;
+    IMAGEHLP_LINE64 line{};
+    line.SizeOfStruct = sizeof(line);
+    DWORD loff = 0;
+    const bool has = SymFromAddr(process, reinterpret_cast<DWORD64>(frames[i]), &off, sym);
+    const bool hasl = SymGetLineFromAddr64(process, reinterpret_cast<DWORD64>(frames[i]), &loff, &line);
+    std::fprintf(stderr, "  %p %s+0x%llx %s:%lu\n", frames[i], has ? sym->Name : "?", static_cast<unsigned long long>(off),
+                 hasl ? line.FileName : "", hasl ? line.LineNumber : 0ul);
+  }
+  std::fflush(stderr);
+}
+void install_crash_trace() {
+  const char* v = std::getenv("AURORA_CRASH_TRACE");
+  if (v == nullptr || v[0] != '1')
+    return;
+  std::signal(SIGABRT, [](int) { print_stack("abort"); });
+  std::set_terminate([] { print_stack("terminate"); std::_Exit(3); });
+  AddVectoredExceptionHandler(1, [](EXCEPTION_POINTERS* e) -> LONG {
+    const DWORD code = e->ExceptionRecord->ExceptionCode;
+    if (code == EXCEPTION_ACCESS_VIOLATION || code == 0xC0000409 || code == EXCEPTION_STACK_OVERFLOW) {
+      // (the game's own code faults on purpose only on Dolphin's threads with fastmem: this reports the first few)
+      static std::atomic<int> reports{0};
+      if (GetCurrentThreadId() == s_aurora_thread_id && reports.fetch_add(1) < 3)
+        print_stack("exception on Aurora's thread");
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+  });
+}
+#else
+void install_crash_trace() {}
+#endif
+
 bool ram_resolver(void*, u32 address, u32, DolGuestAddressSpace, DolGuestResourceKind, const void** data,
                   u32* available) {
   const u32 physical = dol_gx_recomp_guest_to_physical(address);
@@ -253,6 +306,10 @@ void run() {
       .data_dir = s->data_dir.c_str(),
       .embedded = true,
   };
+#ifdef _WIN32
+  s_aurora_thread_id = GetCurrentThreadId();
+#endif
+  install_crash_trace();
   char arg0[] = "aurora-present";
   char* argv[] = {arg0, nullptr};
   if (!dol_aurora_initialize(1, argv, &config)) {
