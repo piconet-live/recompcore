@@ -979,7 +979,7 @@ static void handle_bp(u32 value, bool bigEndian) {
   case 0x52: {
     const bool clear = bp_get(value, 1, 11) != 0;
     if (bp_get(value, 1, 14) != 0) {
-      Log.warn("STUB: display copy is not implemented");
+      copy_xfb(value);
     } else {
       resolve_tex_copy_destination_from_bp(value);
       if (g_gxState.texCopyDest != nullptr) {

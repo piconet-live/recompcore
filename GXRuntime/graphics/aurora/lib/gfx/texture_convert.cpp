@@ -78,6 +78,15 @@ float avg_diff(const uint8_t* lhs, const uint8_t* rhs, uint32_t width, uint32_t 
  * difference between the original and downscaled mipmaps.
  */
 bool arb_mip_check(uint32_t width, uint32_t height, uint32_t mips, ArrayRef<uint8_t> data) {
+  // No detection unless AURORA_ARB_MIPS=1: as the hardware and Dolphin's default ("Arbitrary Mipmap Detection" off).
+  // Detected textures lose the game's anisotropy (gx.cpp), which blurred far walls (stage 4, course 16)
+  static const bool detect = [] {
+    const char* v = std::getenv("AURORA_ARB_MIPS");
+    return v != nullptr && v[0] == '1';
+  }();
+  if (!detect) {
+    return false;
+  }
   if (mips < 2) {
     return false;
   }

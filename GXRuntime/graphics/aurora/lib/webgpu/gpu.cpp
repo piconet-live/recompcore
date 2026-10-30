@@ -307,7 +307,23 @@ TextureWithSampler create_render_texture(uint32_t width, uint32_t height, bool m
   };
 }
 
+static TextureWithSampler g_presentOverride;
+
+void set_present_override(const wgpu::Texture& texture, const wgpu::TextureView& view, wgpu::Extent3D size,
+                          wgpu::TextureFormat format) noexcept {
+  g_presentOverride = {
+      .texture = texture,
+      .view = view,
+      .size = size,
+      .format = format,
+      .sampler = g_frameBuffer.sampler,
+  };
+}
+
 const TextureWithSampler& present_source() noexcept {
+  if (g_presentOverride.texture) {
+    return g_presentOverride;
+  }
   return g_graphicsConfig.msaaSamples > 1 ? g_frameBufferResolved : g_frameBuffer;
 }
 
@@ -916,6 +932,18 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         requiredFeatures.push_back(feature);
       }
 #endif
+      // The main thread (bind groups, textures, pipelines) and the render worker (encoding, submit) call the device at
+      // the same time. Dawn's native device is safe for that only with this feature: without it the two raced, which
+      // corrupted the heap (stage 4: the intermittent code-5 exit, 0xC0000005). AURORA_DEVICE_SYNC=0 leaves it off.
+      if (feature == wgpu::FeatureName::ImplicitDeviceSynchronization) {
+        static const bool sync = [] {
+          const char* v = std::getenv("AURORA_DEVICE_SYNC");
+          return v == nullptr || v[0] != '0';
+        }();
+        if (sync) {
+          requiredFeatures.push_back(feature);
+        }
+      }
     }
     std::string featureList;
     for (auto featureName : requiredFeatures) {
@@ -1059,6 +1087,7 @@ void shutdown() {
   g_ResampleUniformBuffer = {};
   g_resampledFrameBuffer = {};
   g_frameBuffer = {};
+  g_presentOverride = {};
   g_frameBufferResolved = {};
   g_depthBuffer = {};
   g_queue = {};
@@ -1103,6 +1132,7 @@ static void resize_swapchain_internal(uint32_t width, uint32_t height, uint32_t 
   g_frameBuffer = create_render_texture(width, height, true);
   g_frameBufferResolved = create_render_texture(width, height, false);
   g_depthBuffer = create_depth_texture(width, height);
+  g_presentOverride = {};
   g_CopyBindGroup = create_copy_bind_group(present_source());
 }
 
