@@ -21,4 +21,4 @@ one commit on the recompcore branch that touches this directory, so the list can
 
 ## Patches
 
-See the table in `PATCHES.md`.
+The list, with each patch's kind and origin, is in `PATCHES.md`.
