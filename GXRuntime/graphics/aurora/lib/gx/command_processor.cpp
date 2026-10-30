@@ -221,6 +221,14 @@ u8 line_mode_for_prim(GXPrimitive prim) noexcept {
 static void handle_draw(u8 cmd, ByteReader& reader) noexcept;
 static void handle_aurora(ByteReader& reader) noexcept;
 
+// The last commands read, for the log when a byte turns out to be no command
+struct RecentCommand {
+  u32 pos;
+  u8 cmd;
+};
+static std::array<RecentCommand, 16> s_recent{};
+static u32 s_recentAt = 0;
+
 ProcessResult process(const u8* data, u32 size) noexcept {
   ZoneScoped;
   ByteReader reader{{data, size}};
@@ -228,6 +236,7 @@ ProcessResult process(const u8* data, u32 size) noexcept {
   while (!reader.empty()) {
     const u8 cmd = reader.read<u8>();
     u8 opcode = cmd & CP_OPCODE_MASK;
+    s_recent[s_recentAt++ % s_recent.size()] = {static_cast<u32>(reader.offset() - 1), cmd};
 
     switch (opcode) {
     case CP_CMD_NOP:
@@ -336,7 +345,7 @@ ProcessResult process(const u8* data, u32 size) noexcept {
 
     default:
       // Check if it's a draw command (0x80-0xBF range)
-      if (cmd >= 0x80) {
+      if (cmd >= 0x80 && cmd < 0xC0) { // (0xC0 and up are no command: Dolphin's OpcodeDecoding calls them unknown)
         handle_draw(cmd, reader);
       } else {
         // Hex dump surrounding bytes for debugging
@@ -352,6 +361,12 @@ ProcessResult process(const u8* data, u32 size) noexcept {
               hex += fmt::format(" {:02x}", data[i]);
           }
           Log.error("  hex dump (pos {}-{}):{}", dumpStart, dumpEnd - 1, hex);
+          std::string recent;
+          for (u32 i = 0; i < s_recent.size(); ++i) {
+            const auto& c = s_recent[(s_recentAt + i) % s_recent.size()];
+            recent += fmt::format(" {}:{:02x}", c.pos, c.cmd);
+          }
+          Log.error("  last commands (pos:opcode):{}; {} bytes in this burst", recent, size);
         }
         FATAL("command_processor: unknown opcode 0x{:02X} at pos {}", cmd, reader.offset() - 1);
       }
