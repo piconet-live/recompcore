@@ -49,8 +49,10 @@ static u16 prepare_idx_buffer(ByteBuffer& buf, GXPrimitive prim, u16 vtxStart, u
       numIndices += 3;
     }
   } else if (prim == GX_TRIANGLES) {
-    buf.reserve_extra(vtxCount * sizeof(u16));
-    for (u16 v = 0; v < vtxCount; ++v) {
+    // As the hardware (and Dolphin's AddList): only whole triangles; 1-2 leftover vertices draw nothing
+    const u16 whole = static_cast<u16>(vtxCount - vtxCount % 3);
+    buf.reserve_extra(whole * sizeof(u16));
+    for (u16 v = 0; v < whole; ++v) {
       const u16 idx = vtxStart + v;
       buf.append(idx);
       ++numIndices;
@@ -1861,7 +1863,7 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* da
 
   auto* lastDraw = !g_gxState.stateDirty && !has_indexed_arrays() ? gfx::get_last_draw_command<DrawData>() : nullptr;
   const bool canMerge = lastDraw != nullptr && prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS &&
-                        lastDraw->instanceCount == 1;
+                        lastDraw->instanceCount == 1 && (lastDraw->indexCount != 0 || lastDraw->vtxCount >= 3);
 
   // Push raw vertex data to buffer. Merged draws must remain byte-contiguous with the previous range.
   gfx::Range vertRange = gfx::push_verts(data + pos, totalVtxBytes, canMerge ? 0 : 4);
@@ -1873,7 +1875,9 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* da
     u32 numIndices = 0;
     gfx::Range idxRange;
     const bool hadIndexRange = lastDraw->idxRange.size != 0;
-    if (lastDraw->indexCount == 0 && prim != GX_TRIANGLES) {
+    // A non-indexed draw extends only while both lists are whole triangles; otherwise index both
+    const bool needIndices = prim != GX_TRIANGLES || vtxCount % 3 != 0 || lastDraw->vtxCount % 3 != 0;
+    if (lastDraw->indexCount == 0 && needIndices) {
       // Generate triangle index buffer for previous draw
       lastDraw->indexCount = prepare_idx_buffer(handle_draw_idx_buf, GX_TRIANGLES, 0, lastDraw->vtxCount);
     }
@@ -1924,7 +1928,7 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
   u32 numIndices = 0;
   gfx::Range idxRange;
 
-  if (prim != GX_TRIANGLES) {
+  if (prim != GX_TRIANGLES || vtxCount % 3 != 0) {
     ZoneScopedN("build idx buffer");
     auto& realBuf = handle_draw_unmerged_idxBuf;
     numIndices = prepare_idx_buffer(realBuf, prim, 0, vtxCount);
