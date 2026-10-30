@@ -303,7 +303,7 @@ void end_frame() noexcept {
   }
 #endif
 
-  gfx::end_frame([rmlBindGroup = std::move(rmlBindGroup), rmlOverlay, viewport,
+  gfx::end_frame([rmlBindGroup = std::move(rmlBindGroup), rmlOverlay, viewportMain = viewport,
                   imguiDrawData = std::move(imguiDrawData)](
                      wgpu::CommandEncoder& encoder, std::vector<gfx::AfterSubmitCallback> afterSubmitCallbacks) {
     wgpu::Texture currentTexture;
@@ -325,6 +325,15 @@ void end_frame() noexcept {
 
     const bool canPresent = currentTexture && currentView;
     if (canPresent) {
+      // This frame's present source is known only here, on the render worker after its passes were encoded (the
+      // display copy sets it); the main thread's viewport came from a frame before (or the EFB's 640x480 at the
+      // first). The letterbox follows the copy's own size.
+      const auto& frameSource = webgpu::present_source();
+      const auto viewport = rmlBindGroup ? viewportMain
+                                         : webgpu::calculate_present_viewport(
+                                               webgpu::g_graphicsConfig.surfaceConfiguration.width,
+                                               webgpu::g_graphicsConfig.surfaceConfiguration.height,
+                                               frameSource.size.width, frameSource.size.height);
       wgpu::BindGroup presentBindGroup;
       if (rmlBindGroup && !rmlOverlay) {
         presentBindGroup = rmlBindGroup;
