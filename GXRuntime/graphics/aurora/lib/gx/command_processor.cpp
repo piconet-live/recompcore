@@ -228,6 +228,7 @@ struct RecentCommand {
 };
 static std::array<RecentCommand, 16> s_recent{};
 static u32 s_recentAt = 0;
+static u32 s_unknownOpcodes = 0;
 
 ProcessResult process(const u8* data, u32 size) noexcept {
   ZoneScoped;
@@ -349,7 +350,7 @@ ProcessResult process(const u8* data, u32 size) noexcept {
         handle_draw(cmd, reader);
       } else {
         // Hex dump surrounding bytes for debugging
-        {
+        if (s_unknownOpcodes < 8) {
           const size_t pos = reader.offset();
           size_t dumpStart = (pos > 17) ? pos - 17 : 0;
           size_t dumpEnd = (pos + 16 < size) ? pos + 16 : size;
@@ -368,7 +369,9 @@ ProcessResult process(const u8* data, u32 size) noexcept {
           }
           Log.error("  last commands (pos:opcode):{}; {} bytes in this burst", recent, size);
         }
-        FATAL("command_processor: unknown opcode 0x{:02X} at pos {}", cmd, reader.offset() - 1);
+        // As the emulator does (OpcodeDecoding.h, OnUnknown): one byte, and on. The game's own lists hold such bytes
+        // (course 43, copy 883: the emulator logs Unknown Opcode too); a hardware hang is not ours to copy
+        ++s_unknownOpcodes;
       }
       break;
     }
