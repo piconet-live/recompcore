@@ -359,7 +359,7 @@ void run() {
   } else {
     AuroraSetViewportPolicy(AURORA_VIEWPORT_NATIVE);  // the game's own viewport, unscaled
   }
-  // AURORA_TEST_FATAL=<copy> (a test): a stream Aurora cannot decode at this copy, for the way a fatal error goes
+  // AURORA_TEST_FATAL=<copy> (a test): a fatal error at this copy, the way any of Aurora's goes
   const char* test_fatal_text = std::getenv("AURORA_TEST_FATAL");
   const std::uint64_t test_fatal = test_fatal_text != nullptr ? std::strtoull(test_fatal_text, nullptr, 10) : 0;
 
@@ -387,9 +387,7 @@ void run() {
     }
     const auto start = Clock::now();
     if (test_fatal != 0 && f.copy == test_fatal) {
-      static const std::uint8_t bad[32] = {0x01, 0x01, 0x01, 0x01};
-      aurora_backend_gx_write_burst(bad, sizeof bad);
-      aurora_backend_present();
+      on_fatal("AURORA_TEST_FATAL");
     }
     for (std::size_t off = 0; off < f.bytes.size(); off += 32768) {
       const std::size_t n = std::min<std::size_t>(32768, f.bytes.size() - off);
