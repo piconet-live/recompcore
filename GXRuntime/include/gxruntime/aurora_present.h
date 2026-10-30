@@ -41,7 +41,7 @@ typedef struct AuroraPresentConfig {
   uint32_t shot_count;
   const char* log_path;    // a CSV line a frame: copy, times (NULL: none)
   uint32_t width, height;  // the hidden window's size (Aurora's EFB is the game's own 640x528 whatever it is)
-  uint32_t most_behind;    // frames Aurora may be behind before it stops for the run (0: 120)
+  uint32_t most_behind;    // frames Aurora may be behind before it stops for the run (0: 4; and 256 MB at most)
 } AuroraPresentConfig;
 
 typedef struct AuroraPresentPicture {

@@ -182,7 +182,10 @@ struct State {
   std::uint32_t ram_size = 0;
   std::string data_dir, shot_prefix, log_path;
   std::vector<std::uint64_t> shots;
-  std::uint32_t width = 640, height = 528, most_behind = 120;
+  std::uint32_t width = 640, height = 528, most_behind = 4;
+  // the bytes waiting at most (a frame is 1 KB in menus, 100-300 KB in a race): the bound on what falling behind costs
+  static constexpr std::size_t most_bytes_behind = 256u << 20;
+  std::size_t bytes_waiting = 0;  // (under lock)
   Clock::time_point t0;
 
   // the GPU thread's frame being built (its own; moved into the queue at each copy)
@@ -198,6 +201,7 @@ struct State {
   std::thread thread;
   std::atomic<bool> running{false};
   std::atomic<bool> stopped{false};
+  bool up = false;  // (under lock) Aurora started (its device, window and pipelines' cache): the tight bound from then on
   std::vector<double> feed_ms, present_ms, readback_ms;
 };
 State* s = nullptr;
@@ -259,14 +263,22 @@ void run() {
     return;
   }
   // The SDK's state as a booting game sets it (dolgx_replay's baseline): Aurora's own GX layer reads it before the
-  // stream has rewritten everything. Draws wait for their pipelines, so no draw is left out while one compiles (the
-  // thread falls behind instead; the emulator is never held).
+  // stream has rewritten everything. Draws do not wait for their pipelines (Aurora's default): a draw whose pipeline
+  // still compiles is left out of that frame. Waiting would put Aurora seconds behind at the first race frames with
+  // a cold cache, and Aurora must stay close behind the emulator: it reads the display lists, arrays and textures in
+  // the guest's RAM when it decodes a frame, and the game rewrites them once the emulator's GPU said draw-done.
+  // AURORA_DRAWS_BLOCKING=1: they wait (a test of pictures against pictures, where no draw may be missing).
   static std::vector<std::uint8_t> gx_fifo(64u * 1024u);
   GXInit(gx_fifo.data(), static_cast<u32>(gx_fifo.size()));
-  AuroraSetDrawsBlocking(true);
+  const char* blocking = std::getenv("AURORA_DRAWS_BLOCKING");
+  AuroraSetDrawsBlocking(blocking != nullptr && blocking[0] == '1');
   GXFlush();
   AuroraSetViewportPolicy(static_cast<AuroraViewportPolicy>(2));  // native: the game's own viewport, unscaled
 
+  {
+    std::lock_guard g{s->lock};
+    s->up = true;
+  }
   FILE* log = s->log_path.empty() ? nullptr : std::fopen(s->log_path.c_str(), "w");
   if (log)
     std::fprintf(log, "copy,in_us,start_us,fed_us,presented_us,picture_us,waiting,bytes\n");
@@ -282,6 +294,7 @@ void run() {
         break;
       f = std::move(s->queue.front());
       s->queue.pop_front();
+      s->bytes_waiting -= f.bytes.size();
       waiting = s->queue.size();
     }
     const auto start = Clock::now();
@@ -371,6 +384,8 @@ int aurora_present_start(const AuroraPresentConfig* config) {
     s->height = config->height;
   if (config->most_behind)
     s->most_behind = config->most_behind;
+  if (const char* v = std::getenv("AURORA_MOST_BEHIND"); v != nullptr && std::atoi(v) > 0)  // (tests)
+    s->most_behind = static_cast<std::uint32_t>(std::atoi(v));
   s->building.reserve(512u * 1024u);
   s->running = true;
   s->thread = std::thread(run);
@@ -397,12 +412,17 @@ void aurora_present_frame(uint64_t copy) {
     ++s->stats.frames_in;
     s->stats.bytes_in += f.bytes.size();
     // Aurora has fallen too far behind (a frame missed would leave its state wrong, so none is skipped): it stops
-    // for the run, and the emulator shows its own pictures again
-    if (s->queue.size() >= s->most_behind) {
-      stop_for_run("too many frames behind");
+    // for the run, and the emulator shows its own pictures again. The bound is tight (4 frames waiting): further
+    // behind, the guest's RAM it reads may already hold a later frame's lists and vertices (garbage commands)
+    // (while Aurora itself starts, half a second, the frames of the boot wait: 1800 of them at most)
+    const std::size_t most = s->up ? s->most_behind : 1800u;
+    if (s->queue.size() >= most || s->bytes_waiting + f.bytes.size() > State::most_bytes_behind) {
+      stop_for_run(s->queue.size() >= most ? "too many frames behind" : "too many bytes behind");
       s->queue.clear();
+      s->bytes_waiting = 0;
       return;
     }
+    s->bytes_waiting += f.bytes.size();
     s->queue.push_back(std::move(f));
     s->stats.most_behind = std::max<uint64_t>(s->stats.most_behind, s->queue.size());
   }

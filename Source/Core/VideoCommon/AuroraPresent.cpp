@@ -82,6 +82,10 @@ std::vector<u8> s_pending;
 const u8* s_fed_end = nullptr;
 u64 s_cut_copy = 0;
 u64 s_bad_cuts = 0;  // a command end outside the bytes handed in (never seen: the frame is cut at the burst's end)
+bool s_cut = false;  // a cut waits for the copy's command to end
+const u8* s_list = nullptr;  // the display list the command decoded now called (its bytes in RAM), and its size
+u32 s_list_size = 0;
+u64 s_lists = 0, s_list_bytes = 0;  // the lists put in place of their calls
 
 // the presenter's (the GPU thread's)
 std::unique_ptr<AbstractTexture> s_texture;
@@ -186,12 +190,13 @@ std::string MakeReport()
     lag += fmt::format("{}{}", i ? " " : "", s_lag[i]);
   return fmt::format("aurora: {} frames in ({} KB), {} drawn, {} pictures, {} shown; presents {}: {} with Aurora's "
                      "picture, {} the emulator's own; picture behind by 0..9+ copies: {}; most frames waiting {}; "
-                     "Aurora's thread a frame (medians): feed {:.2f} ms, present {:.2f} ms, readback {:.2f} ms{}{}{}",
+                     "Aurora's thread a frame (medians): feed {:.2f} ms, present {:.2f} ms, readback {:.2f} ms{}{}{}{}",
                      st.frames_in, st.bytes_in / 1024, st.frames_drawn, st.pictures, s_pictures_taken, s_presents,
                      s_presents - s_presents_own, s_presents_own, lag, st.most_behind, st.feed_ms_median,
                      st.present_ms_median, st.readback_ms_median, st.stopped ? "; STOPPED (fell behind or failed)" : "",
                      st.failed ? "; Aurora could not start" : "",
-                     s_bad_cuts ? fmt::format("; {} frame cuts outside the stream", s_bad_cuts) : "");
+                     s_bad_cuts ? fmt::format("; {} frame cuts outside the stream", s_bad_cuts) : "",
+                     fmt::format("; {} display lists put in place of their calls ({} KB)", s_lists, s_list_bytes / 1024));
 }
 
 // Aurora's thread ended (it reads the guest's RAM: before the RAM goes), the report kept.
@@ -212,7 +217,7 @@ void StopAll()
 }
 }  // namespace
 
-bool g_cut_pending = false;
+bool g_pending = false;
 
 void Configure(const Settings& settings)
 {
@@ -228,7 +233,10 @@ void Configure(const Settings& settings)
   s_pending.clear();
   s_fed_end = nullptr;
   s_bad_cuts = 0;
-  g_cut_pending = false;
+  g_pending = false;
+  s_cut = false;
+  s_list = nullptr;
+  s_lists = s_list_bytes = 0;
   if (!Load(settings.library))
   {
     ERROR_LOG_FMT(VIDEO, "AuroraPresent: {}; the emulator's own pictures are shown", s_load_problem);
@@ -276,22 +284,55 @@ void OnXFBCopy()
     return;
   ++s_copies;
   s_cut_copy = s_copies;
-  g_cut_pending = true;
+  s_cut = true;
+  g_pending = true;
   if (!s_settings.shot_prefix.empty())
     FrameRedraw::TakeStills(s_copies, false);
 }
 
-void OnCommandEnd(const u8* end)
+void OnDisplayList(const u8* bytes, u32 size)
 {
-  g_cut_pending = false;
+  if (!s_started || !bytes || !size)
+    return;
+  s_list = bytes;
+  s_list_size = size;
+  g_pending = true;
+}
+
+void OnCommandEnd(const u8* data, u32 size)
+{
+  g_pending = false;
   if (!s_started)
     return;
-  // the bytes after the copy's command that came in the bursts already read: the next frame's first
+  const u8* end = data + size;
+  // where the command is among the bytes handed in: `tail` bytes after it (the next commands' first)
   size_t tail = 0;
-  if (s_fed_end && end && end <= s_fed_end && static_cast<size_t>(s_fed_end - end) <= s_pending.size())
+  const bool inside = s_fed_end && data && end <= s_fed_end &&
+                      static_cast<size_t>(s_fed_end - data) <= s_pending.size();
+  if (inside)
     tail = static_cast<size_t>(s_fed_end - end);
-  else
+  if (s_list)
+  {
+    // the call (its 9 bytes) gives its place to the list's bytes
+    if (inside && size == 9)
+    {
+      const size_t at = s_pending.size() - tail - size;
+      s_pending.erase(s_pending.begin() + at, s_pending.begin() + at + size);
+      s_pending.insert(s_pending.begin() + at, s_list, s_list + s_list_size);
+      ++s_lists;
+      s_list_bytes += s_list_size;
+    }
+    s_list = nullptr;
+    s_list_size = 0;
+  }
+  if (!s_cut)
+    return;
+  s_cut = false;
+  if (!inside)
+  {
     ++s_bad_cuts;
+    tail = 0;
+  }
   const size_t frame = s_pending.size() - tail;
   if (frame)
     s_lib.write(s_pending.data(), static_cast<u32>(frame));

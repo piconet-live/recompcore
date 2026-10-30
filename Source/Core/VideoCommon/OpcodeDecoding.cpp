@@ -185,6 +185,8 @@ public:
         // Avoid the crash if memory.GetPointerForRange failed ..
         if (start_address != nullptr)
         {
+          VideoCommon::AuroraPresent::OnDisplayList(start_address, size);
+
           // temporarily swap dl and non-dl (small "hack" for the stats)
           g_stats.SwapDL();
 
@@ -238,8 +240,8 @@ public:
       }
       // AuroraPresent: an XFB copy's command ended (of the FIFO stream itself: a display list's copy cuts at the
       // end of its call)
-      if (VideoCommon::AuroraPresent::CutPending() && !m_in_display_list)
-        VideoCommon::AuroraPresent::OnCommandEnd(data + size);
+      if (VideoCommon::AuroraPresent::Pending() && !m_in_display_list)
+        VideoCommon::AuroraPresent::OnCommandEnd(data, size);
     }
   }
 

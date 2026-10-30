@@ -52,14 +52,19 @@ void OnXFBEntry(const RcTcacheEntry& entry);
 // The XFB copy's BP write: Aurora's frame ends at the end of this command (OnCommandEnd), not at the end of the burst
 // it came in: a frame handed to Aurora holds whole commands only (it decodes each frame to its last byte).
 void OnXFBCopy();
-// OpcodeDecoder, after each command of the FIFO stream itself (not of a display list) while a cut is pending: `end`
-// is the command's end in the video buffer, whose bytes up to the last burst read were handed in already.
-extern bool g_cut_pending;
-inline bool CutPending()
+// OpcodeDecoder, a display list called from the FIFO stream: its bytes, as the emulator reads them now. Aurora
+// decodes the frame later, when the game may have rewritten the list: the list's bytes take the call's place in
+// the stream Aurora is handed (OnCommandEnd).
+void OnDisplayList(const u8* bytes, u32 size);
+// OpcodeDecoder, after each command of the FIFO stream itself (not of a display list) while a cut or a list is
+// pending: [data, data + size) is the command in the video buffer, whose bytes up to the last burst read were
+// handed in already.
+extern bool g_pending;
+inline bool Pending()
 {
-  return g_cut_pending;
+  return g_pending;
 }
-void OnCommandEnd(const u8* end);
+void OnCommandEnd(const u8* data, u32 size);
 
 // The presenter (the GPU thread): Aurora's newest picture, or null (show the emulator's own). `rect` is the
 // picture's: the display copy's size.
