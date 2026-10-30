@@ -372,6 +372,14 @@ void run() {
     std::fprintf(log, "copy,in_us,start_us,fed_us,presented_us,picture_us,waiting,bytes\n");
 
   Picture back;
+  // A readback asked for and not yet taken, and the frame it is of. Aurora never waits for its pixels while a frame
+  // waits behind it: a slow GPU copy (100+ ms seen with a busy GPU) would run it into the stop for being behind.
+  bool asked = false;
+  std::uint64_t asked_copy = 0;
+  const auto frame_waits = [] {
+    std::lock_guard g{s->lock};
+    return !s->queue.empty();
+  };
   for (;;) {
     Frame f;
     std::size_t waiting = 0;
@@ -394,15 +402,28 @@ void run() {
       aurora_backend_gx_write_burst(f.bytes.data() + off, static_cast<u32>(n));
     }
     const auto fed = Clock::now();
-    // a picture when this is the newest frame (none waits behind it) or a test picture is wanted of it
-    const bool picture = waiting == 0 || is_shot(f.copy);
-    if (picture)
+    // a picture when this is the newest frame (none waits behind it) or a test picture is wanted of it (which must be
+    // of that frame: one still on its way comes first)
+    const bool shot = is_shot(f.copy);
+    if (shot && asked) {
+      const std::uint8_t* old = nullptr;
+      u32 oldw = 0, oldh = 0;
+      for (int attempt = 0; attempt < 8000 && !aurora_take_framebuffer_readback(&old, &oldw, &oldh); ++attempt) {
+        aurora_pump_framebuffer_readback();
+        std::this_thread::sleep_for(std::chrono::microseconds(250));
+      }
+      asked = false;
+    }
+    if (!asked && (waiting == 0 || shot)) {
       aurora_request_framebuffer_readback();
+      asked = true;
+      asked_copy = f.copy;
+    }
     aurora_backend_present();
     const auto presented = Clock::now();
     auto pictured = presented;
     bool got = false;
-    if (picture) {
+    if (asked) {
       const std::uint8_t* rgba = nullptr;
       u32 w = 0, h = 0;
       for (int attempt = 0; attempt < 8000; ++attempt) {  // (2 s at most)
@@ -411,6 +432,8 @@ void run() {
           break;
         }
         aurora_pump_framebuffer_readback();
+        if (!shot && frame_waits())
+          break;
         std::this_thread::sleep_for(std::chrono::microseconds(250));
       }
       pictured = Clock::now();
@@ -418,10 +441,11 @@ void run() {
         back.rgba.assign(rgba, rgba + static_cast<std::size_t>(w) * h * 4u);
         back.width = w;
         back.height = h;
-        back.copy = f.copy;
-        if (!s->shot_prefix.empty() && is_shot(f.copy)) {
+        back.copy = asked_copy;
+        asked = false;
+        if (!s->shot_prefix.empty() && is_shot(back.copy)) {
           char path[64];
-          std::snprintf(path, sizeof path, "-aurora-%06llu.png", static_cast<unsigned long long>(f.copy));
+          std::snprintf(path, sizeof path, "-aurora-%06llu.png", static_cast<unsigned long long>(back.copy));
           write_png(s->shot_prefix + path, back.rgba.data(), w, h);
         }
       }
