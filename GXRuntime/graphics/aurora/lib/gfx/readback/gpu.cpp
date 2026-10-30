@@ -19,6 +19,24 @@ constexpr uint64_t PoolLimit = 16ull << 20;
 std::mutex g_poolMutex;
 std::vector<std::pair<uint64_t, wgpu::Buffer>> g_freeBuffers;
 uint64_t g_freeBytes = 0;
+// Buffers the pool did not take, held until the render worker drops them outside any Dawn callback. on_mapped runs
+// inside the buffer's MapAsync callback; dropping the last reference there (or in the callback's captures, which
+// Dawn destroys right after the callback returns) frees the buffer while Dawn still holds a mutex inside it, and the
+// later unlock writes freed memory.
+std::vector<wgpu::Buffer> g_retiredBuffers;
+
+void retire_buffer(wgpu::Buffer buffer) noexcept {
+  std::lock_guard lock{g_poolMutex};
+  g_retiredBuffers.push_back(std::move(buffer));
+}
+
+void drop_retired_buffers() noexcept {
+  std::vector<wgpu::Buffer> retired;
+  {
+    std::lock_guard lock{g_poolMutex};
+    retired.swap(g_retiredBuffers);
+  }
+}
 
 // Render worker only
 wgpu::Buffer g_scratch;
@@ -59,6 +77,7 @@ const wgpu::Buffer& ensure_scratch(uint64_t bytes) {
 void on_mapped(Job& job, wgpu::Buffer buffer, wgpu::MapAsyncStatus status, wgpu::StringView message) {
   if (status != wgpu::MapAsyncStatus::Success) {
     fail_job(job, fmt::format("buffer mapping {}: {}", magic_enum::enum_name(status), message));
+    retire_buffer(std::move(buffer));
     return;
   }
   const auto* data = static_cast<const uint8_t*>(buffer.GetConstMappedRange(0, job.outputBytes));
@@ -105,14 +124,16 @@ void shutdown() {
   std::lock_guard lock{g_poolMutex};
   g_freeBuffers.clear();
   g_freeBytes = 0;
+  g_retiredBuffers.clear();
 }
 
 void release_buffer(wgpu::Buffer buffer, uint64_t bytes) noexcept {
-  if (!buffer || !supported()) {
+  if (!buffer) {
     return;
   }
   std::lock_guard lock{g_poolMutex};
-  if (g_freeBytes + bytes > PoolLimit) {
+  if (!supported() || g_freeBytes + bytes > PoolLimit) {
+    g_retiredBuffers.push_back(std::move(buffer));
     return;
   }
   g_freeBytes += bytes;
@@ -121,6 +142,7 @@ void release_buffer(wgpu::Buffer buffer, uint64_t bytes) noexcept {
 
 void encode_job(const wgpu::CommandEncoder& cmd, detail::FramePacket& frame, const std::shared_ptr<Job>& job) {
   ZoneScoped;
+  drop_retired_buffers();
   if (!supported()) {
     fail_job(*job, "readback GPU resources are not initialized");
     return;
