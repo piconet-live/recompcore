@@ -1,8 +1,10 @@
 #include "regs.hpp"
 
 #include "gx_fmt.hpp"
+#include "recomp.hpp"
 #include "texture.hpp"
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 
@@ -274,18 +276,137 @@ void bp_clear_bg(u8, u32 value) noexcept {
 
 void bp_clear_depth(u8, u32 value) noexcept { g_gxState.clearDepth = reg_get(value, 24, 0); }
 
+// recomp seam: retail streams set copies, TLUTs and textures up with raw BP registers holding physical guest
+// addresses; recomp::resolve_guest_address turns them into host pointers (see recomp.hpp).
+u32 texture_physical_base(u32 reg) noexcept { return (reg & 0x001FFFFFu) << 5; }
+
+void mark_recomp_texture_metadata(GXTexObj_& slot) noexcept {
+  slot.data = nullptr;
+  slot.texObjId = 0;
+  slot.texDataVersion = 0;
+  slot.flags = 0x80;
+}
+
+GXTexFmt decode_tex_copy_format(u32 value) noexcept {
+  const u32 targetPixelFormat = reg_get(value, 4, 3);
+  const u32 realFormat = targetPixelFormat / 2 + (targetPixelFormat & 1u) * 8u;
+  const bool intensity = reg_get(value, 1, 15) != 0;
+  switch (realFormat) {
+  case 0x0:
+    return intensity ? GX_TF_I4 : GX_CTF_R4;
+  case 0x1:
+    return GX_TF_I8;
+  case 0x2:
+    return intensity ? GX_TF_IA4 : GX_CTF_RA4;
+  case 0x3:
+    return intensity ? GX_TF_IA8 : GX_CTF_RA8;
+  case 0x4:
+    return GX_TF_RGB565;
+  case 0x5:
+    return GX_TF_RGB5A3;
+  case 0x6:
+    return GX_TF_RGBA8;
+  case 0x7:
+    return GX_CTF_A8;
+  case 0x8:
+    return intensity ? GX_TF_I8 : GX_CTF_R8;
+  case 0x9:
+    return GX_CTF_G8;
+  case 0xA:
+    return GX_CTF_B8;
+  case 0xB:
+    return g_gxState.pixelFmt == GX_PF_Z24 ? GX_TF_Z16 : GX_CTF_RG8;
+  case 0xC:
+    return GX_CTF_GB8;
+  default:
+    return GX_TF_RGBA8;
+  }
+}
+
+void resolve_tex_copy_destination_from_bp(u32 triggerValue) noexcept {
+  if (g_gxState.texCopyDestPhysical == UINT32_MAX) {
+    return;
+  }
+  g_gxState.texCopyFmt = decode_tex_copy_format(triggerValue);
+  u32 width = static_cast<u32>(std::max(g_gxState.texCopySrc.width, 1));
+  u32 height = static_cast<u32>(std::max(g_gxState.texCopySrc.height, 1));
+  if (reg_get(triggerValue, 1, 9) != 0) {
+    width = std::max((width + 1u) / 2u, 1u);
+    height = std::max((height + 1u) / 2u, 1u);
+  }
+  g_gxState.texCopyDstWidth = width;
+  g_gxState.texCopyDstHeight = height;
+  g_gxState.texCopyDstWide = true;
+
+  u32 byteSize = 0;
+  if (width <= UINT16_MAX && height <= UINT16_MAX) {
+    byteSize = GXGetTexBufferSize(static_cast<u16>(width), static_cast<u16>(height), g_gxState.texCopyFmt, GX_FALSE, 0);
+  }
+  const void* destData = nullptr;
+  u32 available = 0;
+  if (recomp::resolve_guest_address(g_gxState.texCopyDestPhysical, std::max(byteSize, 1u),
+                                     recomp::AddressSpace::Physical, recomp::ResourceKind::CopyDestination, &destData,
+                                     &available)) {
+    g_gxState.texCopyDest = destData;
+  }
+}
+
+void resolve_tlut_load_from_bp(u32 value) noexcept {
+  const u32 tmemOffset = reg_get(value, 10, 0);
+  const u32 lineCount = reg_get(value, 11, 10);
+  if (tmemOffset >= MaxTmemTlutOffsets || lineCount == 0) {
+    return;
+  }
+  const u32 byteSize = lineCount * 32u;
+  const void* tlutData = nullptr;
+  u32 available = 0;
+  if (!recomp::resolve_guest_address(texture_physical_base(g_gxState.bpRegCache[0x64]), byteSize,
+                                     recomp::AddressSpace::Physical, recomp::ResourceKind::Tlut, &tlutData,
+                                     &available)) {
+    return;
+  }
+  auto& slot = g_gxState.loadedTmemTluts[tmemOffset];
+  slot.tlut = value;
+  slot.loadTlut0 = g_gxState.bpRegCache[0x64];
+  slot.numEntries = static_cast<u16>(byteSize / sizeof(u16));
+  slot.data = tlutData;
+  slot.tlutObjId = 0x80000000u | tmemOffset;
+  slot.tlutDataVersion = slot.tlutDataVersion + 1u;
+  if (slot.tlutDataVersion == 0) {
+    slot.tlutDataVersion = 1;
+  }
+  slot.set_no_cache(false);
+}
+
+// EFB copy source and destination (0x49, 0x4A, 0x4B): raw-register copies
+void bp_copy_src_pos(u8, u32 value) noexcept {
+  g_gxState.texCopySrc.x = static_cast<s32>(reg_get(value, 10, 0));
+  g_gxState.texCopySrc.y = static_cast<s32>(reg_get(value, 10, 10));
+}
+void bp_copy_src_size(u8, u32 value) noexcept {
+  g_gxState.texCopySrc.width = static_cast<s32>(reg_get(value, 10, 0) + 1);
+  g_gxState.texCopySrc.height = static_cast<s32>(reg_get(value, 10, 10) + 1);
+}
+void bp_copy_dst_base(u8, u32 value) noexcept { g_gxState.texCopyDestPhysical = texture_physical_base(value); }
+
 // EFB copy trigger (0x52)
 void bp_efb_copy(u8, u32 value) noexcept {
   const bool clear = reg_get(value, 1, 11) != 0;
   if (reg_get(value, 1, 14) != 0) {
     Log.warn("STUB: display copy is not implemented");
   } else {
-    copy_tex(g_gxState.texCopyDest, clear);
+    resolve_tex_copy_destination_from_bp(value);
+    if (g_gxState.texCopyDest != nullptr) {
+      copy_tex(g_gxState.texCopyDest, clear);
+    } else {
+      Log.warn("Skipping GXCopyTex with unresolved destination");
+    }
   }
 }
 
 // TLUT load trigger (0x65)
 void bp_tlut_load(u8, u32 value) noexcept {
+  resolve_tlut_load_from_bp(value);
   const auto idx = reg_get(value, 10, 0);
   if (idx < MaxTluts) {
     auto& slot = g_gxState.loadedTluts[idx];
@@ -496,9 +617,16 @@ void bp_tex(u8 reg, u32 value) noexcept {
     slot.mWidth = 0;
     slot.mHeight = 0;
     slot.mFormat = gfx::InvalidTextureFormat;
+    mark_recomp_texture_metadata(slot);
     break;
   case 5: // Image3
     slot.image3 = value;
+    mark_recomp_texture_metadata(slot);
+    break;
+  case 6: // TLUT region: TMEM offset and format (recomp seam)
+    g_gxState.loadedTextureTlutValid[texMapId] = true;
+    g_gxState.loadedTextureTlutTmemOffsets[texMapId] = static_cast<u16>(reg_get(value, 10, 0));
+    g_gxState.loadedTextureTlutFormats[texMapId] = static_cast<GXTlutFmt>(reg_get(value, 2, 10));
     break;
   default:
     break;
@@ -546,6 +674,9 @@ constexpr auto kBpRegs = [] {
   regs[0x4F] = {bp_clear_ra};
   regs[0x50] = {bp_clear_bg};
   regs[0x51] = {bp_clear_depth};
+  regs[0x49] = {bp_copy_src_pos};
+  regs[0x4A] = {bp_copy_src_size};
+  regs[0x4B] = {bp_copy_dst_base};
   regs[0x52] = {bp_efb_copy, 0, /* alwaysHandle */ true};
   regs[0x59] = {bp_scissor};
   regs[0x64] = {}; // TLUT load address; bp_tlut_load reads from shadow
@@ -558,7 +689,7 @@ constexpr auto kBpRegs = [] {
       regs[base + 0x0C + i] = {};                      // Image1 (GXTexRegion)
       regs[base + 0x10 + i] = {};                      // Image2 (GXTexRegion)
       regs[base + 0x14 + i] = {bp_tex, DirtyTextures}; // Image3
-      regs[base + 0x18 + i] = {};                      // TLUT region TMEM offset
+      regs[base + 0x18 + i] = {bp_tex, DirtyTextures}; // TLUT region TMEM offset
     }
   }
   for (u8 r = 0xC0; r <= 0xDE; r += 2) {
@@ -683,8 +814,33 @@ void cp_vat_c(u8 addr, u32 value) noexcept {
   g_gxState.clearVtxSizeCache();
 }
 
-void cp_arraybase_unsupported(u8, u32) noexcept {
-  Log.error("CP_REG_ARRAYBASE_ID is not supported. Use GX_AURORA_LOAD_ARRAYBASE instead.");
+// Array bases (0xA0-0xAF): a physical guest address, through the recomp seam's resolver (recomp.hpp)
+void cp_arraybase_unsupported(u8 addr, u32 value) noexcept {
+  const u32 attrIdx = addr - 0xA0 + GX_VA_POS;
+  if (attrIdx >= GX_VA_MAX_ATTR) {
+    return;
+  }
+  const void* arrayData = nullptr;
+  u32 available = 0;
+  if (!recomp::resolve_guest_address(value, 1, recomp::AddressSpace::Physical, recomp::ResourceKind::VertexArray,
+                                     &arrayData, &available)) {
+    Log.error("CP_REG_ARRAYBASE_ID is not supported without a guest address resolver (attr {}, address 0x{:08X}). "
+              "Use GX_AURORA_LOAD_ARRAYBASE instead.",
+              attrIdx, value);
+    return;
+  }
+  auto& array = g_gxState.arrays[attrIdx];
+  if (array.data != arrayData || array.size != available || array.le) {
+    if (array.le) {
+      g_gxState.dirty |= DirtyPipeline;
+    }
+    array.data = arrayData;
+    array.size = available;
+    array.le = false;
+    array.cachedRange = {};
+    array.reserved = 0;
+    g_gxState.dirty |= DirtyImmediates;
+  }
 }
 
 // Array strides (0xB0-0xBF)

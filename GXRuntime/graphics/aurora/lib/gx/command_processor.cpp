@@ -7,6 +7,7 @@
 #include "gx.hpp"
 #include "pipeline.hpp"
 #include "readback.hpp"
+#include "recomp.hpp"
 #include "regs.hpp"
 #include "shader_info.hpp"
 #include "texture.hpp"
@@ -22,6 +23,9 @@
 namespace aurora::gx::fifo {
 namespace {
 constexpr Module Log{"aurora::gx::fifo"};
+// recomp seam: GX_CMD_CALL_DL nesting depth (display lists resolved from guest memory)
+u32 s_displayListDepth = 0;
+constexpr u32 MaxDisplayListDepth = 16;
 
 u16 prepare_idx_buffer(ByteBuffer& buf, GXPrimitive prim, u16 vtxStart, u16 vtxCount) noexcept {
   u16 numIndices = 0;
@@ -276,9 +280,28 @@ ProcessResult process(const u8* data, u32 size) noexcept {
     }
 
     case CP_CMD_CALL_DL: {
-      // Call display list: 8 bytes (address + size)
-      Log.warn("Ignoring nested GX_CMD_CALL_DL");
-      reader.skip(8);
+      // Call display list: 8 bytes (address + size). With a guest address resolver (recomp seam) the list is read
+      // from guest memory and processed in place, as the hardware's command processor does.
+      const u32 address = reader.read<u32>();
+      const u32 dlSize = reader.read<u32>();
+      if (dlSize == 0) {
+        break;
+      }
+      if (s_displayListDepth >= MaxDisplayListDepth) {
+        Log.warn("Skipping GX_CMD_CALL_DL recursion at depth {} (address=0x{:08X}, size={})", s_displayListDepth,
+                 address, dlSize);
+        break;
+      }
+      const void* dlData = nullptr;
+      u32 available = 0;
+      if (!recomp::resolve_guest_address(address, dlSize, recomp::AddressSpace::Auto,
+                                         recomp::ResourceKind::DisplayList, &dlData, &available)) {
+        Log.warn("Ignoring nested GX_CMD_CALL_DL (address=0x{:08X}, size={})", address, dlSize);
+        break;
+      }
+      ++s_displayListDepth;
+      process(static_cast<const u8*>(dlData), dlSize);
+      --s_displayListDepth;
       break;
     }
 
@@ -379,6 +402,78 @@ static u32 calc_vtx_size(GXVtxFmt fmt) noexcept {
   return vtxSize;
 }
 
+// recomp seam: an array resolved from guest memory is sized to the end of that memory region, so a draw pushes only
+// the part its indices reach. The index fields' places in a vertex first (one pass over the attributes), then a
+// tight loop per field over the vertices. A draw that needs more of an array than was pushed re-pushes it, which
+// changes the draw's immediates and so ends merging.
+static void reserve_indexed_arrays(GXVtxFmt fmt, u16 vtxCount, const u8* vertices) noexcept {
+  struct IndexField {
+    u32 attr;
+    u32 offset;
+    u32 bytes;
+  };
+  std::array<IndexField, 3 * (GX_VA_TEX7 - GX_VA_PNMTXIDX + 1)> fields;
+  u32 fieldCount = 0;
+  const auto& vtxFmt = g_gxState.vtxFmts[fmt];
+  u32 offset = 0;
+  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+    const auto attr = static_cast<GXAttr>(i);
+    switch (g_gxState.vtxDesc[i]) {
+    case GX_NONE:
+      break;
+    case GX_DIRECT:
+      offset += comp_type_size(attr, vtxFmt.attrs[i].type) * comp_cnt_count(attr, vtxFmt.attrs[i].cnt);
+      break;
+    case GX_INDEX8:
+    case GX_INDEX16: {
+      const u32 bytes = g_gxState.vtxDesc[i] == GX_INDEX8 ? 1u : 2u;
+      const u32 count = (i == GX_VA_NRM && vtxFmt.attrs[i].cnt == GX_NRM_NBT3) ? 3u : 1u;
+      for (u32 n = 0; n < count; ++n) {
+        if (i >= GX_VA_POS) {
+          fields[fieldCount++] = {static_cast<u32>(i), offset, bytes};
+        }
+        offset += bytes;
+      }
+      break;
+    }
+    }
+  }
+  if (fieldCount == 0 || vtxCount == 0) {
+    return;
+  }
+  const u32 vtxSize = offset;
+  std::array<u32, GX_VA_MAX_ATTR> required{};
+  for (u32 f = 0; f < fieldCount; ++f) {
+    const auto& field = fields[f];
+    u32 maxIndex = 0;
+    const u8* cursor = vertices + field.offset;
+    if (field.bytes == 1) {
+      for (u16 v = 0; v < vtxCount; ++v, cursor += vtxSize) {
+        maxIndex = std::max<u32>(maxIndex, *cursor);
+      }
+    } else {
+      for (u16 v = 0; v < vtxCount; ++v, cursor += vtxSize) {
+        maxIndex = std::max<u32>(maxIndex, static_cast<u32>(cursor[0]) << 8 | cursor[1]);
+      }
+    }
+    required[field.attr] = std::max(required[field.attr], (maxIndex + 1u) * g_gxState.arrays[field.attr].stride);
+  }
+  for (u32 attr = GX_VA_POS; attr <= GX_VA_TEX7; ++attr) {
+    auto& array = g_gxState.arrays[attr];
+    if (required[attr] == 0) {
+      continue;
+    }
+    const u32 size = std::min(array.size, required[attr]);
+    if (size > array.reserved) {
+      array.reserved = size;
+      if (array.cachedRange.size != 0 && array.cachedRange.size < size) {
+        array.cachedRange = {};
+        g_gxState.dirty |= DirtyImmediates;
+      }
+    }
+  }
+}
+
 static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange, gfx::Range idxRange,
                          u32 numIndices) noexcept {
   auto& state = g_gxState;
@@ -391,7 +486,9 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     }
     auto& array = state.arrays[i];
     if (array.cachedRange.size == 0) {
-      array.cachedRange = gfx::push_storage(static_cast<const uint8_t*>(array.data), array.size);
+      // recomp seam: only the part the draws' indices reach (reserve_indexed_arrays), when that is known
+      const u32 size = array.reserved != 0 ? std::min(array.size, array.reserved) : array.size;
+      array.cachedRange = gfx::push_storage(static_cast<const uint8_t*>(array.data), size);
     }
     immediates.arrayStart[i - GX_VA_POS] = array.cachedRange.offset;
   }
@@ -499,6 +596,9 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
   u32 totalVtxBytes = vtxCount * vtxSize;
   if (totalVtxBytes > reader.remaining())
     UNLIKELY { handle_draw_overrun(totalVtxBytes, reader); }
+  if (recomp::has_guest_address_resolver()) {
+    reserve_indexed_arrays(fmt, vtxCount, reader.data() + reader.offset());
+  }
 
   const bool cleanState = g_gxState.dirty == 0 && fmt == sDrawCache.lastDrawFmt && sDrawCache.lineMode == 0 &&
                           prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS;
@@ -607,6 +707,7 @@ void handle_aurora(ByteReader& reader) noexcept {
       array.size = arraySize;
       array.le = le;
       array.cachedRange = {};
+      array.reserved = 0;
       g_gxState.dirty |= DirtyImmediates;
     }
   } else if (subCmd == GX_AURORA_LOAD_TEXOBJ) {

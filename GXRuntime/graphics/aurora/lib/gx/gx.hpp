@@ -51,6 +51,8 @@ constexpr bool UseReversedZ = true;
 
 constexpr u32 MaxTextures = GX_MAX_TEXMAP;
 constexpr u32 MaxTluts = 20;
+// recomp seam: TLUTs loaded by raw BP 0x64/0x65 writes, by TMEM offset (10 bits)
+constexpr u32 MaxTmemTlutOffsets = 1024;
 constexpr u32 MaxTevStages = GX_MAX_TEVSTAGE;
 constexpr u32 MaxColorChannels = 4;
 constexpr u32 MaxTevRegs = 4; // TEVPREV, TEVREG0-2
@@ -299,6 +301,8 @@ struct AttrArray {
   u8 stride;
   bool le = true;
   gfx::Range cachedRange;
+  // recomp seam: the bytes the draws' indices reach (0: unknown, push the whole array)
+  u32 reserved = 0;
 };
 inline bool operator==(const AttrArray& lhs, const AttrArray& rhs) {
   return lhs.data == rhs.data && lhs.size == rhs.size && lhs.stride == rhs.stride && lhs.le == rhs.le;
@@ -365,6 +369,11 @@ struct GXState {
   std::array<TevStage, MaxTevStages> tevStages;
   std::array<GXTexObj_, MaxTextures> loadedTextures;
   std::array<GXTlutObj_, MaxTluts> loadedTluts;
+  // recomp seam (recomp.hpp): retail TLUT loads by TMEM offset, and each texture map's TLUT register (BP 0x98+)
+  std::array<GXTlutObj_, MaxTmemTlutOffsets> loadedTmemTluts;
+  std::array<bool, MaxTextures> loadedTextureTlutValid{};
+  std::array<u16, MaxTextures> loadedTextureTlutTmemOffsets{};
+  std::array<GXTlutFmt, MaxTextures> loadedTextureTlutFormats{};
   std::array<Mat3x4<float>, MaxTexMtx> texMtxs;
   std::array<Mat3x4<float>, MaxPTTexMtx> ptTexMtxs;
   std::array<TcgConfig, MaxTexCoord> tcgs;
@@ -410,6 +419,8 @@ struct GXState {
   u32 texCopyDstHeight = 0;
   bool texCopyDstWide = false;
   const void* texCopyDest = nullptr;
+  // recomp seam: the copy destination from BP 0x4B (physical), resolved at the copy trigger
+  u32 texCopyDestPhysical = UINT32_MAX;
   absl::flat_hash_map<const void*, CopyTextureRef> copyTextures;
 
   // Cache state

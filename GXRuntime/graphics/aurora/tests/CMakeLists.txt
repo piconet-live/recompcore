@@ -118,6 +118,7 @@ if (AURORA_ENABLE_GX)
     ../lib/gx/command_processor.cpp
     ../lib/gx/readback.cpp
     ../lib/gx/regs.cpp
+    ../lib/gx/recomp.cpp
     ../lib/gfx/readback/readback.cpp
     ../lib/thread.cpp
     # Display list reader/optimizer

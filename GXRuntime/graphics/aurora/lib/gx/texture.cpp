@@ -1,4 +1,5 @@
 #include "texture.hpp"
+#include "recomp.hpp"
 
 #include "../gfx/lru_cache.hpp"
 #include "../gfx/recording.hpp"
@@ -838,19 +839,26 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
       continue;
     }
 
+    // recomp seam: a slot set up by raw BP registers gets its data from guest memory here
+    recomp::resolve_texture_data(obj);
     gfx::TextureHandle handle;
     const auto copyIt = g_gxState.copyTextures.find(obj.data);
     const GXState::CopyTextureRef* copyRef = copyIt != g_gxState.copyTextures.end() ? &copyIt->second : nullptr;
     if (is_palette_format(obj.format())) {
+      GXTlutObj_ recompTlut{};
+      const GXTlutObj_* tlut = nullptr;
+      if (obj.texObjId == 0 && recomp::resolve_texture_tlut(i, &recompTlut)) {
+        tlut = &recompTlut;
+      }
       const auto tlutIdx = static_cast<size_t>(obj.tlut);
-      if (tlutIdx < g_gxState.loadedTluts.size()) {
-        const auto& tlut = g_gxState.loadedTluts[tlutIdx];
-        if (tlut.data != nullptr) {
-          if (copyRef != nullptr) {
-            handle = resolve_dynamic_palette_texture(obj, *copyRef, tlut);
-          } else if (obj.has_data()) {
-            handle = texture::resolve_static_palette_texture(obj, tlut);
-          }
+      if (tlut == nullptr && tlutIdx < g_gxState.loadedTluts.size() && g_gxState.loadedTluts[tlutIdx].data != nullptr) {
+        tlut = &g_gxState.loadedTluts[tlutIdx];
+      }
+      if (tlut != nullptr) {
+        if (copyRef != nullptr) {
+          handle = resolve_dynamic_palette_texture(obj, *copyRef, *tlut);
+        } else if (obj.has_data()) {
+          handle = texture::resolve_static_palette_texture(obj, *tlut);
         }
       }
     } else if (copyRef != nullptr) {
