@@ -1197,12 +1197,14 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
       vtxOutAttrs += fmt::format("\n    @location({}) tex{}_uv: vec2f,", vtxOutIdx++, i);
     }
     if (is_emboss_texgen(tcg.type)) {
-      // Emboss bump: offset the source texcoord by the light projected onto tangent/binormal
+      // Emboss bump: offset the source texcoord by the light projected onto the NBT vectors. As Dolphin
+      // (VertexShaderGen EmbossMap): S moves along the second NBT vector, T along the third. They were the other way
+      // round, which turned and moved the embossed relief (F-Zero GX's Sand Ocean ripples).
       const u32 lightIdx = tcg.type - GX_TG_BUMP0;
       vtxXfrAttrs += fmt::format(
           "\n    let bump_ldir{0} = normalize(ubuf.lights[{1}].pos - mv_pos);"
-          "\n    let bump_tan{0} = vec4f(in_tangent, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
-          "\n    let bump_bin{0} = vec4f(in_binrm, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
+          "\n    let bump_tan{0} = vec4f(in_binrm, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
+          "\n    let bump_bin{0} = vec4f(in_tangent, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
           "\n    out.tex{0}_uv = tc{2}_proj.xy + vec2f(dot(bump_ldir{0}, bump_tan{0}), dot(bump_ldir{0}, "
           "bump_bin{0}));",
           i, lightIdx, tcg.embossSrc);
