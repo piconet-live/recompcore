@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace aurora::gx::fifo {
@@ -530,6 +531,19 @@ static bool diagnose_draw(GXPrimitive prim, u16 vtxCount, const ShaderInfo& info
   const auto& st = g_gxState;
   if (g_auroraDrawDump != 0) {
     dump_draw(prim, vtxCount, info);
+    // AURORA_DUMP_SKIP=a-b: that frame's draws a to b left out, to find which draw makes a part of the picture
+    static const std::pair<u32, u32> skip = [] {
+      const char* v = std::getenv("AURORA_DUMP_SKIP");
+      char* end = nullptr;
+      const u32 a = v != nullptr ? static_cast<u32>(std::strtoul(v, &end, 10)) : 1u;
+      const u32 b = v != nullptr && *end == '-' ? static_cast<u32>(std::strtoul(end + 1, nullptr, 10)) : 0u;
+      return std::pair{a, b};
+    }();
+    static u32 index = 0;
+    const u32 i = index++;
+    if (i >= skip.first && i <= skip.second) {
+      return false;
+    }
   }
   if (g_drawLogCount < drawLogMax) {
     const auto& vp = st.logicalViewport;

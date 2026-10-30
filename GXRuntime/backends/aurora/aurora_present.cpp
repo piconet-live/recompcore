@@ -209,7 +209,7 @@ struct State {
   std::thread thread;
   std::atomic<bool> running{false};
   std::atomic<bool> stopped{false};
-  bool up = false;  // (under lock) Aurora started (its device, window and pipelines' cache): the tight bound from then on
+  bool up = false;  // (under lock) Aurora started and the frames that waited for it drained: the tight bound from then on
   std::vector<double> feed_ms, present_ms, readback_ms;
 };
 State* s = nullptr;
@@ -365,10 +365,6 @@ void run() {
   const char* test_fatal_text = std::getenv("AURORA_TEST_FATAL");
   const std::uint64_t test_fatal = test_fatal_text != nullptr ? std::strtoull(test_fatal_text, nullptr, 10) : 0;
 
-  {
-    std::lock_guard g{s->lock};
-    s->up = true;
-  }
   FILE* log = s->log_path.empty() ? nullptr : std::fopen(s->log_path.c_str(), "w");
   if (log)
     std::fprintf(log, "copy,in_us,start_us,fed_us,presented_us,picture_us,waiting,bytes\n");
@@ -394,6 +390,10 @@ void run() {
       s->queue.pop_front();
       s->bytes_waiting -= f.bytes.size();
       waiting = s->queue.size();
+      // the tight bound from when the frames that waited for the start are gone: while they drain, a new frame found
+      // 4 waiting and stopped Aurora for the run in its first half second (course 37, a window)
+      if (waiting == 0)
+        s->up = true;
     }
     const auto start = Clock::now();
     static const std::uint64_t dump_copy = [] {
