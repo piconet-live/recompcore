@@ -1986,6 +1986,40 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
                      g_gxState.textures[t] ? "" : "(empty)");
       }
     }
+    // AURORA_DRAW_LOG_TCG=1: each texgen and its matrices too
+    static const bool tcgLog = std::getenv("AURORA_DRAW_LOG_TCG") != nullptr;
+    if (tcgLog) {
+      for (u32 i = 0; i < g_gxState.numTexGens && i < MaxTexCoord; ++i) {
+        const auto& tcg = g_gxState.tcgs[i];
+        std::fprintf(stderr, " | tg%u type %u src %u mtx %u post %u norm %u", i, static_cast<unsigned>(tcg.type),
+                     static_cast<unsigned>(tcg.src), static_cast<unsigned>(tcg.mtx),
+                     static_cast<unsigned>(tcg.postMtx), tcg.normalize ? 1u : 0u);
+        if (tcg.mtx != GX_IDENTITY) {
+          const auto idx = static_cast<u32>(tcg.mtx) / 3;
+          const f32* m = idx < MaxPnMtx ? reinterpret_cast<const f32*>(&g_gxState.pnMtx[idx].pos)
+                                        : reinterpret_cast<const f32*>(&g_gxState.texMtxs[idx - MaxPnMtx]);
+          std::fprintf(stderr, " M[%g %g %g %g / %g %g %g %g / %g %g %g %g]", m[0], m[1], m[2], m[3], m[4], m[5],
+                       m[6], m[7], m[8], m[9], m[10], m[11]);
+        }
+        if (tcg.postMtx != GX_PTIDENTITY) {
+          const f32* m = reinterpret_cast<const f32*>(&g_gxState.ptTexMtxs[(tcg.postMtx - GX_PTTEXMTX0) / 3]);
+          std::fprintf(stderr, " P[%g %g %g %g / %g %g %g %g / %g %g %g %g]", m[0], m[1], m[2], m[3], m[4], m[5],
+                       m[6], m[7], m[8], m[9], m[10], m[11]);
+        }
+      }
+      for (u32 s = 0; s < g_gxState.numTevStages && s < MaxTevStages; ++s) {
+        const auto& st = g_gxState.tevStages[s];
+        if (st.texCoordId == GX_TEXCOORD_NULL || st.texMapId == GX_TEXMAP_NULL) {
+          continue;
+        }
+        const auto c = static_cast<u32>(st.texCoordId) & 7u;
+        const auto mp = static_cast<u32>(st.texMapId) & 7u;
+        const auto& tcs = g_gxState.texCoordScales[c];
+        const auto& tb = g_gxState.textures[mp];
+        std::fprintf(stderr, " | st%u c%u->m%u su %ux%u tex %ux%u", s, c, mp, tcs.scaleS + 1u, tcs.scaleT + 1u,
+                     tb.texObj.width(), tb.texObj.height());
+      }
+    }
     std::fprintf(stderr, "\n");
   }
   ++g_drawLogCount;
@@ -2005,6 +2039,30 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
       }
     }
     std::fprintf(stderr, "\n");
+  }
+  // AURORA_SKIP_TEX=ADDR[,ADDR...] (physical, hex): draws sampling any of these textures are not drawn (a
+  // diagnostic, to find which draws make an effect)
+  static const std::vector<u32> skipTex = [] {
+    std::vector<u32> list;
+    if (const char* v = std::getenv("AURORA_SKIP_TEX")) {
+      for (const char* p = v; *p != '\0';) {
+        char* end = nullptr;
+        list.push_back(static_cast<u32>(std::strtoul(p, &end, 16)));
+        if (end == p) {
+          break;
+        }
+        p = (*end == ',') ? end + 1 : end;
+      }
+    }
+    return list;
+  }();
+  if (!skipTex.empty()) {
+    for (u32 t = 0; t < MaxTextures; ++t) {
+      if (info.sampledTextures.test(t) &&
+          std::ranges::find(skipTex, (g_gxState.loadedTextures[t].image3 & 0x001FFFFFu) << 5) != skipTex.end()) {
+        return;
+      }
+    }
   }
   const auto bindGroups = build_bind_groups(info);
   const auto pipeline = gfx::pipeline_ref(config);
