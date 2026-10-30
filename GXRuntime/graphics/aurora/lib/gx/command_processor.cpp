@@ -478,6 +478,9 @@ static void reserve_indexed_arrays(GXVtxFmt fmt, u16 vtxCount, const u8* vertice
 
 static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange, gfx::Range idxRange,
                          u32 numIndices) noexcept {
+  if (g_gxState.cullMode == GX_CULL_ALL) {
+    return; // draws nothing, as the hardware
+  }
   auto& state = g_gxState;
   auto& cache = sDrawCache;
 
@@ -598,6 +601,12 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
   u32 totalVtxBytes = vtxCount * vtxSize;
   if (totalVtxBytes > reader.remaining())
     UNLIKELY { handle_draw_overrun(totalVtxBytes, reader); }
+  if (g_gxState.cullMode == GX_CULL_ALL)
+    UNLIKELY {
+      // GX_CULL_ALL rasterises nothing (the hardware culls both faces; lines and points too)
+      reader.skip(totalVtxBytes);
+      return;
+    }
   if (recomp::has_guest_address_resolver()) {
     reserve_indexed_arrays(fmt, vtxCount, reader.data() + reader.offset());
   }
