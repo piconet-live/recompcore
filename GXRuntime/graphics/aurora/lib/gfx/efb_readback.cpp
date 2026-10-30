@@ -72,6 +72,11 @@ void after_submit() noexcept {
   if (!g_requested.load(std::memory_order_acquire)) {
     return;
   }
+  // MapAsync is issued after g_mutex is released: with AllowSpontaneous the
+  // callback may run inside MapAsync (D3D12 does this when the copy is already
+  // done), and complete_map takes g_mutex (std::mutex throws on the re-lock).
+  wgpu::Buffer mapBuffer;
+  uint64_t mapSize = 0;
   {
     std::lock_guard lock{g_mutex};
     if (g_inFlight) {
@@ -142,13 +147,14 @@ void after_submit() noexcept {
     };
     const auto buffer = encoder.Finish(&CommandBufferDescriptor);
     webgpu::g_queue.Submit(1, &buffer);
-    g_buffer.MapAsync(wgpu::MapMode::Read, 0, byteSize,
-                      wgpu::CallbackMode::AllowSpontaneous,
-                      [](wgpu::MapAsyncStatus status, wgpu::StringView message) {
-                        complete_map(status, message);
-                      });
+    mapBuffer = g_buffer;
+    mapSize = byteSize;
   }
   g_requested.store(false, std::memory_order_release);
+  if (mapBuffer) {
+    mapBuffer.MapAsync(wgpu::MapMode::Read, 0, mapSize, wgpu::CallbackMode::AllowSpontaneous,
+                       [](wgpu::MapAsyncStatus status, wgpu::StringView message) { complete_map(status, message); });
+  }
 }
 
 bool take(const std::uint8_t** rgba, std::uint32_t* width,

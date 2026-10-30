@@ -517,8 +517,11 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     const float width = sx * 2.0f;
     const float height = -sy * 2.0f;
     gx::set_logical_viewport({
-        .left = ox - 340.0f - width / 2.0f,
-        .top = oy - 340.0f - height / 2.0f,
+        // 342: the retail SDK's scissor box offset (BP 0x59 after GXInit),
+        // the origin Dolphin takes; 340 put retail pictures 2 px off. The
+        // plan does not carry BP 0x59 yet, so a game that moves it is not met.
+        .left = ox - 342.0f - width / 2.0f,
+        .top = oy - 342.0f - height / 2.0f,
         .width = width,
         .height = height,
         .znear = (oz - sz) / 1.6777215e7f,

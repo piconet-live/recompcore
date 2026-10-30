@@ -14,6 +14,7 @@
 #include <tracy/Tracy.hpp>
 
 #include <algorithm>
+#include <utility>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -567,6 +568,16 @@ static GXTexFmt decode_tex_copy_format(u32 value) {
   }
 }
 
+// Scissor box offset (BP 0x59): x and y in 2-pixel units, 10 bits each; the
+// EFB origin of viewport and scissor coordinates. GXInit writes (0+342)/2.
+static std::pair<int32_t, int32_t> scissor_box_origin() {
+  const u32 v = g_gxState.bpRegCache[0x59];
+  if (v == 0) {
+    return {342, 342};
+  }
+  return {static_cast<int32_t>(v & 0x3FFu) * 2, static_cast<int32_t>((v >> 10) & 0x3FFu) * 2};
+}
+
 static u32 tex_copy_destination_size(GXTexFmt format, u32 width, u32 height) {
   if (width == 0 || height == 0 || width > UINT16_MAX || height > UINT16_MAX) {
     return 0;
@@ -777,15 +788,16 @@ static void handle_bp(u32 value, bool bigEndian) {
     break;
   }
 
-  // Scissor registers (0x20, 0x21)
+  // Scissor registers (0x20, 0x21), relative to the scissor box offset (0x59)
   case 0x20:
   case 0x21: {
     const u32 scis0 = g_gxState.bpRegCache[0x20];
     const u32 scis1 = g_gxState.bpRegCache[0x21];
-    const int32_t tp = static_cast<int32_t>(bp_get(scis0, 11, 0)) - 342;
-    const int32_t lf = static_cast<int32_t>(bp_get(scis0, 11, 12)) - 342;
-    const int32_t bm = static_cast<int32_t>(bp_get(scis1, 11, 0)) - 342;
-    const int32_t rt = static_cast<int32_t>(bp_get(scis1, 11, 12)) - 342;
+    const auto [offX, offY] = scissor_box_origin();
+    const int32_t tp = static_cast<int32_t>(bp_get(scis0, 11, 0)) - offY;
+    const int32_t lf = static_cast<int32_t>(bp_get(scis0, 11, 12)) - offX;
+    const int32_t bm = static_cast<int32_t>(bp_get(scis1, 11, 0)) - offY;
+    const int32_t rt = static_cast<int32_t>(bp_get(scis1, 11, 12)) - offX;
     const int32_t wd = std::max(rt - lf + 1, 0);
     const int32_t ht = std::max(bm - tp + 1, 0);
     set_logical_scissor({lf, tp, wd, ht});
@@ -1597,9 +1609,13 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian) {
           f32 oz = read_f32(xfData + 20, bigEndian);
           f32 width = sx * 2.0f;
           f32 height = -sy * 2.0f;
+          // The XF origin carries the scissor box offset (BP 0x59, 342 from
+          // the retail SDK's GXInit), as Dolphin's VertexShaderManager takes it;
+          // a fixed 340 put every retail picture 2 pixels right and down.
+          const auto [offX, offY] = scissor_box_origin();
           set_logical_viewport({
-              .left = ox - 340.0f - width / 2.0f,
-              .top = oy - 340.0f - height / 2.0f,
+              .left = ox - static_cast<f32>(offX) - width / 2.0f,
+              .top = oy - static_cast<f32>(offY) - height / 2.0f,
               .width = width,
               .height = height,
               .znear = (oz - sz) / 1.6777215e7f,

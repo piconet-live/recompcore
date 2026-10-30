@@ -24,6 +24,21 @@
 #include "system_info.hpp"
 #include "tracy/Tracy.hpp"
 
+#include <atomic>
+#include <chrono>
+
+// Frame timing for offline tools (dolgx_replay --timing): the steady-clock time the render worker submitted the
+// last frame, and the time the GPU reported that submission done (queue OnSubmittedWorkDone).
+static std::atomic<uint64_t> g_timingSubmitNs{0};
+static std::atomic<uint64_t> g_timingGpuDoneNs{0};
+static uint64_t timing_now_ns() {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count());
+}
+extern "C" uint64_t aurora_timing_last_submit_ns() { return g_timingSubmitNs.load(std::memory_order_acquire); }
+extern "C" uint64_t aurora_timing_last_gpu_done_ns() { return g_timingGpuDoneNs.load(std::memory_order_acquire); }
+
 namespace aurora {
 AuroraConfig g_config;
 uint32_t g_sdlCustomEventsStart;
@@ -353,6 +368,11 @@ void end_frame() noexcept {
     {
       ZoneScopedN("Queue Submit");
       g_queue.Submit(1, &buffer);
+      g_timingSubmitNs.store(timing_now_ns(), std::memory_order_release);
+      g_queue.OnSubmittedWorkDone(wgpu::CallbackMode::AllowSpontaneous,
+                                  [](wgpu::QueueWorkDoneStatus, wgpu::StringView) {
+                                    g_timingGpuDoneNs.store(timing_now_ns(), std::memory_order_release);
+                                  });
     }
     webgpu::gpu_prof::after_submit();
     if (canPresent && g_surface) {

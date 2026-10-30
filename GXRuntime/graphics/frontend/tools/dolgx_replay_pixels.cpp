@@ -182,6 +182,9 @@ int dolgx_replay_pixels_main(const char* trace_path,
                              const PixelReplayOptions& options) {
   // Deterministic pixels need every draw's pipeline ready at encode time
   // (an explicit AURORA_SYNC_PIPELINES=0 wins, for experiments).
+  // Unbuffered stdout: a crash in the GPU stack must not swallow the lines
+  // (and Aurora's info log) printed before it.
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
   setenv("AURORA_SYNC_PIPELINES", "1", 0);
   // The backend arms its recorder/shadow from these; a replay must never
   // re-record or shadow-decode.
@@ -218,7 +221,7 @@ int dolgx_replay_pixels_main(const char* trace_path,
       .window_height = options.window_height,
       .vsync = false,
       .allow_texture_dumps = false,
-      .info_logging = false,
+      .info_logging = std::getenv("DOLGX_REPLAY_INFO_LOG") != nullptr,
       .graphics_logging = false,
       .force_untextured = false,
   };
@@ -255,6 +258,8 @@ int dolgx_replay_pixels_main(const char* trace_path,
             .count());
   };
   double feed_ns = 0.0;
+  double mem_ns = 0.0;  // MEM_UPDATE copies inside the frame (excluded)
+  Clock::time_point frame_t0 = Clock::now();
   unsigned pass = 0;
 
   std::vector<std::string> lines;
@@ -282,6 +287,7 @@ int dolgx_replay_pixels_main(const char* trace_path,
   // FRAME_BEGIN / end-of-trace instead.
   auto present_and_capture = [&]() {
     frame_open = false;
+    feed_ns = ns_since(frame_t0) - mem_ns;
     aurora_request_framebuffer_readback();
     const auto present_t0 = Clock::now();
     aurora_backend_present();
@@ -305,15 +311,27 @@ int dolgx_replay_pixels_main(const char* trace_path,
     }
     if (options.timing) {
       const double readback_ns = ns_since(readback_t0);
+      // worker = present call -> worker's queue submit (encode on the render
+      // worker); gpu = submit -> queue work done (GPU execution, readback copy).
+      const auto t0ns = static_cast<double>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              present_t0.time_since_epoch()).count());
+      const double submit_ns =
+          static_cast<double>(aurora_timing_last_submit_ns());
+      const double done_ns =
+          static_cast<double>(aurora_timing_last_gpu_done_ns());
       const AuroraStats* st = aurora_get_stats();
       std::printf("timing pass %u frame %u feed_ms %.3f present_ms %.3f "
-                  "readback_ms %.3f draws %u merged %u verts %u indices %u\n",
+                  "readback_ms %.3f worker_ms %.3f gpu_ms %.3f draws %u "
+                  "merged %u verts %u indices %u\n",
                   pass, current_frame, feed_ns * 1e-6, present_ns * 1e-6,
-                  readback_ns * 1e-6, st->drawCallCount, st->mergedDrawCallCount,
+                  readback_ns * 1e-6, (submit_ns - t0ns) * 1e-6,
+                  done_ns > submit_ns ? (done_ns - submit_ns) * 1e-6 : -1.0,
+                  st->drawCallCount, st->mergedDrawCallCount,
                   st->lastVertSize, st->lastIndexSize);
       std::fflush(stdout);
     }
-    feed_ns = 0.0;
+    mem_ns = 0.0;
     const std::uint64_t hash =
         fnv1a(rgba, static_cast<std::size_t>(width) * height * 4u);
     char line[96];
@@ -350,6 +368,8 @@ int dolgx_replay_pixels_main(const char* trace_path,
         present_and_capture();
       current_frame = frame_index;
       frame_open = true;
+      frame_t0 = Clock::now();
+      mem_ns = 0.0;
       break;
     }
     case trace::RecordKind::GxWrite: {
@@ -359,9 +379,7 @@ int dolgx_replay_pixels_main(const char* trace_path,
         fail("malformed GX_WRITE");
         break;
       }
-      const auto t0 = Clock::now();
       aurora_backend_gx_write(value, size);
-      feed_ns += ns_since(t0);
       break;
     }
     case trace::RecordKind::CallDisplayList: {
@@ -371,10 +389,8 @@ int dolgx_replay_pixels_main(const char* trace_path,
         fail("malformed CALL_DL");
         break;
       }
-      const auto t0 = Clock::now();
       aurora_backend_call_display_list(bytes.data(),
                                        static_cast<u32>(bytes.size()));
-      feed_ns += ns_since(t0);
       break;
     }
     case trace::RecordKind::SetArray: {
@@ -409,7 +425,9 @@ int dolgx_replay_pixels_main(const char* trace_path,
         fail("MEM_UPDATE outside MEM1");
         break;
       }
+      const auto mem_t0 = Clock::now();
       std::memcpy(ctx.mem1.data() + physical, bytes.data(), bytes.size());
+      mem_ns += ns_since(mem_t0);
       break;
     }
     case trace::RecordKind::PresentStats: {

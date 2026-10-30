@@ -220,6 +220,12 @@ bool dol_aurora_initialize(int argc, char** argv,
     config.logLevel = backend_config->info_logging ? LOG_INFO : LOG_ERROR;
     config.mem1Size = 0;
     config.mem2Size = 0;
+    // DOL_AURORA_DATA_DIR: Aurora's user and cache folder (pipeline and Dawn
+    // caches, imgui.ini) instead of SDL's per-user preference path.
+    if (const char* dir = std::getenv("DOL_AURORA_DATA_DIR"); dir != nullptr && dir[0] != '\0') {
+        config.userPath = dir;
+        config.cachePath = dir;
+    }
 
     const AuroraInfo info = aurora_initialize(argc, argv, &config);
     gx_aurora::g_initialized = info.window != nullptr;
