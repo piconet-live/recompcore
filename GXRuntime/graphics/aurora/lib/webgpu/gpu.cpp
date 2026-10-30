@@ -945,12 +945,21 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         }
       }
     }
+    // The adapter does not list ImplicitDeviceSynchronization (stage 4, D3D12): AURORA_DEVICE_SYNC=force asks anyway
+    if (const char* v = std::getenv("AURORA_DEVICE_SYNC"); v != nullptr && std::string_view{v} == "force" &&
+        std::find(requiredFeatures.begin(), requiredFeatures.end(),
+                  wgpu::FeatureName::ImplicitDeviceSynchronization) == requiredFeatures.end()) {
+      requiredFeatures.push_back(wgpu::FeatureName::ImplicitDeviceSynchronization);
+    }
     std::string featureList;
     for (auto featureName : requiredFeatures) {
       featureList += "\n  ";
       featureList += magic_enum::enum_name(featureName);
     }
     Log.info("Enabling features: {}", featureList);
+    if (std::getenv("AURORA_FEATURE_LOG") != nullptr) {
+      std::fprintf(stderr, "[aurora] device features:%s\n", featureList.c_str());
+    }
 #ifdef WEBGPU_DAWN
     wgpu::DawnCacheDeviceDescriptor cacheDescriptor({
         .isolationKey = nullptr,
