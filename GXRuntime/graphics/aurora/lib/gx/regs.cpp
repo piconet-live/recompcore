@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "regs.hpp"
 
 #include "gx_fmt.hpp"
@@ -8,6 +9,8 @@
 #include <bit>
 #include <cmath>
 #include <utility>
+
+extern "C" volatile int g_auroraDrawDump;  // command_processor.cpp (AURORA_DUMP_COPY)
 
 namespace aurora::gx::fifo {
 namespace {
@@ -405,6 +408,12 @@ void bp_efb_copy(u8, u32 value) noexcept {
   } else {
     resolve_tex_copy_destination_from_bp(value);
     if (g_gxState.texCopyDest != nullptr) {
+      if (g_auroraDrawDump != 0) {
+        std::fprintf(stderr, "[copy] dest %08X fmt %u src %d,%d %dx%d dst %ux%u clear %d pf %u draws-so-far\n", g_gxState.texCopyDestPhysical,
+                     (unsigned)g_gxState.texCopyFmt, g_gxState.texCopySrc.x, g_gxState.texCopySrc.y, g_gxState.texCopySrc.width,
+                     g_gxState.texCopySrc.height, g_gxState.texCopyDstWidth, g_gxState.texCopyDstHeight, clear ? 1 : 0,
+                     (unsigned)g_gxState.pixelFmt);
+      }
       copy_tex(g_gxState.texCopyDest, clear);
     } else {
       Log.warn("Skipping GXCopyTex with unresolved destination");

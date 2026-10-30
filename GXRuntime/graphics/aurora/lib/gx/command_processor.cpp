@@ -439,12 +439,12 @@ volatile int g_auroraDrawDump = 0;
 static void dump_draw(GXPrimitive prim, u16 vtxCount, const ShaderInfo& info) noexcept {
   static u32 n = 0;
   const auto& st = g_gxState;
-  std::fprintf(stderr, "[dump %u] prim %u verts %u blend %u %u %u lop %u zc %d zu %d zf %u cu %d au %d cull %u tev %u ind %u tg %u chans %u ac %u/%u op %u %u/%u fog %u\n",
+  std::fprintf(stderr, "[dump %u] prim %u verts %u blend %u %u %u lop %u zc %d zu %d zf %u cu %d au %d cull %u tev %u ind %u tg %u chans %u ac %u/%u op %u %u/%u fog %u dsta %08X pf %u\n",
                n++, (unsigned)prim, vtxCount, (unsigned)st.blendMode, (unsigned)st.blendFacSrc, (unsigned)st.blendFacDst,
                (unsigned)st.blendOp, st.depthCompare, st.depthUpdate, (unsigned)st.depthFunc, st.colorUpdate, st.alphaUpdate,
                (unsigned)st.cullMode, st.numTevStages, st.numIndStages, st.numTexGens, st.numChans,
                (unsigned)st.alphaCompare.comp0, st.alphaCompare.ref0, (unsigned)st.alphaCompare.op,
-               (unsigned)st.alphaCompare.comp1, st.alphaCompare.ref1, (unsigned)st.fog.type);
+               (unsigned)st.alphaCompare.comp1, st.alphaCompare.ref1, (unsigned)st.fog.type, st.dstAlpha, (unsigned)st.pixelFmt);
   for (u32 t = 0; t < MaxTextures; ++t) {
     if (!info.sampledTextures.test(t)) {
       continue;
