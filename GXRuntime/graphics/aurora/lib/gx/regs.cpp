@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <utility>
 
 namespace aurora::gx::fifo {
 namespace {
@@ -131,20 +132,27 @@ void bp_tev_ind(u8 reg, u32 value) noexcept {
   s.indTexAddPrev = reg_get(value, 1, 20) != 0;
 }
 
+// Scissor box offset (0x59): x and y in 2-pixel units, 10 bits each, subtracted from scissor and viewport
+// coordinates, as the hardware and Dolphin (bpmem.scissorOffset). The SDK's GXInit writes (0 + 342) / 2. Before
+// the register is written, 342.
+std::pair<s32, s32> scissor_box_origin() noexcept {
+  if (!g_gxState.bpRegValid.test(0x59)) {
+    return {342, 342};
+  }
+  const u32 v = g_gxState.bpRegCache[0x59];
+  return {static_cast<s32>(reg_get(v, 10, 0)) * 2, static_cast<s32>(reg_get(v, 10, 10)) * 2};
+}
+
 // Scissor (0x20/0x21)
 void bp_scissor(u8, u32) noexcept {
   const u32 scis0 = g_gxState.bpRegCache[0x20];
   const u32 scis1 = g_gxState.bpRegCache[0x21];
 
-  const u32 boxOffset = g_gxState.bpRegCache[0x59];
-  // The box offset fields are signed 9-bit values and also halved, like the viewport registers. Sign extend.
-  const s32 offsX = static_cast<s32>(reg_get(boxOffset, 10, 0)) << 23 >> 22;
-  const s32 offsY = static_cast<s32>(reg_get(boxOffset, 10, 10)) << 23 >> 22;
-
-  const s32 tp = static_cast<s32>(reg_get(scis0, 11, 0)) + offsY;
-  const s32 lf = static_cast<s32>(reg_get(scis0, 11, 12)) + offsX;
-  const s32 bm = static_cast<s32>(reg_get(scis1, 11, 0)) + offsY;
-  const s32 rt = static_cast<s32>(reg_get(scis1, 11, 12)) + offsX;
+  const auto [offsX, offsY] = scissor_box_origin();
+  const s32 tp = static_cast<s32>(reg_get(scis0, 11, 0)) - offsY;
+  const s32 lf = static_cast<s32>(reg_get(scis0, 11, 12)) - offsX;
+  const s32 bm = static_cast<s32>(reg_get(scis1, 11, 0)) - offsY;
+  const s32 rt = static_cast<s32>(reg_get(scis1, 11, 12)) - offsX;
   const s32 wd = std::max(rt - lf + 1, 0);
   const s32 ht = std::max(bm - tp + 1, 0);
   set_logical_scissor({lf, tp, wd, ht});
@@ -1052,9 +1060,11 @@ void xf_load_viewport(const u8* data) noexcept {
   f32 oz = read_bits<f32>(data + 20);
   f32 width = sx * 2.0f;
   f32 height = -sy * 2.0f;
+  // The XF origin carries the scissor box offset, as Dolphin's VertexShaderManager takes it
+  const auto [offsX, offsY] = scissor_box_origin();
   set_logical_viewport({
-      .left = ox - 340.0f - width / 2.0f,
-      .top = oy - 340.0f - height / 2.0f,
+      .left = ox - static_cast<f32>(offsX) - width / 2.0f,
+      .top = oy - static_cast<f32>(offsY) - height / 2.0f,
       .width = width,
       .height = height,
       .znear = (oz - sz) / 1.6777215e7f,
