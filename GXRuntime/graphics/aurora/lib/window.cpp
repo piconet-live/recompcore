@@ -423,6 +423,9 @@ void destroy_window() {
 // shown, never focused, still a valid surface.
 bool hidden_window() noexcept {
   static const bool hidden = [] {
+    if (g_config.embedded) {
+      return true;
+    }
     const char* v = SDL_getenv("AURORA_HIDDEN_WINDOW");
     return v != nullptr && v[0] != '\0' && v[0] != '0';
   }();

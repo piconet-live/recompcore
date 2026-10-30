@@ -116,6 +116,13 @@ typedef struct {
    * This can be set to 0 to disable allocating this region.
    */
   uint32_t mem2Size;
+
+  /*
+   * Embedded in another program that owns the screen and the input (an emulator that shows Aurora's pictures in its
+   * own window): the window stays hidden for its whole life (a valid surface, never shown or focused), and Aurora
+   * opens no gamepad, joystick, haptic or sensor device.
+   */
+  bool embedded;
 } AuroraConfig;
 
 typedef struct {

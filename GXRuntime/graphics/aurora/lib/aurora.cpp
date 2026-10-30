@@ -241,7 +241,9 @@ const AuroraEvent* update() noexcept {
   ZoneScoped;
   if (g_initialFrame) {
     g_initialFrame = false;
-    gamepad::initialize();
+    if (!g_config.embedded) {
+      gamepad::initialize();
+    }
   }
 #ifdef AURORA_ENABLE_GX
   gx::update();
