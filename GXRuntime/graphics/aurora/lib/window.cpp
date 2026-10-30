@@ -419,7 +419,20 @@ void destroy_window() {
   }
 }
 
+// AURORA_HIDDEN_WINDOW=1 keeps the window hidden for its whole life (offscreen tools such as pixel replay): never
+// shown, never focused, still a valid surface.
+bool hidden_window() noexcept {
+  static const bool hidden = [] {
+    const char* v = SDL_getenv("AURORA_HIDDEN_WINDOW");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  return hidden;
+}
+
 void show_window() {
+  if (hidden_window()) {
+    return;
+  }
   if (g_window != nullptr) {
     TRY_WARN(SDL_ShowWindow(g_window), "Failed to show window: {}", SDL_GetError());
   }
@@ -516,6 +529,9 @@ SDL_Renderer* get_sdl_renderer() { return g_renderer; }
 bool is_paused() noexcept {
   if (!is_presentable()) {
     return true;
+  }
+  if (hidden_window()) {
+    return false;
   }
   const auto flags = SDL_GetWindowFlags(g_window);
   if ((flags & SDL_WINDOW_HIDDEN) != 0u) {

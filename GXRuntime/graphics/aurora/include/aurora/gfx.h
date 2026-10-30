@@ -43,6 +43,10 @@ void aurora_request_framebuffer_readback();
 bool aurora_take_framebuffer_readback(const uint8_t** rgba, uint32_t* width, uint32_t* height);
 /* Drive GPU event processing while waiting for take (no frame, no present). */
 void aurora_pump_framebuffer_readback();
+/* Frame timing for offline tools (steady clock, ns): when the render worker
+ * submitted the last frame, and when the GPU reported that work done. */
+uint64_t aurora_timing_last_submit_ns();
+uint64_t aurora_timing_last_gpu_done_ns();
 
 #ifdef __cplusplus
 }

@@ -1,7 +1,8 @@
 include(FetchContent)
 
 # Don't build tests for third party dependencies
-set(BUILD_TESTING OFF CACHE INTERNAL "Build tests")
+set(_prev_build_testing ${BUILD_TESTING})
+set(BUILD_TESTING OFF CACHE INTERNAL "Build tests" FORCE)
 set(SKIP_INSTALL_ALL ON)
 if (WIN32 AND NOT DEFINED BUILD_SHARED_LIBS)
   set(_USE_SHARED ON)
@@ -329,3 +330,6 @@ if (NOT TARGET Tracy::TracyClient)
     message(FATAL_ERROR "Failed to make TracyClient available")
   endif ()
 endif ()
+
+# Restore BUILD_TESTING for the rest of the project (GXRuntime builds Aurora as a subdirectory)
+set(BUILD_TESTING ${_prev_build_testing} CACHE INTERNAL "Build tests" FORCE)
