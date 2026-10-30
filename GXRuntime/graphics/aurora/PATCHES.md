@@ -27,6 +27,8 @@ ports do not need it); **local** = tools and diagnostics for GXRuntime's harness
 | 13 | Hooks for offline tools: frame timing, `AURORA_HIDDEN_WINDOW`, BUILD_TESTING restored | local | 6b711915f2, c3ddf9a7e2 |
 | 14 | No out-of-range read with zero TEV stages | upstream | bootstrap 0006 |
 | 15 | Draw diagnostics (`AURORA_DRAW_LOG`, `_TCG`, `AURORA_IND_LOG`, `AURORA_SKIP_TEX`) + fixup | local | 4172723df3, e6a85563d4 |
+| 16 | Embedded in another program (`AuroraConfig::embedded`): hidden window for life, no gamepad/joystick/haptic/sensor devices | local (until PresentTarget, upstream 12943d1) | c4e0fd4 (gxr/r3) |
+| 17 | Window letterbox from the frame's own present source, worked out on the render worker | upstream | 2aa1d92 (gxr/r3) |
 
 ## Not carried, and why
 
