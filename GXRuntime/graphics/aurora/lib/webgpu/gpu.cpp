@@ -1034,7 +1034,8 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     deviceDescriptor.SetDeviceLostCallback(
         wgpu::CallbackMode::AllowSpontaneous,
         [](const wgpu::Device& device, wgpu::DeviceLostReason reason, wgpu::StringView message) {
-          if (g_initialized) {
+          // (Destroyed: the device went on purpose, at a shutdown or as the process ends: no error. Patch 19)
+          if (g_initialized && reason != wgpu::DeviceLostReason::Destroyed) {
             FATAL("Device lost: {}", message);
           } else {
             Log.warn("Device lost: {}", message);
