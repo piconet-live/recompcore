@@ -139,7 +139,7 @@ void init() {
 
 void shutdown() { stop_worker(); }
 
-extern u32 g_drawLogCount; // command_processor.cpp (AURORA_DRAW_LOG)
+extern uint32_t g_drawLogCount; // command_processor.cpp (AURORA_DRAW_LOG)
 
 void begin_frame() noexcept {
   g_drawLogCount = 0;
