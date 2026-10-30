@@ -33,22 +33,6 @@ float aurora_get_fps();
 
 void aurora_enable_vsync(bool enabled);
 
-/*
- * EFB readback (GXRuntime recomp patch): arm a one-shot copy of the next
- * submitted frame's present source; take returns tightly packed RGBA8 rows
- * (top-left origin) once the copy completed and consumes the result. The
- * returned pointer stays valid until the next readback completes.
- * Upstream remedy: a public aurora framebuffer readback API.
- */
-void aurora_request_framebuffer_readback();
-bool aurora_take_framebuffer_readback(const uint8_t** rgba, uint32_t* width, uint32_t* height);
-/* Drive GPU event processing while waiting for take (no frame, no present). */
-void aurora_pump_framebuffer_readback();
-/* Frame timing for offline tools (steady clock, ns): when the render worker
- * submitted the last frame, and when the GPU reported that work done. */
-uint64_t aurora_timing_last_submit_ns();
-uint64_t aurora_timing_last_gpu_done_ns();
-
 #ifdef __cplusplus
 }
 #endif

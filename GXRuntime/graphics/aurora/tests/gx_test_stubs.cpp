@@ -1,19 +1,23 @@
 // Stub implementations for renderer symbols that the GX/FIFO/command_processor code
-// references but that live in the full renderer (common.cpp, gx.cpp, model/shader.cpp, etc.).
+// references but that live in the full renderer (gfx, gx.cpp, model/shader.cpp, etc.).
 // These allow the test binary to link without pulling in WebGPU runtime.
 
 #include "gx/gx.hpp"
 #include "gfx/clear.hpp"
-#include "gfx/common.hpp"
-#include "gfx/depth_peek.hpp"
+#include "gfx/frame_packet.hpp"
+#include "gfx/resources.hpp"
+#include "gfx/readback/gpu.hpp"
+#include "gfx/recording.hpp"
 #include "gfx/tex_copy_conv.hpp"
 #include "gfx/tex_palette_conv.hpp"
 #include "gfx/texture.hpp"
+#include "gfx/texture_replacement.hpp"
 #include "gx/pipeline.hpp"
 #include "gx/shader_info.hpp"
 #include "internal.hpp"
 #include "webgpu/gpu.hpp"
 
+#include <atomic>
 #include <cstdio>
 #include <fmt/format.h>
 
@@ -35,24 +39,25 @@ auto fmt::formatter<AuroraLogLevel>::format(AuroraLogLevel level, format_context
   return fmt::format_to(ctx.out(), "{}", static_cast<int>(level));
 }
 
-// --- GPU buffers (default-constructed, not used in tests) ---
-namespace aurora::gfx {
-AuroraStats g_stats;
-wgpu::Buffer g_vertexBuffer;
-wgpu::Buffer g_uniformBuffer;
-wgpu::Buffer g_indexBuffer;
-wgpu::Buffer g_storageBuffer;
-uint32_t g_drawCallCount = 0;
-uint32_t g_mergedDrawCallCount = 0;
-} // namespace aurora::gfx
+// --- GPU resources (default-constructed, not used in tests) ---
+namespace aurora::gfx::detail {
+Resources& resources() noexcept {
+  static Resources resources;
+  return resources;
+}
+
+void increment_merged_draw_count() noexcept {}
+} // namespace aurora::gfx::detail
 
 namespace aurora::webgpu {
 GraphicsConfig g_graphicsConfig{};
+bool g_dualSourceBlendingSupported = false;
 } // namespace aurora::webgpu
 
-// --- GXState (the real instance -- tests validate this) ---
+// --- GXState ---
 namespace aurora::gx {
 GXState g_gxState{};
+void set_viewport_policy(AuroraViewportPolicy policy) noexcept {}
 } // namespace aurora::gx
 
 namespace aurora::vi {
@@ -63,6 +68,21 @@ void configure(const GXRenderModeObj*) noexcept {}
 // --- get_texture ---
 namespace aurora::gx {
 const gfx::TextureBind& get_texture(GXTexMapID id) noexcept { return g_gxState.textures[id]; }
+namespace texture {
+void invalidate_bindings() noexcept {}
+uint64_t current_bind_generation() noexcept { return 1; }
+GXState::CopyTextureRef resolve_copy_texture(const GXState::CopyTextureKey& key) noexcept {
+  auto& ref = g_gxState.copyTextures[key.dest];
+  if (!ref.handle || ref.key != key) {
+    ref.handle = std::make_shared<gfx::TextureRef>(wgpu::Texture{}, wgpu::TextureView{}, wgpu::TextureView{},
+                                                   wgpu::Extent3D{key.width, key.height, 1},
+                                                   wgpu::TextureFormat::RGBA8Unorm, 1, key.format);
+  }
+  ref.key = key;
+  ++ref.revision;
+  return ref;
+}
+} // namespace texture
 void evict_texture_object(u32 texObjId) noexcept {
   for (auto& obj : g_gxState.loadedTextures) {
     if (obj.texObjId == texObjId) {
@@ -79,13 +99,6 @@ void evict_tlut_object(u32 tlutObjId) noexcept {
 }
 void evict_copy_texture(const void* dest) noexcept {
   g_gxState.copyTextures.erase(dest);
-  for (auto it = g_gxState.copyTextureCache.begin(); it != g_gxState.copyTextureCache.end();) {
-    if (it->first.dest == dest) {
-      g_gxState.copyTextureCache.erase(it++);
-    } else {
-      ++it;
-    }
-  }
 }
 void shutdown() noexcept {}
 Vec2<uint32_t> logical_fb_size() noexcept { return {640, 480}; }
@@ -105,32 +118,53 @@ void set_render_scissor(const gfx::ClipRect& scissor) noexcept { g_gxState.rende
 
 // --- Shader/pipeline stubs ---
 namespace aurora::gx {
+uint32_t g_testPipelineBuildCount = 0;
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept {
-  // No-op for tests
+  ++g_testPipelineBuildCount;
 }
 GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept { return {}; }
 ShaderInfo build_shader_info(const ShaderConfig& config) noexcept { return {}; }
-gfx::Range build_uniform(const ShaderInfo& info, uint32_t vtxStart, const BindGroupRanges& ranges) noexcept {
-  return {};
-}
+gfx::Range build_uniform(const ShaderInfo& info) noexcept { return {.size = 1}; }
 void resolve_sampled_textures(const ShaderInfo& info) noexcept {}
-u8 color_channel(GXChannelID id) noexcept { return 0; }
 } // namespace aurora::gx
 
 // --- Buffer push stubs ---
 namespace aurora::gfx {
 Range push_verts(const uint8_t* data, size_t length, size_t alignment) { return {}; }
 Range push_indices(const uint8_t* data, size_t length, size_t alignment) { return {}; }
-Range push_uniform(const uint8_t* data, size_t length) { return {}; }
-size_t g_testLastStoragePushSize = 0;
-Range push_storage(const uint8_t* data, size_t length) {
-  g_testLastStoragePushSize = length;
-  return {.offset = 0, .size = static_cast<uint32_t>(length)};
+namespace testing {
+std::vector<uint8_t> uniformData;
+std::vector<uint8_t> storageData;
+} // namespace testing
+static Range push_test_data(std::vector<uint8_t>& target, const uint8_t* data, size_t length) {
+  const auto offset = static_cast<uint32_t>(target.size());
+  if (data != nullptr && length != 0) {
+    target.insert(target.end(), data, data + length);
+  }
+  return {offset, static_cast<uint32_t>(length)};
 }
+Range push_uniform(const uint8_t* data, size_t length) { return push_test_data(testing::uniformData, data, length); }
+Range push_storage(const uint8_t* data, size_t length) { return push_test_data(testing::storageData, data, length); }
 
 Vec2<uint32_t> get_render_target_size() noexcept { return {640, 480}; }
 void set_viewport(const Viewport& viewport) noexcept {}
 void set_scissor(uint32_t x, uint32_t y, uint32_t w, uint32_t h) noexcept {}
+bool g_testNormalAttachment = false;
+bool has_normal_attachment() noexcept { return g_testNormalAttachment; }
+RenderTargetLayout get_render_target_layout() noexcept {
+  RenderTargetLayout layout{
+      .colorAttachmentCount = 1,
+      .colorAttachments = {{{ColorAttachmentSemantic::SceneColor, wgpu::TextureFormat::RGBA8Unorm}}},
+      .depthStencilFormat = wgpu::TextureFormat::Depth24Plus,
+      .sampleCount = 1,
+  };
+  if (g_testNormalAttachment) {
+    layout.colorAttachmentCount = 2;
+    layout.colorAttachments[1] = {ColorAttachmentSemantic::Normal, wgpu::TextureFormat::RGB10A2Unorm};
+  }
+  detail::finalize_render_target_layout(layout);
+  return layout;
+}
 } // namespace aurora::gfx
 
 // --- Pipeline/draw command stubs ---
@@ -149,11 +183,13 @@ PipelineRef pipeline_ref<gx::PipelineConfig>(const gx::PipelineConfig& config) {
 }
 gx::DrawData g_testLastDraw{};
 uint32_t g_testDrawCount = 0;
+std::atomic<uint32_t> g_testProcessedDrawCount{0};
 
 template <>
 void push_draw_command<gx::DrawData>(gx::DrawData data) {
   g_testLastDraw = data;
   ++g_testDrawCount;
+  g_testProcessedDrawCount.fetch_add(1, std::memory_order_release);
 }
 template <>
 gx::DrawData* get_last_draw_command() {
@@ -184,55 +220,57 @@ void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept {}
 void queue_texture_upload(TextureUpload upload) {}
 void queue_texture_upload_data(const uint8_t* data, size_t length, uint32_t bytesPerRow, uint32_t rowsPerImage,
                                wgpu::TexelCopyTextureInfo tex, wgpu::Extent3D size) {}
-void resolve_pass(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
-                  Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat) {}
 void queue_palette_conv(tex_palette_conv::ConvRequest req) {}
-void begin_offscreen(uint32_t width, uint32_t height) {}
-void end_offscreen() {}
+namespace testing {
+std::atomic<uint32_t> beginOffscreenCount{0};
+std::atomic<uint32_t> endOffscreenCount{0};
+std::atomic<uint32_t> resolvePassCount{0};
+std::atomic<uint32_t> offscreenWidth{0};
+std::atomic<uint32_t> offscreenHeight{0};
+} // namespace testing
+
+void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
+                       Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat,
+                       GXPixelFmt sourceFormat) {
+  testing::resolvePassCount.fetch_add(1, std::memory_order_release);
+}
+void begin_offscreen(uint32_t width, uint32_t height) {
+  testing::offscreenWidth.store(width, std::memory_order_relaxed);
+  testing::offscreenHeight.store(height, std::memory_order_relaxed);
+  testing::beginOffscreenCount.fetch_add(1, std::memory_order_release);
+}
+void end_offscreen() { testing::endOffscreenCount.fetch_add(1, std::memory_order_release); }
 bool is_offscreen() noexcept { return false; }
 } // namespace aurora::gfx
 
-namespace aurora::gfx::depth_peek {
-namespace {
-bool s_snapshotRequested = false;
-uint32_t s_width = 0;
-uint32_t s_height = 0;
-std::vector<uint32_t> s_data;
-} // namespace
+// --- Readback recording hooks ---
+namespace aurora::gfx {
+namespace testing {
+ReadbackCapture readbackCapture{.active = true, .width = 640, .height = 480};
+std::vector<std::shared_ptr<readback::Job>> readbackJobs;
+std::vector<bool> readbackJobEfb;
+std::vector<uint32_t> readbackJobCopies;
+std::vector<uint32_t> readbackJobDraws;
+} // namespace testing
 
-void initialize() {}
-void shutdown() {}
-void request_snapshot() noexcept { s_snapshotRequested = true; }
-void poll() noexcept {}
-void encode_frame_snapshot(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& depthView,
-                           wgpu::Extent3D sourceSize, uint32_t msaaSamples) noexcept {}
-void after_submit() noexcept {}
-
-bool read_latest(uint16_t x, uint16_t y, uint32_t& z) noexcept {
-  if (x >= s_width || y >= s_height || s_data.empty()) {
+ReadbackCapture readback_capture() noexcept { return testing::readbackCapture; }
+bool push_readback_op(std::shared_ptr<readback::Job> job, bool efbSource) {
+  if (!testing::readbackCapture.active || (efbSource && testing::readbackCapture.offscreen)) {
     return false;
   }
-  z = s_data[static_cast<size_t>(y) * s_width + x] & 0x00ffffffu;
+  testing::readbackJobs.push_back(std::move(job));
+  testing::readbackJobEfb.push_back(efbSource);
+  testing::readbackJobCopies.push_back(testing::resolvePassCount.load(std::memory_order_acquire));
+  testing::readbackJobDraws.push_back(g_testDrawCount);
   return true;
 }
+} // namespace aurora::gfx
 
-namespace testing {
-void reset() noexcept {
-  s_snapshotRequested = false;
-  s_width = 0;
-  s_height = 0;
-  s_data.clear();
-}
-
-bool snapshot_requested() noexcept { return s_snapshotRequested; }
-
-void set_latest(uint32_t width, uint32_t height, const std::vector<uint32_t>& data) {
-  s_width = width;
-  s_height = height;
-  s_data = data;
-}
-} // namespace testing
-} // namespace aurora::gfx::depth_peek
+namespace aurora::gfx::readback::gpu {
+void initialize() {}
+void shutdown() {}
+void release_buffer(wgpu::Buffer, uint64_t) noexcept {}
+} // namespace aurora::gfx::readback::gpu
 
 namespace aurora::gfx::tex_copy_conv {
 bool needs_conversion(GXTexFmt fmt) { return false; }
@@ -244,9 +282,8 @@ void queue(ConvRequest req) {}
 
 namespace aurora::gfx::texture_replacement {
 u32 compute_texture_upload_size(const GXTexObj_& obj) noexcept { return 0; }
-void register_tlut(const GXTlutObj*, const void*, GXTlutFmt, u16) noexcept {}
-void load_tlut(const GXTlutObj*, u32) noexcept {}
-std::optional<TextureHandle> find_replacement(const GXTexObj_&) noexcept { return std::nullopt; }
+bool has_replacement(const GXTexObj_&) noexcept { return false; }
+bool has_replacement(const GXTexObj_&, const GXTlutObj_&) noexcept { return false; }
 } // namespace aurora::gfx::texture_replacement
 
 // --- Window stub ---

@@ -2,6 +2,8 @@
 
 #ifdef AURORA_ENABLE_RMLUI
 
+#include <aurora/input.hpp>
+
 #include <RmlUi/Core/Context.h>
 
 #include <cstddef>
@@ -29,12 +31,20 @@ bool is_initialized() noexcept;
 void set_input_type(InputType type) noexcept;
 void set_ui_scale(float scale) noexcept;
 float get_ui_scale() noexcept;
+void set_glass_light_dir(float x, float y) noexcept;
+
+struct InputResult {
+  bool handled = false;           // An element stopped propagation
+  Rml::Element* target = nullptr; // The element hit, if any
+};
+InputResult process_input(const input::InputEvent& event) noexcept;
 
 struct RuntimeTexture {
   uint32_t width = 0;
   uint32_t height = 0;
   std::span<const std::byte> rgba8;
   bool premultipliedAlpha = false;
+  bool generateMipmaps = false;
 };
 
 using TextureProvider = std::function<std::optional<RuntimeTexture>(std::string_view)>;

@@ -1,5 +1,8 @@
 #include "pipeline.hpp"
 
+#include "../gfx/encoding.hpp"
+#include "../gfx/resources.hpp"
+#include "../gfx/resource_cache.hpp"
 #include "../internal.hpp"
 #include "../webgpu/gpu.hpp"
 
@@ -25,7 +28,8 @@ constexpr uint32_t DynamicGroup2 = 1u << 2u;
 constexpr uint64_t CommonUniformBindingSize = AURORA_ALIGN(sizeof(UniformBlock), 16);
 constexpr uint64_t ExtraUniformBindingSize =
     AURORA_ALIGN(std::max({sizeof(BlurUniformBlock), sizeof(DropShadowUniformBlock), sizeof(SimpleFilterUniformBlock),
-                           sizeof(GradientUniformBlock), sizeof(SeedResampleUniformBlock)}),
+                           sizeof(GradientUniformBlock), sizeof(SeedResampleUniformBlock), sizeof(GlassUniformBlock),
+                           sizeof(ImageEffectsUniformBlock)}),
                  16);
 
 constexpr std::string_view vertexSource = R"(
@@ -39,6 +43,7 @@ struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,
     @location(1) uv: vec2<f32>,
+    @location(2) local_position: vec2<f32>,
 };
 
 struct Uniforms {
@@ -57,6 +62,7 @@ fn main(in: VertexInput) -> VertexOutput {
     out.position = uniforms.mvp * vec4<f32>(translatedPos, 0.0, 1.0);
     out.color = in.color;
     out.uv = in.uv;
+    out.local_position = in.position;
     return out;
 }
 )"sv;
@@ -86,6 +92,43 @@ fn main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     let corrected_color = pow(color.rgb, vec3<f32>(uniforms.gamma));
     return vec4<f32>(corrected_color, color.a);
+}
+)"sv;
+
+constexpr std::string_view imageEffectsFragmentSource = R"(
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) local_position: vec2<f32>,
+};
+
+struct Uniforms {
+    mvp: mat4x4<f32>,
+    translation: vec4<f32>,
+    gamma: f32,
+};
+struct ImageEffects { parameters: vec4<f32> };
+
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+@group(0) @binding(1) var s: sampler;
+@group(1) @binding(0) var t: texture_2d<f32>;
+@group(2) @binding(0) var<uniform> image: ImageEffects;
+
+@fragment
+fn main(in: VertexOutput) -> @location(0) vec4<f32> {
+    var color = in.color * textureSample(t, s, in.uv);
+    if (uniforms.gamma != 1.0) {
+        color = vec4<f32>(pow(color.rgb, vec3<f32>(uniforms.gamma)), color.a);
+    }
+    let gray = dot(color.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+    color = vec4<f32>(mix(color.rgb, vec3<f32>(gray), image.parameters.z), color.a);
+    if (image.parameters.w > 0.0) {
+        let fade = clamp((image.parameters.y - in.local_position.y) /
+                         max(image.parameters.y - image.parameters.x, 0.000001), 0.0, 1.0);
+        color *= fade;
+    }
+    return color;
 }
 )"sv;
 
@@ -124,19 +167,12 @@ const REPEATING_CONIC: i32 = 5;
 const PI: f32 = 3.14159265;
 
 fn bayer_dither(position: vec4<f32>) -> f32 {
-    let bayer = array<u32, 64>(
-        0u, 32u, 8u, 40u, 2u, 34u, 10u, 42u,
-        48u, 16u, 56u, 24u, 50u, 18u, 58u, 26u,
-        12u, 44u, 4u, 36u, 14u, 46u, 6u, 38u,
-        60u, 28u, 52u, 20u, 62u, 30u, 54u, 22u,
-        3u, 35u, 11u, 43u, 1u, 33u, 9u, 41u,
-        51u, 19u, 59u, 27u, 49u, 17u, 57u, 25u,
-        15u, 47u, 7u, 39u, 13u, 45u, 5u, 37u,
-        63u, 31u, 55u, 23u, 61u, 29u, 53u, 21u
-    );
     let x = u32(position.x) % 8u;
     let y = u32(position.y) % 8u;
-    return (f32(bayer[x + y * 8u]) / 64.0 - 0.5) / 255.0;
+    let z = x ^ y;
+    let bayer = ((z & 1u) << 5u) | ((y & 1u) << 4u) | ((z & 2u) << 2u) |
+                ((y & 2u) << 1u) | ((z & 4u) >> 1u) | ((y & 4u) >> 2u);
+    return (f32(bayer) / 64.0 - 0.5) / 255.0;
 }
 
 fn stop_position(index: i32) -> f32 {
@@ -478,6 +514,115 @@ fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
 }
 )"sv;
 
+constexpr std::string_view glassFragmentSource = R"(
+struct GlassUniforms {
+    rect_center: vec2<f32>,
+    rect_half_size: vec2<f32>,
+    corner_radii: vec4<f32>,
+    tint: vec4<f32>,
+    frame_size: vec2<f32>,
+    tex_coord_min: vec2<f32>,
+    tex_coord_max: vec2<f32>,
+    bezel_width: f32,
+    refraction: f32,
+    specular: f32,
+    saturation: f32,
+    profile: f32,
+    dome: f32,
+    edge_fades: vec4<f32>, // per-edge bezel strength (top, right, bottom, left)
+    light_dir: vec2<f32>,  // direction from surfaces toward the specular light
+    _padding: vec2<f32>,
+};
+
+@group(0) @binding(1) var s: sampler;
+@group(1) @binding(0) var t: texture_2d<f32>;
+@group(2) @binding(0) var<uniform> glass: GlassUniforms;
+
+const SLOPE_MAX: f32 = 4.0;
+// tan(atan(SLOPE_MAX) - asin(sin(atan(SLOPE_MAX)) / IOR)) where IOR == 1.5
+const TAN_BEND_MAX: f32 = 0.7185;
+
+fn corner_radius(p: vec2<f32>) -> f32 {
+    return select(
+        select(glass.corner_radii.z, glass.corner_radii.y, p.y < 0.0),
+        select(glass.corner_radii.w, glass.corner_radii.x, p.y < 0.0),
+        p.x < 0.0
+    );
+}
+
+fn sd_rounded_rect(p: vec2<f32>) -> f32 {
+    let r = corner_radius(p);
+    let q = abs(p) - glass.rect_half_size + vec2<f32>(r);
+    return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
+}
+
+fn sdf_normal(p: vec2<f32>) -> vec2<f32> {
+    let e = 0.5;
+    let grad = vec2<f32>(
+        sd_rounded_rect(p + vec2<f32>(e, 0.0)) - sd_rounded_rect(p - vec2<f32>(e, 0.0)),
+        sd_rounded_rect(p + vec2<f32>(0.0, e)) - sd_rounded_rect(p - vec2<f32>(0.0, e)),
+    );
+    return grad / max(length(grad), 1e-4);
+}
+
+fn bezel_height(x: f32) -> f32 {
+    let convex = pow(max(1.0 - pow(1.0 - x, 4.0), 0.0), 0.25);
+    let lip = mix(convex, 1.0 - convex, smoothstep(0.0, 1.0, x));
+    return mix(convex, lip, glass.profile);
+}
+
+@fragment
+fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    let p = uv * glass.frame_size - glass.rect_center;
+    let d = sd_rounded_rect(p);
+    let n = sdf_normal(p);
+
+    // Per-edge bezel fade
+    var edge_fade = 1.0;
+    edge_fade *= mix(1.0, glass.edge_fades.x, clamp(-n.y, 0.0, 1.0));
+    edge_fade *= mix(1.0, glass.edge_fades.y, clamp(n.x, 0.0, 1.0));
+    edge_fade *= mix(1.0, glass.edge_fades.z, clamp(n.y, 0.0, 1.0));
+    edge_fade *= mix(1.0, glass.edge_fades.w, clamp(-n.x, 0.0, 1.0));
+
+    // Bezel coordinate: 0 at the rim, 1 at the inner end of the band
+    let x = clamp(-d, 0.0, glass.bezel_width) / max(glass.bezel_width, 1.0);
+
+    // Calculate slope to tilt the surface normal
+    let inv = 1.0 - x;
+    let he = 0.005;
+    var slope = (bezel_height(min(x + he, 1.0)) - bezel_height(max(x - he, 0.0))) / (2.0 * he);
+    slope = clamp(slope, -SLOPE_MAX, SLOPE_MAX);
+
+    // Snell deflection
+    let theta = atan(abs(slope));
+    let bend = theta - asin(clamp(sin(theta) / 1.5, -1.0, 1.0));
+    let disp = glass.refraction * (tan(bend) / TAN_BEND_MAX) * sign(slope) * edge_fade;
+
+    // Full-surface dome
+    let dome_disp = -p * glass.dome;
+
+    let sample_uv = clamp(uv + (n * disp + dome_disp) / glass.frame_size, glass.tex_coord_min, glass.tex_coord_max);
+    var color = textureSample(t, s, sample_uv);
+
+    // Saturation
+    let luma = dot(color.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+    color = vec4<f32>(mix(vec3<f32>(luma), color.rgb, glass.saturation), color.a);
+
+    // Tint
+    let tint = glass.tint * mix(1.0, mix(0.35, 1.0, smoothstep(0.0, 1.0, x)), edge_fade);
+    color = vec4<f32>(tint.rgb + color.rgb * (1.0 - tint.a),
+                      tint.a + color.a * (1.0 - tint.a));
+
+    // Specular rim
+    let rim = mix(0.4, 1.0, 0.5 + 0.5 * dot(n, glass.light_dir));
+    color = vec4<f32>(color.rgb + glass.specular * rim * inv * inv * edge_fade, color.a);
+
+    // Outside of the shape, pass the background through
+    let passthrough = textureSample(t, s, clamp(uv, glass.tex_coord_min, glass.tex_coord_max));
+    return mix(passthrough, color, 1.0 - smoothstep(-0.75, 0.75, d));
+}
+)"sv;
+
 wgpu::ComputeState compile_shader(std::string_view wgslSource, std::string_view label) {
   const wgpu::ShaderSourceWGSL source{
       wgpu::ShaderSourceWGSL::Init{
@@ -536,6 +681,8 @@ const wgpu::PipelineLayout create_pipeline_layout(PipelineKind kind) {
   case PipelineKind::DropShadow:
   case PipelineKind::SimpleFilter:
   case PipelineKind::SeedResample:
+  case PipelineKind::Glass:
+  case PipelineKind::ImageEffects:
     layouts[layoutCount++] = g_imageBindGroupLayout;
     layouts[layoutCount++] = g_uniformBindGroupLayout;
     break;
@@ -558,6 +705,8 @@ const std::string_view fragment_source(PipelineKind kind) {
   switch (kind) {
   case PipelineKind::Geometry:
     return fragmentSource;
+  case PipelineKind::ImageEffects:
+    return imageEffectsFragmentSource;
   case PipelineKind::Gradient:
     return gradientFragmentSource;
   case PipelineKind::OpaqueBlit:
@@ -574,6 +723,8 @@ const std::string_view fragment_source(PipelineKind kind) {
     return simpleFilterFragmentSource;
   case PipelineKind::MaskImage:
     return maskImageFragmentSource;
+  case PipelineKind::Glass:
+    return glassFragmentSource;
   case PipelineKind::Blit:
   default:
     return blitFragmentSource;
@@ -692,7 +843,7 @@ gfx::BindGroupRef common_bind_group_ref() {
   const std::array entries{
       wgpu::BindGroupEntry{
           .binding = 0,
-          .buffer = gfx::g_uniformBuffer,
+          .buffer = gfx::detail::resources().uniformBuffer,
           .offset = 0,
           .size = CommonUniformBindingSize,
       },
@@ -713,7 +864,7 @@ gfx::BindGroupRef uniform_bind_group_ref() {
   const std::array entries{
       wgpu::BindGroupEntry{
           .binding = 0,
-          .buffer = gfx::g_uniformBuffer,
+          .buffer = gfx::detail::resources().uniformBuffer,
           .offset = 0,
           .size = ExtraUniformBindingSize,
       },
@@ -880,8 +1031,9 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   pass.SetStencilReference(data.stencilRef);
 
   if (static_cast<DrawKind>(data.drawKind) == DrawKind::Geometry) {
-    pass.SetVertexBuffer(0, gfx::g_vertexBuffer, data.vertexRange.offset, data.vertexRange.size);
-    pass.SetIndexBuffer(gfx::g_indexBuffer, wgpu::IndexFormat::Uint32, data.indexRange.offset, data.indexRange.size);
+    auto& resources = gfx::detail::resources();
+    pass.SetVertexBuffer(0, resources.vertexBuffer, data.vertexRange.offset, data.vertexRange.size);
+    pass.SetIndexBuffer(resources.indexBuffer, wgpu::IndexFormat::Uint32, data.indexRange.offset, data.indexRange.size);
     pass.DrawIndexed(data.indexCount);
   } else {
     pass.Draw(data.vertexCount);

@@ -6,8 +6,9 @@
 #include "gx.hpp"
 #include "../../window.hpp"
 
-#include "../../gfx/common.hpp"
+#include "../../gfx/readback/readback.hpp"
 #include "../../gx/fifo.hpp"
+#include "../../gx/readback.hpp"
 
 static void GXWriteString(const char* label) {
   auto length = strlen(label);
@@ -33,10 +34,7 @@ void GXInsertDebugMarker(const char* label) {
   GXWriteString(label);
 }
 
-void AuroraSetViewportPolicy(AuroraViewportPolicy policy) {
-  g_gxState.viewportPolicy = policy;
-  aurora::window::set_frame_buffer_aspect_fit(policy == AURORA_VIEWPORT_FIT);
-}
+void AuroraSetViewportPolicy(AuroraViewportPolicy policy) { aurora::gx::set_viewport_policy(policy); }
 
 void AuroraGetRenderSize(u32* width, u32* height) {
   const auto windowSize = aurora::window::get_window_size();
@@ -46,6 +44,16 @@ void AuroraGetRenderSize(u32* width, u32* height) {
   if (height != nullptr) {
     *height = windowSize.fb_height;
   }
+}
+
+void AuroraGXSync() {
+  GXFlush();
+  aurora::gx::fifo::drain();
+}
+
+void AuroraSetDrawsBlocking(bool blocking) {
+  GX_WRITE_AURORA(GX_AURORA_SET_DRAWS_BLOCKING);
+  GX_WRITE_U8(blocking);
 }
 
 void GXSetViewportRender(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz) {
@@ -66,6 +74,14 @@ void GXSetScissorRender(u32 left, u32 top, u32 wd, u32 ht) {
   GX_WRITE_U32(ht);
 }
 
+void GXSetProjectionFull(const void* mtx) {
+  const f32* values = reinterpret_cast<const f32*>(mtx);
+  GX_WRITE_AURORA(GX_AURORA_LOAD_PROJECTION_FULL);
+  for (int i = 0; i < 16; ++i) {
+    GX_WRITE_F32(values[i]);
+  }
+}
+
 void GX2SetPolygonOffset(f32 mFrontOffset, f32 mFrontScale, f32 mBackOffset, f32 mBackScale, f32 mClamp) {
   GX_WRITE_AURORA(GX2_SET_POLYGON_OFFSET);
   GX_WRITE_F32(mFrontOffset);
@@ -79,8 +95,26 @@ void GXCreateFrameBuffer(u32 width, u32 height) {
   GX_WRITE_AURORA(GX_AURORA_BEGIN_OFFSCREEN);
   GX_WRITE_U32(width);
   GX_WRITE_U32(height);
+  aurora::gx::fifo::publish();
 }
 
 void GXRestoreFrameBuffer() {
   GX_WRITE_AURORA(GX_AURORA_END_OFFSCREEN);
+  aurora::gx::fifo::publish();
+}
+
+AuroraReadbackStream AuroraReadbackCreateStream() { return aurora::gfx::readback::create_stream(); }
+
+void AuroraReadbackDestroyStream(AuroraReadbackStream stream) { aurora::gfx::readback::destroy_stream(stream); }
+
+GXBool AuroraReadbackCapturePeeks(AuroraReadbackStream stream, const AuroraReadbackPeekRequest* requests, u32 count) {
+  return aurora::gx::readback::capture_peeks(stream, requests, count, __gx->alphaRead);
+}
+
+GXBool AuroraReadbackCaptureCopies(AuroraReadbackStream stream, const AuroraReadbackCopySrc* srcs, u32 count) {
+  return aurora::gx::readback::capture_copies(stream, srcs, count);
+}
+
+GXBool AuroraReadbackGet(AuroraReadbackStream stream, AuroraReadbackDest* dests, u32 count) {
+  return aurora::gx::readback::get(stream, dests, count);
 }

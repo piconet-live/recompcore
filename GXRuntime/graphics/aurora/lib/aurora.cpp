@@ -1,9 +1,15 @@
 #include <aurora/aurora.h>
+#include <aurora/time.hpp>
 
 #ifdef AURORA_ENABLE_GX
-#include "gfx/common.hpp"
+#include "gfx/resources.hpp"
+#include "gfx/frame.hpp"
+#include "gfx/recording.hpp"
 #include "gfx/render_worker.hpp"
+#include "gx/command_processor.hpp"
 #include "gx/fifo.hpp"
+#include "gx/gx.hpp"
+#include "gx/texture.hpp"
 #include "imgui.hpp"
 #include "webgpu/gpu.hpp"
 #include "webgpu/gpu_prof.hpp"
@@ -14,8 +20,9 @@
 #include "rmlui.hpp"
 #endif
 
-#include "input.hpp"
+#include "gamepad.hpp"
 #include "internal.hpp"
+#include "thread.hpp"
 #include "window.hpp"
 
 #include <SDL3/SDL_filesystem.h>
@@ -24,28 +31,13 @@
 #include "system_info.hpp"
 #include "tracy/Tracy.hpp"
 
-#include <atomic>
-#include <chrono>
-
-// Frame timing for offline tools (dolgx_replay --timing): the steady-clock time the render worker submitted the
-// last frame, and the time the GPU reported that submission done (queue OnSubmittedWorkDone).
-static std::atomic<uint64_t> g_timingSubmitNs{0};
-static std::atomic<uint64_t> g_timingGpuDoneNs{0};
-static uint64_t timing_now_ns() {
-  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                   std::chrono::steady_clock::now().time_since_epoch())
-                                   .count());
-}
-extern "C" uint64_t aurora_timing_last_submit_ns() { return g_timingSubmitNs.load(std::memory_order_acquire); }
-extern "C" uint64_t aurora_timing_last_gpu_done_ns() { return g_timingGpuDoneNs.load(std::memory_order_acquire); }
-
 namespace aurora {
 AuroraConfig g_config;
 uint32_t g_sdlCustomEventsStart;
 char g_gameName[4];
 
 namespace {
-Module Log("aurora");
+constexpr Module Log{"aurora"};
 
 #ifdef AURORA_ENABLE_GX
 // GPU
@@ -134,11 +126,11 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
   if (g_config.maxTextureAnisotropy == 0) {
     g_config.maxTextureAnisotropy = 16;
   }
-  ASSERT(window::initialize(), "Error initializing window");
+  AURORA_ASSERT(window::initialize(), "Error initializing window");
 
   g_sdlCustomEventsStart = SDL_RegisterEvents(2);
-  ASSERT(g_sdlCustomEventsStart, "Failed to allocate user events: {}", SDL_GetError());
-  ASSERT(window::initialize_event_watch(), "Error initializing SDL event watch");
+  AURORA_ASSERT(g_sdlCustomEventsStart, "Failed to allocate user events: {}", SDL_GetError());
+  AURORA_ASSERT(window::initialize_event_watch(), "Error initializing SDL event watch");
 
 #ifdef AURORA_ENABLE_GX
   /* Attempt to create a window using the calling application's desired backend */
@@ -167,23 +159,27 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
     }
   }
 
-  ASSERT(windowCreated, "Error creating window: {}", SDL_GetError());
+  AURORA_ASSERT(windowCreated, "Error creating window: {}", SDL_GetError());
 
   // Initialize SDL_Renderer for ImGui when we can't use a Dawn backend
   if (webgpu::g_backendType == wgpu::BackendType::Null) {
-    ASSERT(window::create_renderer(), "Failed to initialize SDL renderer: {}", SDL_GetError());
+    AURORA_ASSERT(window::create_renderer(), "Failed to initialize SDL renderer: {}", SDL_GetError());
   }
 #else
   AuroraBackend selectedBackend = BACKEND_NULL;
-  ASSERT(window::create_window(BACKEND_NULL), "Error creating window: {}", SDL_GetError());
-  ASSERT(window::create_renderer(), "Failed to initialize SDL renderer: {}", SDL_GetError());
+  AURORA_ASSERT(window::create_window(BACKEND_NULL), "Error creating window: {}", SDL_GetError());
+  AURORA_ASSERT(window::create_renderer(), "Failed to initialize SDL renderer: {}", SDL_GetError());
 #endif
 
   window::show_window();
+  thread::set_current({
+      .name = "Main thread",
+      .affinity = thread::Affinity::SharedCache,
+  });
 
 #ifdef AURORA_ENABLE_GX
   gfx::initialize();
-
+  gx::fifo::init();
   imgui::create_context();
 #endif
   const auto size = window::get_window_size();
@@ -212,6 +208,7 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
 
 void shutdown() noexcept {
 #ifdef AURORA_ENABLE_GX
+  gx::fifo::shutdown();
   gfx::render_worker::synchronize();
 #ifdef AURORA_ENABLE_RMLUI
   rmlui::shutdown();
@@ -220,7 +217,7 @@ void shutdown() noexcept {
   gfx::shutdown();
   webgpu::shutdown();
 #endif
-  input::shutdown();
+  gamepad::shutdown();
   window::shutdown();
 }
 
@@ -228,8 +225,11 @@ const AuroraEvent* update() noexcept {
   ZoneScoped;
   if (g_initialFrame) {
     g_initialFrame = false;
-    input::initialize();
+    gamepad::initialize();
   }
+#ifdef AURORA_ENABLE_GX
+  gx::update();
+#endif
   return window::poll_events();
 }
 
@@ -256,6 +256,7 @@ bool begin_frame() noexcept {
   if (!gfx::begin_frame()) {
     return false;
   }
+  gx::fifo::begin_frame();
 #endif
   return true;
 }
@@ -264,6 +265,8 @@ void end_frame() noexcept {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
   gx::fifo::drain();
+  gx::fifo::end_frame();
+  gx::texture::end_frame();
   gfx::finish();
   auto imguiDrawData = imgui::freeze();
 
@@ -283,7 +286,8 @@ void end_frame() noexcept {
 #endif
 
   gfx::end_frame([rmlBindGroup = std::move(rmlBindGroup), rmlOverlay, viewport,
-                  imguiDrawData = std::move(imguiDrawData)](wgpu::CommandEncoder& encoder) {
+                  imguiDrawData = std::move(imguiDrawData)](
+                     wgpu::CommandEncoder& encoder, std::vector<gfx::AfterSubmitCallback> afterSubmitCallbacks) {
     wgpu::Texture currentTexture;
     wgpu::TextureView currentView;
     auto surfaceStatus = wgpu::SurfaceGetCurrentTextureStatus::Error;
@@ -368,11 +372,6 @@ void end_frame() noexcept {
     {
       ZoneScopedN("Queue Submit");
       g_queue.Submit(1, &buffer);
-      g_timingSubmitNs.store(timing_now_ns(), std::memory_order_release);
-      g_queue.OnSubmittedWorkDone(wgpu::CallbackMode::AllowSpontaneous,
-                                  [](wgpu::QueueWorkDoneStatus, wgpu::StringView) {
-                                    g_timingGpuDoneNs.store(timing_now_ns(), std::memory_order_release);
-                                  });
     }
     webgpu::gpu_prof::after_submit();
     if (canPresent && g_surface) {
@@ -417,7 +416,11 @@ void end_frame() noexcept {
         break;
       }
     }
-    gfx::after_submit();
+    for (auto& callback : afterSubmitCallbacks) {
+      if (callback) {
+        callback();
+      }
+    }
 
     TracyPlotConfig("aurora: lastVertSize", tracy::PlotFormatType::Memory, false, true, 0);
     TracyPlotConfig("aurora: lastUniformSize", tracy::PlotFormatType::Memory, false, true, 0);
@@ -425,15 +428,16 @@ void end_frame() noexcept {
     TracyPlotConfig("aurora: lastStorageSize", tracy::PlotFormatType::Memory, false, true, 0);
     TracyPlotConfig("aurora: lastTextureUploadSize", tracy::PlotFormatType::Memory, false, true, 0);
 
-    TracyPlot("aurora: queuedPipelines", static_cast<int64_t>(gfx::g_stats.queuedPipelines));
-    TracyPlot("aurora: createdPipelines", static_cast<int64_t>(gfx::g_stats.createdPipelines));
-    TracyPlot("aurora: drawCallCount", static_cast<int64_t>(gfx::g_stats.drawCallCount));
-    TracyPlot("aurora: mergedDrawCallCount", static_cast<int64_t>(gfx::g_stats.mergedDrawCallCount));
-    TracyPlot("aurora: lastVertSize", static_cast<int64_t>(gfx::g_stats.lastVertSize));
-    TracyPlot("aurora: lastUniformSize", static_cast<int64_t>(gfx::g_stats.lastUniformSize));
-    TracyPlot("aurora: lastIndexSize", static_cast<int64_t>(gfx::g_stats.lastIndexSize));
-    TracyPlot("aurora: lastStorageSize", static_cast<int64_t>(gfx::g_stats.lastStorageSize));
-    TracyPlot("aurora: lastTextureUploadSize", static_cast<int64_t>(gfx::g_stats.lastTextureUploadSize));
+    const auto& stats = gfx::detail::resources().stats;
+    TracyPlot("aurora: queuedPipelines", static_cast<int64_t>(stats.queuedPipelines));
+    TracyPlot("aurora: createdPipelines", static_cast<int64_t>(stats.createdPipelines));
+    TracyPlot("aurora: drawCallCount", static_cast<int64_t>(stats.drawCallCount));
+    TracyPlot("aurora: mergedDrawCallCount", static_cast<int64_t>(stats.mergedDrawCallCount));
+    TracyPlot("aurora: lastVertSize", static_cast<int64_t>(stats.lastVertSize));
+    TracyPlot("aurora: lastUniformSize", static_cast<int64_t>(stats.lastUniformSize));
+    TracyPlot("aurora: lastIndexSize", static_cast<int64_t>(stats.lastIndexSize));
+    TracyPlot("aurora: lastStorageSize", static_cast<int64_t>(stats.lastStorageSize));
+    TracyPlot("aurora: lastTextureUploadSize", static_cast<int64_t>(stats.lastTextureUploadSize));
   });
 
 #endif
@@ -449,6 +453,10 @@ void aurora_shutdown() { aurora::shutdown(); }
 const AuroraEvent* aurora_update() { return aurora::update(); }
 bool aurora_begin_frame() { return aurora::begin_frame(); }
 void aurora_end_frame() { aurora::end_frame(); }
+SDL_Window* aurora_get_window() { return aurora::window::get_sdl_window(); }
+AuroraWindowSize aurora_get_window_size() {
+  return aurora::window::get_sdl_window() != nullptr ? aurora::window::get_window_size() : AuroraWindowSize{};
+}
 AuroraBackend aurora_get_backend() { return aurora::g_config.desiredBackend; }
 const AuroraBackend* aurora_get_available_backends(size_t* count) {
   if (count != nullptr) {
@@ -469,3 +477,5 @@ void aurora_set_resampler(AuroraSampler sampler) {
   (void)sampler;
 #endif
 }
+void aurora_set_timescale(float scale) { aurora::time::set_scale(scale); }
+float aurora_get_timescale() { return aurora::time::scale(); }

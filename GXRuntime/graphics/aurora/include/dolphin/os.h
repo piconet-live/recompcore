@@ -48,6 +48,7 @@ extern "C" {
 #include <dolphin/os/OSSemaphore.h>
 #include <dolphin/os/OSUtf.h>
 #include <dolphin/os/OSTimer.h>
+#include <dolphin/os/OSStopwatch.h>
 
 // private macro, maybe shouldn't be defined here?
 #define OFFSET(addr, align) (((u32)(addr) & ((align)-1)))
@@ -156,31 +157,28 @@ typedef struct OSBootInfo_s {
     u32 FSTMaxLength;
 } OSBootInfo;
 
-typedef struct OSStopwatch {
-    char* name;
-    u32 hits;
-    OSTime total;
-    OSTime min;
-    OSTime max;
-    OSTime last;
-    BOOL running;
-    u32 _padding;
-} OSStopwatch;
-
-void OSInitStopwatch(OSStopwatch* sw, char* name);
-void OSStartStopwatch(OSStopwatch* sw);
-void OSStopStopwatch(OSStopwatch* sw);
-OSTime OSCheckStopwatch(OSStopwatch* sw);
-void OSResetStopwatch(OSStopwatch* sw);
-void OSDumpStopwatch(OSStopwatch* sw);
-
 OSTick OSGetTick(void);
+/**
+ * Get the current time, in ticks since GCN epoch (2000-01-01 00:00:00 UTC).
+ * Monotonic, scaled by aurora_set_timescale, and pauses when backgrounded.
+ */
 OSTime OSGetTime(void);
 void OSTicksToCalendarTime(OSTime ticks, OSCalendarTime* td);
 OSTime OSCalendarTimeToTicks(OSCalendarTime* td);
 BOOL OSEnableInterrupts(void);
 BOOL OSDisableInterrupts(void);
 BOOL OSRestoreInterrupts(BOOL level);
+
+/**
+ * Aurora extension: get the system time, in ticks since GCN epoch (2000-01-01 00:00:00 UTC).
+ * Not guaranteed to increase monotonically and not converted to the local time zone.
+ */
+OSTime OSGetSystemTime(void);
+/**
+ * Aurora extension: get the unscaled monotonic time, in ticks since GCN epoch (2000-01-01 00:00:00 UTC).
+ * Use only for elapsed-time measurements.
+ */
+OSTime OSGetNativeTime(void);
 
 #define OS_CONSOLE_MASK        0xF0000000
 #define OS_CONSOLE_RETAIL      0x00000000
@@ -203,6 +201,9 @@ BOOL OSRestoreInterrupts(BOOL level);
 #define OS_CONSOLE_ARTHUR      0x10000002
 #define OS_CONSOLE_PC_EMULATOR 0x10000001
 #define OS_CONSOLE_EMULATOR    0x10000000
+#define OS_CONSOLE_DEV_MASK    OS_CONSOLE_DEVELOPMENT
+
+#define OS_CONSOLE_IS_DEV() ((OSGetConsoleType() & OS_CONSOLE_DEV_MASK) != 0)
 
 #define OS_SOUND_MODE_MONO   0
 #define OS_SOUND_MODE_STEREO 1
@@ -214,6 +215,8 @@ DECL_WEAK void OSReport(const char* msg, ...);
 DECL_WEAK void OSVReport(const char* msg, va_list list);
 DECL_WEAK void OSPanic NORETURN(const char* file, int line, const char* msg, ...);
 void OSFatal NORETURN(GXColor fg, GXColor bg, const char* msg);
+
+#define OSErrorLine(line, ...) OSPanic(__FILE__, line, __VA_ARGS__)
 
 #define OSRoundUp32B(x)   (((uintptr_t)(x) + 32 - 1) & ~(32 - 1))
 #define OSRoundDown32B(x) (((uintptr_t)(x)) & ~(32 - 1))

@@ -7,7 +7,7 @@
 #include "gx/gx.hpp"
 #include "gx/fifo.hpp"
 #include "gx/command_processor.hpp"
-#include "gfx/depth_peek.hpp"
+#include "gfx/readback/readback.hpp"
 
 #include <cstring>
 #include <vector>
@@ -21,8 +21,10 @@ protected:
     GXInit(nullptr, 0);
     aurora::gx::fifo::clear_buffer();
     aurora::gx::g_gxState = aurora::gx::GXState{};
-    aurora::gfx::depth_peek::testing::reset();
+    aurora::gfx::readback::initialize();
   }
+
+  void TearDown() override { aurora::gx::fifo::shutdown(); }
 
   // Copy the internal FIFO buffer contents and clear it
   std::vector<u8> capture_fifo() {
@@ -38,7 +40,7 @@ protected:
 
   // Decode a captured FIFO byte stream through the command processor
   void decode_fifo(const std::vector<u8>& bytes) {
-    aurora::gx::fifo::process(bytes.data(), static_cast<u32>(bytes.size()), true);
+    aurora::gx::fifo::process(bytes.data(), static_cast<u32>(bytes.size()));
   }
 
   // Flush dirty state, then capture the FIFO buffer

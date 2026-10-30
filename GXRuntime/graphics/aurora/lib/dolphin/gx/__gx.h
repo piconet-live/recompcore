@@ -67,7 +67,8 @@
 
 #define SET_REG_FIELD(line, reg, size, shift, val)                                                                     \
   do {                                                                                                                 \
-    (reg) = ((u32)(reg) & ~(((1u << (size)) - 1) << (shift))) | ((u32)(val) << (shift));                               \
+    constexpr int kMask = ((1u << (size)) - 1) << (shift);                                                             \
+    (reg) = (u32(reg) & ~kMask) | ((u32(val) << (shift)) & kMask);                                                     \
   } while (0)
 
 #define GX_WRITE_AURORA(cmd)     \
@@ -126,6 +127,7 @@ struct __GXData_struct {
   u32 zmode;        // Z-buffer mode register
   u32 peCtrl;       // pixel engine control
   u32 cpTex;        // copy texture trigger register
+  GXAlphaReadMode alphaRead; // PE alpha read mode
 
   u32 genMode;      // general mode (numTexGens, numChans, numTevStages, cullMode, numIndStages)
 

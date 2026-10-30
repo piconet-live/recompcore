@@ -1,30 +1,25 @@
 #include "gx.hpp"
 
 #include "pipeline.hpp"
+#include "texture.hpp"
 #include "../dolphin/vi/vi_internal.hpp"
 #include "../webgpu/gpu.hpp"
 #include "../internal.hpp"
-#include "../gfx/common.hpp"
-#include "../gfx/tex_palette_conv.hpp"
+#include "../window.hpp"
+#include "../gfx/resources.hpp"
+#include "../gfx/recording.hpp"
+#include "../gfx/resource_cache.hpp"
 #include "../gfx/texture.hpp"
-#include "../gfx/texture_convert.hpp"
-#include "../gfx/texture_replacement.hpp"
 #include "gx_fmt.hpp"
-#include "recomp.hpp"
 
 #include <absl/container/flat_hash_map.h>
-#include <absl/container/flat_hash_set.h>
 #include <tracy/Tracy.hpp>
-#include <xxhash.h>
 
 #include <atomic>
-#include <cstdio>
-#include <cstdlib>
 #include <bit>
 #include <cfloat>
 #include <cmath>
 #include <mutex>
-#include <optional>
 #include <utility>
 
 static aurora::Module Log("aurora::gx");
@@ -34,372 +29,16 @@ using webgpu::g_device;
 using webgpu::g_graphicsConfig;
 
 GXState g_gxState{};
-
-static wgpu::Sampler sEmptySampler;
-static wgpu::Texture sEmptyTexture;
-static wgpu::TextureView sEmptyTextureView;
-static std::mutex sBindGroupLayoutMutex;
-static absl::flat_hash_map<u32, wgpu::BindGroupLayout> sUniformBindGroupLayouts;
-static absl::flat_hash_map<u32, std::pair<wgpu::BindGroupLayout, wgpu::BindGroupLayout>> sTextureBindGroupLayouts;
-static wgpu::BindGroupLayout sTextureBindGroupLayout;
-static wgpu::BindGroupLayout sSamplerBindGroupLayout;
-static wgpu::PipelineLayout sPipelineLayout;
 wgpu::BindGroup g_emptyTextureBindGroup;
 
 namespace {
-struct DynamicPaletteKey {
-  const void* sourceIdentity = nullptr;
-  u32 width = 0;
-  u32 height = 0;
-  u32 format = 0;
+wgpu::Sampler sEmptySampler;
+wgpu::Texture sEmptyTexture;
+wgpu::TextureView sEmptyTextureView;
+wgpu::BindGroupLayout sTextureBindGroupLayout;
+wgpu::PipelineLayout sPipelineLayout;
 
-  bool operator==(const DynamicPaletteKey& rhs) const = default;
-  template <typename H>
-  friend H AbslHashValue(H h, const DynamicPaletteKey& key) {
-    return H::combine(std::move(h), key.sourceIdentity, key.width, key.height, key.format);
-  }
-};
-
-struct DynamicPaletteEntry {
-  gfx::TextureHandle handle;
-  u32 sourceRevision = 0;
-  u32 tlutDataVersion = 0;
-};
-
-struct CachedTextureEntry {
-  gfx::TextureHandle handle;
-  u32 texDataVersion = 0;
-  u32 tlutObjId = 0;
-  u32 tlutDataVersion = 0;
-};
-
-struct CachedTlutTextureEntry {
-  gfx::TextureHandle handle;
-  u32 tlutDataVersion = 0;
-};
-
-struct TlutObjectCache {
-  CachedTlutTextureEntry tlutTexture;
-  absl::flat_hash_map<DynamicPaletteKey, DynamicPaletteEntry> dynamicPaletteTextures;
-  absl::flat_hash_set<u32> staticTextureUsers;
-};
-
-absl::flat_hash_map<u32, CachedTextureEntry> s_textureObjectCaches;
-absl::flat_hash_map<u32, TlutObjectCache> s_tlutObjectCaches;
-std::atomic_bool s_staticTextureCacheClearPending = false;
-
-void do_clear_static_texture_cache() noexcept {
-  s_textureObjectCaches.clear();
-  for (auto& [_, cache] : s_tlutObjectCaches) {
-    cache.staticTextureUsers.clear();
-  }
-}
-
-// Retail textures (texObjId 0: set up by raw BP registers and resolved from guest memory by recomp::
-// resolve_texture_data, which marks them no_cache). They have no SDK object id or version, so the id cache above
-// never holds them, and every draw used to decode and create its textures again. They are cached here by content
-// instead, as gxcore's TextureKey does: the guest pointer, the registers that shape the texels, and a hash of the
-// texel (and palette) bytes. A content change under the same address is a new entry and evicts the old one.
-struct RawTextureKey {
-  const void* data = nullptr;
-  u32 image0 = 0;
-  u32 byteSize = 0;
-  u32 mipCount = 0;
-  u32 format = 0;
-  const void* tlutData = nullptr;
-  u32 tlutFormat = 0;
-  u32 tlutEntries = 0;
-  u64 hash = 0;
-  bool operator==(const RawTextureKey&) const = default;
-  template <typename H>
-  friend H AbslHashValue(H h, const RawTextureKey& k) {
-    return H::combine(std::move(h), k.data, k.image0, k.byteSize, k.mipCount, k.format, k.tlutData, k.tlutFormat,
-                      k.tlutEntries, k.hash);
-  }
-};
-absl::flat_hash_map<RawTextureKey, gfx::TextureHandle> s_rawTextureCache;
-// a texture's identity (its key without the content hash) to its current entry: new content under the same identity
-// replaces the old entry. Keyed by identity, not by address alone: one address sampled with two mip counts (F-Zero's
-// CMPR course textures) is two textures, and an address-only key made them evict each other every frame.
-absl::flat_hash_map<RawTextureKey, RawTextureKey> s_rawTextureAtAddress;
-constexpr size_t MaxRawTextures = 4096;
-
-// The content hash is taken once per texture generation, not per draw. A generation ends where the hardware's
-// texture memory could change under the same registers: at each frame's drain, at a TMEM invalidate (BP 0x66), a
-// TLUT load (BP 0x65) and an EFB copy (BP 0x52). Within one, a slot whose registers are unchanged keeps its bind.
-u64 s_rawTextureGeneration = 1;
-struct RawBindMemo {
-  u64 generation = 0;
-  u32 mode0 = 0, mode1 = 0, image0 = 0, image3 = 0;
-  bool tlutValid = false;
-  u16 tlutOffset = 0;
-  u32 tlutFormat = 0;
-  u32 tlut = 0;
-  gfx::TextureBind bind;
-};
-std::array<RawBindMemo, MaxTextures> s_rawBindMemo;
-struct RawTextureStats {
-  u64 resolves = 0, memoHits = 0, hashed = 0, hashedBytes = 0, hits = 0, creates = 0;
-} s_rawStats;
-
-// AURORA_RAW_TEXCACHE=0: the cache off (every retail texture decoded and created at every bind, as before it), for
-// before-and-after timings.
-bool raw_texture_cache_on() noexcept {
-  static const bool on = [] {
-    const char* v = std::getenv("AURORA_RAW_TEXCACHE");
-    return v == nullptr || v[0] != '0';
-  }();
-  return on;
-}
-
-template <typename Create>
-gfx::TextureHandle resolve_raw_cached(const GXTexObj_& obj, const GXTlutObj_* tlut, Create&& create) {
-  const u32 size = recomp::texture_byte_size(obj);
-  RawTextureKey key{
-      .data = obj.data,
-      .image0 = obj.image0,
-      .byteSize = size,
-      .mipCount = obj.mip_count(),
-      .format = obj.format(),
-  };
-  u64 h = XXH3_64bits(obj.data, size);
-  s_rawStats.hashedBytes += size;
-  if (tlut != nullptr) {
-    key.tlutData = tlut->data;
-    key.tlutFormat = static_cast<u32>(tlut->format);
-    key.tlutEntries = tlut->numEntries;
-    h = XXH3_64bits_withSeed(tlut->data, static_cast<size_t>(tlut->numEntries) * 2, h);
-    s_rawStats.hashedBytes += static_cast<u64>(tlut->numEntries) * 2;
-  }
-  key.hash = h;
-  ++s_rawStats.hashed;
-  if (const auto it = s_rawTextureCache.find(key); it != s_rawTextureCache.end()) {
-    ++s_rawStats.hits;
-    return it->second;
-  }
-  RawTextureKey identity = key;
-  identity.hash = 0;
-  if (const auto at = s_rawTextureAtAddress.find(identity); at != s_rawTextureAtAddress.end()) {
-    s_rawTextureCache.erase(at->second);
-  }
-  if (s_rawTextureCache.size() >= MaxRawTextures) {
-    s_rawTextureCache.clear();
-    s_rawTextureAtAddress.clear();
-  }
-  static const bool createLog = [] {
-    const char* v = std::getenv("AURORA_TEXCACHE_STATS");
-    return v != nullptr && v[0] == '2';
-  }();
-  if (createLog) {
-    std::fprintf(stderr, "[texcache-create] data %p %ux%u fmt %u mips %u bytes %u tlut %d replaced %d\n", obj.data,
-                 obj.width(), obj.height(), obj.format(), obj.mip_count(), size, tlut != nullptr ? 1 : 0,
-                 s_rawTextureAtAddress.contains(identity) ? 1 : 0);
-  }
-  gfx::TextureHandle handle = create();
-  ++s_rawStats.creates;
-  if (handle) {
-    s_rawTextureCache.emplace(key, handle);
-    s_rawTextureAtAddress[identity] = key;
-  }
-  return handle;
-}
-
-DynamicPaletteKey make_dynamic_palette_key(const GXTexObj_& obj, const GXState::CopyTextureRef& source) {
-  return {
-      .sourceIdentity = source.handle.get(),
-      .width = obj.width(),
-      .height = obj.height(),
-      .format = obj.format(),
-  };
-}
-
-void clear_texture_dependency(u32 texObjId, u32 tlutObjId) {
-  if (texObjId == 0 || tlutObjId == 0) {
-    return;
-  }
-  if (auto it = s_tlutObjectCaches.find(tlutObjId); it != s_tlutObjectCaches.end()) {
-    it->second.staticTextureUsers.erase(texObjId);
-    if (!it->second.tlutTexture.handle && it->second.dynamicPaletteTextures.empty() &&
-        it->second.staticTextureUsers.empty()) {
-      s_tlutObjectCaches.erase(it);
-    }
-  }
-}
-
-void store_cached_texture(const GXTexObj_& obj, gfx::TextureHandle handle, u32 tlutObjId = 0, u32 tlutDataVersion = 0) {
-  if (obj.texObjId == 0) {
-    return;
-  }
-
-  auto& entry = s_textureObjectCaches[obj.texObjId];
-  if (entry.tlutObjId != tlutObjId) {
-    clear_texture_dependency(obj.texObjId, entry.tlutObjId);
-  }
-
-  entry.handle = std::move(handle);
-  entry.texDataVersion = obj.texDataVersion;
-  entry.tlutObjId = tlutObjId;
-  entry.tlutDataVersion = tlutDataVersion;
-
-  if (tlutObjId != 0) {
-    s_tlutObjectCaches[tlutObjId].staticTextureUsers.insert(obj.texObjId);
-  }
-}
-
-gfx::TextureHandle get_tlut_texture(const GXTlutObj_& tlut) {
-  if (tlut.tlutObjId != 0) {
-    auto& cache = s_tlutObjectCaches[tlut.tlutObjId];
-    if (cache.tlutTexture.handle && cache.tlutTexture.tlutDataVersion == tlut.tlutDataVersion) {
-      return cache.tlutTexture.handle;
-    }
-    cache.dynamicPaletteTextures.clear();
-    for (const u32 texObjId : cache.staticTextureUsers) {
-      s_textureObjectCaches.erase(texObjId);
-    }
-    cache.staticTextureUsers.clear();
-  }
-
-  const auto handle = gfx::new_static_texture_2d(
-      tlut.numEntries, 1, 1, gfx::tlut_texture_format(tlut.format),
-      {static_cast<const u8*>(tlut.data), static_cast<size_t>(tlut.numEntries) * sizeof(u16)}, true, "Loaded TLUT");
-  if (tlut.tlutObjId != 0) {
-    auto& cache = s_tlutObjectCaches[tlut.tlutObjId];
-    cache.tlutTexture.handle = handle;
-    cache.tlutTexture.tlutDataVersion = tlut.tlutDataVersion;
-  }
-  return handle;
-}
-
-gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
-  ZoneScoped;
-  if (s_staticTextureCacheClearPending.exchange(false, std::memory_order_acq_rel)) {
-    do_clear_static_texture_cache();
-  }
-
-  if (obj.texObjId != 0) {
-    if (const auto it = s_textureObjectCaches.find(obj.texObjId); it != s_textureObjectCaches.end()) {
-      const auto& entry = it->second;
-      if (entry.handle && entry.texDataVersion == obj.texDataVersion && entry.tlutObjId == 0) {
-        return entry.handle;
-      }
-    }
-  }
-
-  if (obj.texObjId == 0 && obj.no_cache() && raw_texture_cache_on()) {
-    return resolve_raw_cached(obj, nullptr, [&] {
-      return gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), obj.format(),
-                                        {static_cast<const uint8_t*>(obj.data), UINT32_MAX}, false,
-                                        "GX Retail Texture");
-    });
-  }
-
-  gfx::TextureHandle handle;
-  if (const auto replacement = gfx::texture_replacement::find_replacement(obj); replacement.has_value()) {
-    handle = *replacement;
-  } else {
-#if DEBUG
-    const auto name = gfx::texture_replacement::build_texture_replacement_name(obj);
-    const auto nameStr = name.c_str();
-#else
-    const auto nameStr = "GX Static Texture";
-#endif
-    handle = gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), obj.format(),
-                                        {static_cast<const uint8_t*>(obj.data), UINT32_MAX}, false, nameStr);
-  }
-  if (!obj.no_cache()) {
-    store_cached_texture(obj, handle);
-  }
-  return handle;
-}
-
-gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GXTlutObj_& tlut) {
-  ZoneScoped;
-  if (s_staticTextureCacheClearPending.exchange(false, std::memory_order_acq_rel)) {
-    do_clear_static_texture_cache();
-  }
-
-  if (obj.texObjId != 0) {
-    if (const auto it = s_textureObjectCaches.find(obj.texObjId); it != s_textureObjectCaches.end()) {
-      const auto& entry = it->second;
-      if (entry.handle && entry.texDataVersion == obj.texDataVersion && entry.tlutObjId == tlut.tlutObjId &&
-          entry.tlutDataVersion == tlut.tlutDataVersion) {
-        return entry.handle;
-      }
-    }
-  }
-
-  if (obj.texObjId == 0 && obj.no_cache() && raw_texture_cache_on()) {
-    return resolve_raw_cached(obj, &tlut, [&]() -> gfx::TextureHandle {
-      auto converted = gfx::convert_texture_palette(
-          obj.format(), obj.width(), obj.height(), obj.mip_count(), {static_cast<const u8*>(obj.data), UINT32_MAX},
-          tlut.format, tlut.numEntries, {static_cast<const u8*>(tlut.data), static_cast<size_t>(tlut.numEntries) * 2});
-      if (converted.data.empty()) {
-        return {};
-      }
-      auto h = gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), GX_TF_RGBA8_PC,
-                                          {converted.data.data(), converted.data.size()}, false,
-                                          "GX Retail Palette Texture");
-      h->hasArbitraryMips = converted.hasArbitraryMips;
-      return h;
-    });
-  }
-
-  gfx::TextureHandle handle;
-  if (const auto replacement = gfx::texture_replacement::find_replacement(obj, tlut); replacement.has_value()) {
-    handle = *replacement;
-  } else {
-    auto converted = gfx::convert_texture_palette(
-        obj.format(), obj.width(), obj.height(), obj.mip_count(), {static_cast<const u8*>(obj.data), UINT32_MAX},
-        tlut.format, tlut.numEntries, {static_cast<const u8*>(tlut.data), static_cast<size_t>(tlut.numEntries) * 2});
-    if (converted.data.empty()) {
-      return {};
-    }
-    handle =
-        gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), GX_TF_RGBA8_PC,
-                                   {converted.data.data(), converted.data.size()}, false, "GX Static Palette Texture");
-    handle->hasArbitraryMips = converted.hasArbitraryMips;
-  }
-  if (!obj.no_cache() && !tlut.no_cache()) {
-    store_cached_texture(obj, handle, tlut.tlutObjId, tlut.tlutDataVersion);
-  }
-  return handle;
-}
-
-gfx::TextureHandle resolve_dynamic_palette_texture(const GXTexObj_& obj, const GXState::CopyTextureRef& source,
-                                                   const GXTlutObj_& tlut) {
-  ZoneScoped;
-
-  const auto tlutHandle = get_tlut_texture(tlut);
-  auto& tlutCache = s_tlutObjectCaches[tlut.tlutObjId];
-  auto& entry = tlutCache.dynamicPaletteTextures[make_dynamic_palette_key(obj, source)];
-  if (!entry.handle) {
-    // Use source size instead of target (logical) size
-    entry.handle = gfx::new_conv_texture(source.handle->size.width, source.handle->size.height, GX_TF_RGBA8,
-                                         "GX Dynamic Palette Texture");
-  }
-  if (entry.sourceRevision != source.revision || entry.tlutDataVersion != tlut.tlutDataVersion) {
-    gfx::queue_palette_conv({
-        .variant = obj.format() == GX_TF_C4 ? gfx::tex_palette_conv::Variant::FromFloat4
-                                            : gfx::tex_palette_conv::Variant::FromFloat8,
-        .src = source.handle,
-        .dst = entry.handle,
-        .tlut = tlutHandle,
-    });
-    entry.sourceRevision = source.revision;
-    entry.tlutDataVersion = tlut.tlutDataVersion;
-  }
-  return entry.handle;
-}
-
-u32 resolved_format_for_handle(const gfx::TextureHandle& handle) {
-  if (!handle) {
-    return GX_TF_RGBA8;
-  }
-  if (handle->gxFormat != gfx::InvalidTextureFormat) {
-    return handle->gxFormat;
-  }
-  return GX_TF_RGBA8_PC;
-}
+std::atomic<int> sPendingViewportPolicy{-1};
 
 template <typename T>
 T round_away_from_zero(float value) noexcept {
@@ -412,7 +51,185 @@ std::pair<f32, f32> polygon_offset_for_cull_mode(GXCullMode cullMode) noexcept {
   }
   return {g_gxState.frontOffset, g_gxState.frontScale};
 }
+
+wgpu::BlendFactor to_blend_factor(GXBlendFactor fac, bool isDst) {
+  switch (fac) {
+    DEFAULT_FATAL("invalid blend factor {}", underlying(fac));
+  case GX_BL_ZERO:
+    return wgpu::BlendFactor::Zero;
+  case GX_BL_ONE:
+    return wgpu::BlendFactor::One;
+  case GX_BL_SRCCLR: // + GX_BL_DSTCLR
+    if (isDst) {
+      return wgpu::BlendFactor::Src;
+    } else {
+      return wgpu::BlendFactor::Dst;
+    }
+  case GX_BL_INVSRCCLR: // + GX_BL_INVDSTCLR
+    if (isDst) {
+      return wgpu::BlendFactor::OneMinusSrc;
+    } else {
+      return wgpu::BlendFactor::OneMinusDst;
+    }
+  case GX_BL_SRCALPHA:
+    return wgpu::BlendFactor::SrcAlpha;
+  case GX_BL_INVSRCALPHA:
+    return wgpu::BlendFactor::OneMinusSrcAlpha;
+  case GX_BL_DSTALPHA:
+    return wgpu::BlendFactor::DstAlpha;
+  case GX_BL_INVDSTALPHA:
+    return wgpu::BlendFactor::OneMinusDstAlpha;
+  }
+}
+
+wgpu::CompareFunction to_compare_function(GXCompare func) {
+  switch (func) {
+    DEFAULT_FATAL("invalid depth fn {}", underlying(func));
+  case GX_NEVER:
+    return wgpu::CompareFunction::Never;
+  case GX_LESS:
+    return UseReversedZ ? wgpu::CompareFunction::Greater : wgpu::CompareFunction::Less;
+  case GX_EQUAL:
+    return wgpu::CompareFunction::Equal;
+  case GX_LEQUAL:
+    return UseReversedZ ? wgpu::CompareFunction::GreaterEqual : wgpu::CompareFunction::LessEqual;
+  case GX_GREATER:
+    return UseReversedZ ? wgpu::CompareFunction::Less : wgpu::CompareFunction::Greater;
+  case GX_NEQUAL:
+    return wgpu::CompareFunction::NotEqual;
+  case GX_GEQUAL:
+    return UseReversedZ ? wgpu::CompareFunction::LessEqual : wgpu::CompareFunction::GreaterEqual;
+  case GX_ALWAYS:
+    return wgpu::CompareFunction::Always;
+  }
+}
+
+wgpu::BlendState to_blend_state(GXBlendMode mode, GXBlendFactor srcFac, GXBlendFactor dstFac, GXLogicOp op,
+                                u32 dstAlpha, bool dualSource) {
+  wgpu::BlendComponent colorBlendComponent;
+  switch (mode) {
+    DEFAULT_FATAL("unsupported blend mode {}", underlying(mode));
+  case GX_BM_NONE:
+    colorBlendComponent = {
+        .operation = wgpu::BlendOperation::Add,
+        .srcFactor = wgpu::BlendFactor::One,
+        .dstFactor = wgpu::BlendFactor::Zero,
+    };
+    break;
+  case GX_BM_BLEND:
+    colorBlendComponent = {
+        .operation = wgpu::BlendOperation::Add,
+        .srcFactor = to_blend_factor(srcFac, false),
+        .dstFactor = to_blend_factor(dstFac, true),
+    };
+    break;
+  case GX_BM_SUBTRACT:
+    colorBlendComponent = {
+        .operation = wgpu::BlendOperation::ReverseSubtract,
+        .srcFactor = wgpu::BlendFactor::One,
+        .dstFactor = wgpu::BlendFactor::One,
+    };
+    break;
+  case GX_BM_LOGIC:
+    switch (op) {
+      DEFAULT_FATAL("unsupported logic op {}", underlying(op));
+    case GX_LO_CLEAR:
+      colorBlendComponent = {
+          .operation = wgpu::BlendOperation::Add,
+          .srcFactor = wgpu::BlendFactor::Zero,
+          .dstFactor = wgpu::BlendFactor::Zero,
+      };
+      break;
+    case GX_LO_COPY:
+      colorBlendComponent = {
+          .operation = wgpu::BlendOperation::Add,
+          .srcFactor = wgpu::BlendFactor::One,
+          .dstFactor = wgpu::BlendFactor::Zero,
+      };
+      break;
+    case GX_LO_NOOP:
+      colorBlendComponent = {
+          .operation = wgpu::BlendOperation::Add,
+          .srcFactor = wgpu::BlendFactor::Zero,
+          .dstFactor = wgpu::BlendFactor::One,
+      };
+      break;
+    }
+    break;
+  }
+  if (dualSource) {
+    const auto remap = [](wgpu::BlendFactor factor) {
+      if (factor == wgpu::BlendFactor::SrcAlpha) {
+        return wgpu::BlendFactor::Src1Alpha;
+      }
+      if (factor == wgpu::BlendFactor::OneMinusSrcAlpha) {
+        return wgpu::BlendFactor::OneMinusSrc1Alpha;
+      }
+      return factor;
+    };
+    colorBlendComponent.srcFactor = remap(colorBlendComponent.srcFactor);
+    colorBlendComponent.dstFactor = remap(colorBlendComponent.dstFactor);
+  }
+  wgpu::BlendComponent alphaBlendComponent;
+  if (dstAlpha != UINT32_MAX) {
+    alphaBlendComponent = wgpu::BlendComponent{
+        .operation = wgpu::BlendOperation::Add,
+        .srcFactor = wgpu::BlendFactor::Constant,
+        .dstFactor = wgpu::BlendFactor::Zero,
+    };
+  } else {
+    alphaBlendComponent = colorBlendComponent;
+  }
+  return {
+      .color = colorBlendComponent,
+      .alpha = alphaBlendComponent,
+  };
+}
+
+wgpu::ColorWriteMask to_write_mask(bool colorUpdate, bool alphaUpdate) {
+  wgpu::ColorWriteMask writeMask = wgpu::ColorWriteMask::None;
+  if (colorUpdate) {
+    writeMask |= wgpu::ColorWriteMask::Red | wgpu::ColorWriteMask::Green | wgpu::ColorWriteMask::Blue;
+  }
+  if (alphaUpdate) {
+    writeMask |= wgpu::ColorWriteMask::Alpha;
+  }
+  return writeMask;
+}
+
+wgpu::PrimitiveState to_primitive_state(GXCullMode gx_cullMode) {
+  auto cullMode = wgpu::CullMode::None;
+  switch (gx_cullMode) {
+    DEFAULT_FATAL("unsupported cull mode {}", underlying(gx_cullMode));
+  case GX_CULL_FRONT:
+    cullMode = wgpu::CullMode::Front;
+    break;
+  case GX_CULL_BACK:
+    cullMode = wgpu::CullMode::Back;
+    break;
+  case GX_CULL_NONE:
+    break;
+  }
+  return {
+      .topology = wgpu::PrimitiveTopology::TriangleList,
+      .stripIndexFormat = wgpu::IndexFormat::Undefined,
+      .frontFace = wgpu::FrontFace::CW,
+      .cullMode = cullMode,
+  };
+}
 } // namespace
+
+void set_viewport_policy(AuroraViewportPolicy policy) noexcept {
+  sPendingViewportPolicy.store(policy, std::memory_order_release);
+}
+
+void update() noexcept {
+  if (const int pending = sPendingViewportPolicy.exchange(-1, std::memory_order_acq_rel); pending != -1) {
+    const auto policy = static_cast<AuroraViewportPolicy>(pending);
+    g_gxState.viewportPolicy = policy;
+    window::set_frame_buffer_aspect_fit(policy == AURORA_VIEWPORT_FIT);
+  }
+}
 
 Vec2<uint32_t> logical_fb_size() noexcept {
   return gfx::is_offscreen() ? gfx::get_render_target_size() : vi::configured_fb_size();
@@ -476,11 +293,19 @@ gfx::ClipRect map_logical_scissor(const gfx::ClipRect& logicalScissor) noexcept 
 }
 
 void set_logical_viewport(const gfx::Viewport& viewport) noexcept {
+  if (viewport.left != g_gxState.logicalViewport.left || viewport.width != g_gxState.logicalViewport.width ||
+      viewport.height != g_gxState.logicalViewport.height) {
+    g_gxState.dirty |= DirtyUniform;
+  }
   g_gxState.logicalViewport = viewport;
   set_render_viewport(map_logical_viewport(viewport));
 }
 
 void set_render_viewport(const gfx::Viewport& viewport) noexcept {
+  if (viewport.left != g_gxState.renderViewport.left || viewport.width != g_gxState.renderViewport.width ||
+      viewport.height != g_gxState.renderViewport.height) {
+    g_gxState.dirty |= DirtyUniform;
+  }
   g_gxState.renderViewport = viewport;
   gfx::set_viewport(viewport);
 }
@@ -497,384 +322,39 @@ void set_render_scissor(const gfx::ClipRect& scissor) noexcept {
 
 const gfx::TextureBind& get_texture(GXTexMapID id) noexcept { return g_gxState.textures[static_cast<size_t>(id)]; }
 
-void evict_texture_object(u32 texObjId) noexcept {
-  if (const auto it = s_textureObjectCaches.find(texObjId); it != s_textureObjectCaches.end()) {
-    clear_texture_dependency(texObjId, it->second.tlutObjId);
-    s_textureObjectCaches.erase(it);
-  }
-  // If there is a loaded slot with this ID, mark it as no_cache to avoid inserting it when it's resolved.
-  // This also handles the case where the texture was created, loaded, and immediately destroyed before we resolved it.
-  for (auto& obj : g_gxState.loadedTextures) {
-    if (obj.texObjId == texObjId) {
-      obj.set_no_cache(true);
-    }
-  }
-}
-
-void evict_tlut_object(u32 tlutObjId) noexcept {
-  if (const auto it = s_tlutObjectCaches.find(tlutObjId); it != s_tlutObjectCaches.end()) {
-    for (const u32 texObjId : it->second.staticTextureUsers) {
-      s_textureObjectCaches.erase(texObjId);
-    }
-    s_tlutObjectCaches.erase(it);
-  }
-  // If there is a loaded slot with this ID, mark it as no_cache to avoid inserting it when it's resolved.
-  // This also handles the case where the texture was created, loaded, and immediately destroyed before we resolved it.
-  for (auto& obj : g_gxState.loadedTluts) {
-    if (obj.tlutObjId == tlutObjId) {
-      obj.set_no_cache(true);
-    }
-  }
-}
-
-void clear_copy_texture_cache() noexcept {
-  release_xfb_copy();
-  g_gxState.copyTextures.clear();
-  g_gxState.copyTextureCache.clear();
-  for (auto& [_, cache] : s_tlutObjectCaches) {
-    cache.dynamicPaletteTextures.clear();
-  }
-}
-
-void clear_static_texture_cache() noexcept { s_staticTextureCacheClearPending.store(true, std::memory_order_release); }
-
-void evict_copy_texture(const void* dest) noexcept {
-  absl::flat_hash_set<const void*> sourceIdentities;
-  if (const auto it = g_gxState.copyTextures.find(dest); it != g_gxState.copyTextures.end()) {
-    if (it->second.handle) {
-      sourceIdentities.insert(it->second.handle.get());
-    }
-    g_gxState.copyTextures.erase(it);
-  }
-
-  for (auto it = g_gxState.copyTextureCache.begin(); it != g_gxState.copyTextureCache.end();) {
-    if (it->first.dest == dest) {
-      if (it->second.handle) {
-        sourceIdentities.insert(it->second.handle.get());
-      }
-      g_gxState.copyTextureCache.erase(it++);
-    } else {
-      ++it;
-    }
-  }
-
-  if (sourceIdentities.empty()) {
-    return;
-  }
-
-  for (auto& [_, cache] : s_tlutObjectCaches) {
-    for (auto it = cache.dynamicPaletteTextures.begin(); it != cache.dynamicPaletteTextures.end();) {
-      if (sourceIdentities.contains(it->first.sourceIdentity)) {
-        cache.dynamicPaletteTextures.erase(it++);
-      } else {
-        ++it;
-      }
-    }
-  }
-}
-
-void resolve_sampled_textures(const ShaderInfo& info) noexcept {
-  ZoneScoped;
-
-  for (u32 i = 0; i < MaxTextures; ++i) {
-    if (!info.sampledTextures.test(i)) {
-      continue;
-    }
-
-    GXTexObj_ obj = g_gxState.loadedTextures[i];
-    auto& textureBind = g_gxState.textures[i];
-    // a retail slot (raw registers, data from guest memory) unchanged within this texture generation
-    const bool raw = obj.texObjId == 0 && !obj.has_data() && raw_texture_cache_on();
-    ++s_rawStats.resolves;
-    static const bool copyLog = std::getenv("AURORA_COPY_LOG") != nullptr;
-    if (copyLog) {
-      // the samples of textures in the copies' region (F-Zero's face board: 0x01235FA0-0x01240040)
-      const u32 phys = (obj.image3 & 0x001FFFFFu) << 5;
-      if (phys >= 0x01200000u && phys < 0x01280000u) {
-        GXTexObj_ probe = obj;
-        recomp::resolve_texture_data(probe);
-        std::fprintf(stderr, "[copy-use] slot %u phys %08X data %p %ux%u fmt %u memo %d copy %s\n", i, phys,
-                     probe.data, probe.width(), probe.height(), probe.format(),
-                     raw && s_rawBindMemo[i].generation == s_rawTextureGeneration ? 1 : 0,
-                     g_gxState.copyTextures.contains(probe.data) ? "found" : "none");
-      }
-    }
-    if (raw) {
-      const auto& memo = s_rawBindMemo[i];
-      if (memo.generation == s_rawTextureGeneration && memo.mode0 == obj.mode0 && memo.mode1 == obj.mode1 &&
-          memo.image0 == obj.image0 && memo.image3 == obj.image3 && memo.tlut == static_cast<u32>(obj.tlut) &&
-          memo.tlutValid == g_gxState.loadedTextureTlutValid[i] &&
-          memo.tlutOffset == g_gxState.loadedTextureTlutTmemOffsets[i] &&
-          memo.tlutFormat == static_cast<u32>(g_gxState.loadedTextureTlutFormats[i])) {
-        ++s_rawStats.memoHits;
-        textureBind = memo.bind;
-        continue;
-      }
-    }
-    recomp::resolve_texture_data(obj);
-    if (obj.texObjId != 0 && obj.texObjId == textureBind.texObj.texObjId &&
-        obj.texDataVersion == textureBind.texObj.texDataVersion) {
-      // Texture bind unchanged
-      continue;
-    }
-
-    gfx::TextureHandle handle;
-    const auto copyIt = g_gxState.copyTextures.find(obj.data);
-    const GXState::CopyTextureRef* copyRef = copyIt != g_gxState.copyTextures.end() ? &copyIt->second : nullptr;
-    if (is_palette_format(obj.format())) {
-      GXTlutObj_ recompTlut{};
-      const GXTlutObj_* tlut = nullptr;
-      if (obj.texObjId == 0) {
-        if (recomp::resolve_texture_tlut(i, &recompTlut)) {
-          tlut = &recompTlut;
-        }
-      }
-      if (tlut == nullptr) {
-        const auto tlutIdx = static_cast<size_t>(obj.tlut);
-        if (tlutIdx < g_gxState.loadedTluts.size() && g_gxState.loadedTluts[tlutIdx].data != nullptr) {
-          tlut = &g_gxState.loadedTluts[tlutIdx];
-        }
-      }
-      if (tlut == nullptr) {
-        if (recomp::resolve_texture_tlut(i, &recompTlut)) {
-          tlut = &recompTlut;
-        }
-      }
-      if (tlut != nullptr) {
-        if (copyRef != nullptr) {
-          handle = resolve_dynamic_palette_texture(obj, *copyRef, *tlut);
-        } else if (obj.has_data()) {
-          handle = resolve_static_palette_texture(obj, *tlut);
-        }
-      }
-    } else if (copyRef != nullptr) {
-      handle = copyRef->handle;
-    } else if (obj.has_data()) {
-      handle = resolve_static_texture(obj);
-    }
-
-    obj.mFormat = resolved_format_for_handle(handle);
-    textureBind = gfx::TextureBind{obj, std::move(handle)};
-    if (raw) {
-      const GXTexObj_& regs = g_gxState.loadedTextures[i];
-      s_rawBindMemo[i] = RawBindMemo{
-          .generation = s_rawTextureGeneration,
-          .mode0 = regs.mode0,
-          .mode1 = regs.mode1,
-          .image0 = regs.image0,
-          .image3 = regs.image3,
-          .tlutValid = g_gxState.loadedTextureTlutValid[i],
-          .tlutOffset = g_gxState.loadedTextureTlutTmemOffsets[i],
-          .tlutFormat = static_cast<u32>(g_gxState.loadedTextureTlutFormats[i]),
-          .tlut = static_cast<u32>(regs.tlut),
-          .bind = textureBind,
-      };
-    }
-  }
-}
-
-void end_raw_texture_generation() noexcept { ++s_rawTextureGeneration; }
-
-void report_raw_texture_stats() noexcept {
-  static const bool on = std::getenv("AURORA_TEXCACHE_STATS") != nullptr;
-  if (on) {
-    std::fprintf(stderr,
-                 "[texcache] resolves=%llu memo_hits=%llu hashed=%llu hashed_kb=%llu hits=%llu creates=%llu "
-                 "entries=%zu\n",
-                 static_cast<unsigned long long>(s_rawStats.resolves),
-                 static_cast<unsigned long long>(s_rawStats.memoHits),
-                 static_cast<unsigned long long>(s_rawStats.hashed),
-                 static_cast<unsigned long long>(s_rawStats.hashedBytes / 1024),
-                 static_cast<unsigned long long>(s_rawStats.hits), static_cast<unsigned long long>(s_rawStats.creates),
-                 s_rawTextureCache.size());
-  }
-  s_rawStats = {};
-}
-
-static inline wgpu::BlendFactor to_blend_factor(GXBlendFactor fac, bool isDst) {
-  switch (fac) {
-    DEFAULT_FATAL("invalid blend factor {}", underlying(fac));
-  case GX_BL_ZERO:
-    return wgpu::BlendFactor::Zero;
-  case GX_BL_ONE:
-    return wgpu::BlendFactor::One;
-  case GX_BL_SRCCLR: // + GX_BL_DSTCLR
-    if (isDst) {
-      return wgpu::BlendFactor::Src;
-    } else {
-      return wgpu::BlendFactor::Dst;
-    }
-  case GX_BL_INVSRCCLR: // + GX_BL_INVDSTCLR
-    if (isDst) {
-      return wgpu::BlendFactor::OneMinusSrc;
-    } else {
-      return wgpu::BlendFactor::OneMinusDst;
-    }
-  case GX_BL_SRCALPHA:
-    return wgpu::BlendFactor::SrcAlpha;
-  case GX_BL_INVSRCALPHA:
-    return wgpu::BlendFactor::OneMinusSrcAlpha;
-  case GX_BL_DSTALPHA:
-    return wgpu::BlendFactor::DstAlpha;
-  case GX_BL_INVDSTALPHA:
-    return wgpu::BlendFactor::OneMinusDstAlpha;
-  }
-}
-
-static inline wgpu::CompareFunction to_compare_function(GXCompare func) {
-  switch (func) {
-    DEFAULT_FATAL("invalid depth fn {}", underlying(func));
-  case GX_NEVER:
-    return wgpu::CompareFunction::Never;
-  case GX_LESS:
-    return UseReversedZ ? wgpu::CompareFunction::Greater : wgpu::CompareFunction::Less;
-  case GX_EQUAL:
-    return wgpu::CompareFunction::Equal;
-  case GX_LEQUAL:
-    return UseReversedZ ? wgpu::CompareFunction::GreaterEqual : wgpu::CompareFunction::LessEqual;
-  case GX_GREATER:
-    return UseReversedZ ? wgpu::CompareFunction::Less : wgpu::CompareFunction::Greater;
-  case GX_NEQUAL:
-    return wgpu::CompareFunction::NotEqual;
-  case GX_GEQUAL:
-    return UseReversedZ ? wgpu::CompareFunction::LessEqual : wgpu::CompareFunction::GreaterEqual;
-  case GX_ALWAYS:
-    return wgpu::CompareFunction::Always;
-  }
-}
-
-static inline wgpu::BlendState to_blend_state(GXBlendMode mode, GXBlendFactor srcFac, GXBlendFactor dstFac,
-                                              GXLogicOp op, u32 dstAlpha) {
-  wgpu::BlendComponent colorBlendComponent;
-  switch (mode) {
-    DEFAULT_FATAL("unsupported blend mode {}", underlying(mode));
-  case GX_BM_NONE:
-    colorBlendComponent = {
-        .operation = wgpu::BlendOperation::Add,
-        .srcFactor = wgpu::BlendFactor::One,
-        .dstFactor = wgpu::BlendFactor::Zero,
-    };
-    break;
-  case GX_BM_BLEND:
-    colorBlendComponent = {
-        .operation = wgpu::BlendOperation::Add,
-        .srcFactor = to_blend_factor(srcFac, false),
-        .dstFactor = to_blend_factor(dstFac, true),
-    };
-    break;
-  case GX_BM_SUBTRACT:
-    colorBlendComponent = {
-        .operation = wgpu::BlendOperation::ReverseSubtract,
-        .srcFactor = wgpu::BlendFactor::One,
-        .dstFactor = wgpu::BlendFactor::One,
-    };
-    break;
-  case GX_BM_LOGIC:
-    switch (op) {
-      DEFAULT_FATAL("unsupported logic op {}", underlying(op));
-    case GX_LO_CLEAR:
-      colorBlendComponent = {
-          .operation = wgpu::BlendOperation::Add,
-          .srcFactor = wgpu::BlendFactor::Zero,
-          .dstFactor = wgpu::BlendFactor::Zero,
-      };
-      break;
-    case GX_LO_COPY:
-      colorBlendComponent = {
-          .operation = wgpu::BlendOperation::Add,
-          .srcFactor = wgpu::BlendFactor::One,
-          .dstFactor = wgpu::BlendFactor::Zero,
-      };
-      break;
-    case GX_LO_NOOP:
-      colorBlendComponent = {
-          .operation = wgpu::BlendOperation::Add,
-          .srcFactor = wgpu::BlendFactor::Zero,
-          .dstFactor = wgpu::BlendFactor::One,
-      };
-      break;
-    }
-    break;
-  }
-  wgpu::BlendComponent alphaBlendComponent;
-  if (dstAlpha != UINT32_MAX) {
-    alphaBlendComponent = wgpu::BlendComponent{
-        .operation = wgpu::BlendOperation::Add,
-        .srcFactor = wgpu::BlendFactor::Constant,
-        .dstFactor = wgpu::BlendFactor::Zero,
-    };
-  } else {
-    alphaBlendComponent = colorBlendComponent;
-  }
-  return {
-      .color = colorBlendComponent,
-      .alpha = alphaBlendComponent,
-  };
-}
-
-static inline wgpu::ColorWriteMask to_write_mask(bool colorUpdate, bool alphaUpdate) {
-  wgpu::ColorWriteMask writeMask = wgpu::ColorWriteMask::None;
-  if (colorUpdate) {
-    writeMask |= wgpu::ColorWriteMask::Red | wgpu::ColorWriteMask::Green | wgpu::ColorWriteMask::Blue;
-  }
-  if (alphaUpdate) {
-    writeMask |= wgpu::ColorWriteMask::Alpha;
-  }
-  return writeMask;
-}
-
-static inline wgpu::PrimitiveState to_primitive_state(GXCullMode gx_cullMode) {
-  auto cullMode = wgpu::CullMode::None;
-  switch (gx_cullMode) {
-    DEFAULT_FATAL("unsupported cull mode {}", underlying(gx_cullMode));
-  case GX_CULL_FRONT:
-    cullMode = wgpu::CullMode::Front;
-    break;
-  case GX_CULL_BACK:
-    cullMode = wgpu::CullMode::Back;
-    break;
-  case GX_CULL_ALL:
-    // WebGPU has no "Cull Both", map to Front since render() will drop the draw.
-    cullMode = wgpu::CullMode::Front;
-    break;
-  case GX_CULL_NONE:
-    break;
-  }
-  return {
-      .topology = wgpu::PrimitiveTopology::TriangleList,
-      .stripIndexFormat = wgpu::IndexFormat::Undefined,
-      .frontFace = wgpu::FrontFace::CW,
-      .cullMode = cullMode,
-  };
-}
-
-wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu::VertexBufferLayout> vtxBuffers,
+wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout,
+                                    const PipelineOptions& options, ArrayRef<wgpu::VertexBufferLayout> vtxBuffers,
                                     wgpu::ShaderModule shader, const char* label) noexcept {
   ZoneScoped;
   const float depthBias = (UseReversedZ ? -1.0f : 1.0f) * std::bit_cast<float>(config.polygonOffsetBits);
   const float depthBiasSlopeScale = (UseReversedZ ? -1.0f : 1.0f) * std::bit_cast<float>(config.polygonOffsetScaleBits);
-  const float depthBiasClamp = webgpu::g_hasCoreFeatures
-                                   ? std::bit_cast<float>(config.polygonOffsetClampBits)
-                                   : 0.0f;
+  const float depthBiasClamp = webgpu::g_hasCoreFeatures ? std::bit_cast<float>(config.polygonOffsetClampBits) : 0.0f;
+  const bool writesDepth = config.depthCompare && options.depthUpdate;
   const wgpu::DepthStencilState depthStencil{
-      .format = g_graphicsConfig.depthFormat,
-      .depthWriteEnabled = config.depthCompare && config.depthUpdate,
+      .format = layout.depthStencilFormat,
+      .depthWriteEnabled = writesDepth,
       .depthCompare = config.depthCompare ? to_compare_function(config.depthFunc) : wgpu::CompareFunction::Always,
       .depthBias = round_away_from_zero<int32_t>(depthBias),
       .depthBiasSlopeScale = depthBiasSlopeScale,
       .depthBiasClamp = depthBiasClamp,
   };
-  const auto blendState =
-      to_blend_state(config.blendMode, config.blendFacSrc, config.blendFacDst, config.blendOp, config.dstAlpha);
-  const std::array colorTargets{wgpu::ColorTargetState{
-      .format = g_graphicsConfig.surfaceConfiguration.format,
-      .blend = &blendState,
-      .writeMask = to_write_mask(config.colorUpdate, config.alphaUpdate),
-  }};
+  const auto blendState = to_blend_state(config.blendMode, config.blendFacSrc, config.blendFacDst, config.blendOp,
+                                         config.dstAlpha, options.dstAlphaMode == DstAlphaMode::DualSource);
+  std::array<wgpu::ColorTargetState, gfx::MaxColorAttachments> colorTargets{};
+  for (uint32_t i = 0; i < layout.colorAttachmentCount; ++i) {
+    colorTargets[i] = {
+        .format = layout.colorAttachments[i].format,
+        .writeMask = layout.colorAttachments[i].semantic == gfx::ColorAttachmentSemantic::Normal && writesDepth
+                         ? wgpu::ColorWriteMask::All
+                         : wgpu::ColorWriteMask::None,
+    };
+  }
+  colorTargets[gfx::SceneColorAttachmentIndex].blend = &blendState;
+  colorTargets[gfx::SceneColorAttachmentIndex].writeMask = to_write_mask(options.colorUpdate, options.alphaUpdate);
   const wgpu::FragmentState fragmentState{
       .module = shader,
       .entryPoint = "fs_main",
-      .targetCount = colorTargets.size(),
+      .targetCount = layout.colorAttachmentCount,
       .targets = colorTargets.data(),
   };
   const wgpu::RenderPipelineDescriptor descriptor{
@@ -888,11 +368,8 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu:
               .buffers = vtxBuffers.data(),
           },
       .primitive = to_primitive_state(config.cullMode),
-      .depthStencil = &depthStencil,
-      .multisample =
-          wgpu::MultisampleState{
-              .count = config.msaaSamples,
-          },
+      .depthStencil = layout.depthStencilFormat != wgpu::TextureFormat::Undefined ? &depthStencil : nullptr,
+      .multisample = wgpu::MultisampleState{.count = layout.sampleCount},
       .fragment = &fragmentState,
   };
   return g_device.CreateRenderPipeline(&descriptor);
@@ -902,7 +379,9 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
   ZoneScoped;
 
   const auto& vtxFmt = g_gxState.vtxFmts[fmt];
+  config.shaderConfig = {};
   config.shaderConfig.fogType = g_gxState.fog.type;
+  config.shaderConfig.fogRangeEnabled = g_gxState.fog.rangeEnabled;
   u8 vtxOffset = 0;
   for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
     const auto attr = static_cast<GXAttr>(i);
@@ -982,22 +461,34 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
   }
   const auto cullMode = config.shaderConfig.lineMode == 0 ? g_gxState.cullMode : GX_CULL_NONE;
   const auto [polygonOffset, polygonOffsetScale] = polygon_offset_for_cull_mode(cullMode);
+  const bool hasAlpha = efb_has_alpha(g_gxState.pixelFmt);
+  const bool alphaUpdate = hasAlpha && g_gxState.alphaUpdate;
+  const auto blendFactor = [hasAlpha](GXBlendFactor factor) {
+    if (!hasAlpha) {
+      if (factor == GX_BL_DSTALPHA) {
+        return GX_BL_ONE;
+      }
+      if (factor == GX_BL_INVDSTALPHA) {
+        return GX_BL_ZERO;
+      }
+    }
+    return factor;
+  };
   config = {
-      .msaaSamples = gfx::get_sample_count(),
       .shaderConfig = config.shaderConfig,
       .depthFunc = g_gxState.depthFunc,
       .cullMode = cullMode,
       .blendMode = g_gxState.blendMode,
-      .blendFacSrc = g_gxState.blendFacSrc,
-      .blendFacDst = g_gxState.blendFacDst,
+      .blendFacSrc = blendFactor(g_gxState.blendFacSrc),
+      .blendFacDst = blendFactor(g_gxState.blendFacDst),
       .blendOp = g_gxState.blendOp,
-      .dstAlpha = g_gxState.dstAlpha,
+      .dstAlpha = alphaUpdate ? g_gxState.dstAlpha : UINT32_MAX,
       .polygonOffsetBits = std::bit_cast<uint32_t>(polygonOffset),
       .polygonOffsetScaleBits = std::bit_cast<uint32_t>(polygonOffsetScale),
       .polygonOffsetClampBits = std::bit_cast<uint32_t>(g_gxState.clamp),
       .depthCompare = g_gxState.depthCompare,
       .depthUpdate = g_gxState.depthUpdate,
-      .alphaUpdate = g_gxState.alphaUpdate,
+      .alphaUpdate = alphaUpdate,
       .colorUpdate = g_gxState.colorUpdate,
   };
 }
@@ -1099,14 +590,15 @@ void initialize() noexcept {
   }
   {
     const std::array layouts{
-        gfx::g_staticBindGroupLayout,
-        gfx::g_uniformBindGroupLayout,
+        gfx::detail::resources().staticBindGroupLayout,
+        gfx::detail::resources().uniformBindGroupLayout,
         sTextureBindGroupLayout,
     };
     const wgpu::PipelineLayoutDescriptor desc{
         .label = "GX Pipeline Layout",
         .bindGroupLayoutCount = layouts.size(),
         .bindGroupLayouts = layouts.data(),
+        .immediateSize = sizeof(DrawImmediateData),
     };
     sPipelineLayout = g_device.CreatePipelineLayout(&desc);
   }
@@ -1114,118 +606,12 @@ void initialize() noexcept {
 
 void shutdown() noexcept {
   // TODO we should probably store this all in g_state.gx instead
-  sSamplerBindGroupLayout = {};
   sTextureBindGroupLayout = {};
-  {
-    std::lock_guard lock{sBindGroupLayoutMutex};
-    sUniformBindGroupLayouts.clear();
-    sTextureBindGroupLayouts.clear();
-  }
   for (auto& item : g_gxState.textures) {
     item.ref.reset();
   }
-  s_textureObjectCaches.clear();
-  s_tlutObjectCaches.clear();
-  s_rawTextureCache.clear();
-  s_rawTextureAtAddress.clear();
-  s_rawBindMemo.fill({});
   g_gxState.loadedTextures.fill({});
   g_gxState.loadedTluts.fill({});
-  g_gxState.loadedTmemTluts.fill({});
-  g_gxState.loadedTextureTlutValid.fill(false);
-  g_gxState.loadedTextureTlutTmemOffsets.fill(0);
-  g_gxState.loadedTextureTlutFormats.fill(GX_TL_IA8);
-  clear_copy_texture_cache();
+  texture::shutdown();
 }
-} // namespace aurora::gx
-
-static wgpu::AddressMode wgpu_address_mode(GXTexWrapMode mode) {
-  switch (mode) {
-    DEFAULT_FATAL("invalid wrap mode {}", underlying(mode));
-  case GX_CLAMP:
-    return wgpu::AddressMode::ClampToEdge;
-  case GX_REPEAT:
-    return wgpu::AddressMode::Repeat;
-  case GX_MIRROR:
-    return wgpu::AddressMode::MirrorRepeat;
-  }
-}
-
-static std::pair<wgpu::FilterMode, wgpu::MipmapFilterMode> wgpu_filter_mode(GXTexFilter filter) {
-  switch (filter) {
-    DEFAULT_FATAL("invalid filter mode {}", static_cast<int>(filter));
-  case GX_NEAR:
-    return {wgpu::FilterMode::Nearest, wgpu::MipmapFilterMode::Undefined};
-  case GX_LINEAR:
-    return {wgpu::FilterMode::Linear, wgpu::MipmapFilterMode::Undefined};
-  case GX_NEAR_MIP_NEAR:
-    return {wgpu::FilterMode::Nearest, wgpu::MipmapFilterMode::Nearest};
-  case GX_LIN_MIP_NEAR:
-    return {wgpu::FilterMode::Linear, wgpu::MipmapFilterMode::Nearest};
-  case GX_NEAR_MIP_LIN:
-    return {wgpu::FilterMode::Nearest, wgpu::MipmapFilterMode::Linear};
-  case GX_LIN_MIP_LIN:
-    return {wgpu::FilterMode::Linear, wgpu::MipmapFilterMode::Linear};
-  }
-}
-
-// The game's own maximum (2x, 4x), as the hardware and Dolphin at its default; AURORA_ANISO_GX=0 scales it to the
-// config's maximum (Aurora's enhancement: 8x, 16x)
-static bool anisoAsGx() {
-  static const bool v = [] {
-    const char* e = std::getenv("AURORA_ANISO_GX");
-    return e == nullptr || e[0] != '0';
-  }();
-  return v;
-}
-
-static u16 wgpu_aniso(GXAnisotropy aniso) {
-  switch (aniso) {
-    DEFAULT_FATAL("invalid aniso {}", static_cast<int>(aniso));
-  case GX_ANISO_1:
-  case GX_MAX_ANISOTROPY:
-    return 1;
-  case GX_ANISO_2:
-    return anisoAsGx() ? 2 : std::max<u16>(aurora::webgpu::g_graphicsConfig.textureAnisotropy / 2, 1);
-  case GX_ANISO_4:
-    return anisoAsGx() ? 4 : std::max<u16>(aurora::webgpu::g_graphicsConfig.textureAnisotropy, 1);
-  }
-}
-
-wgpu::SamplerDescriptor aurora::gfx::TextureBind::get_descriptor() const noexcept {
-  auto [minFilter, mipFilter] = wgpu_filter_mode(texObj.min_filter());
-  auto [magFilter, _] = wgpu_filter_mode(texObj.mag_filter());
-  const bool mipsEnabled = mipFilter != wgpu::MipmapFilterMode::Undefined;
-  float minLod = texObj.min_lod();
-  float maxLod = texObj.max_lod();
-  u16 maxAnisotropy = wgpu_aniso(texObj.max_aniso());
-  if (ref && ref->isReplacement) {
-    minLod = 0.f;
-    maxLod = 1000.f;
-    if (!mipsEnabled) {
-      mipFilter = wgpu::MipmapFilterMode::Nearest;
-    }
-  } else if (mipFilter == wgpu::MipmapFilterMode::Undefined) {
-    minLod = 0.f;
-    maxLod = 0.f;
-  }
-  if ((ref && ref->hasArbitraryMips) || !mipsEnabled) {
-    maxAnisotropy = 1;
-  } else if (maxAnisotropy > 1) {
-    magFilter = wgpu::FilterMode::Linear;
-    minFilter = wgpu::FilterMode::Linear;
-    mipFilter = wgpu::MipmapFilterMode::Linear;
-  }
-  return {
-      .label = "Generated Filtering Sampler",
-      .addressModeU = wgpu_address_mode(texObj.wrap_s()),
-      .addressModeV = wgpu_address_mode(texObj.wrap_t()),
-      .addressModeW = wgpu::AddressMode::Repeat,
-      .magFilter = magFilter,
-      .minFilter = minFilter,
-      .mipmapFilter = mipFilter,
-      .lodMinClamp = minLod,
-      .lodMaxClamp = maxLod,
-      .maxAnisotropy = maxAnisotropy,
-  };
 } // namespace aurora::gx

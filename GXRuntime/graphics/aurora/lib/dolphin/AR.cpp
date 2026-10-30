@@ -1,4 +1,4 @@
-#include <dolphin/ar.h>
+#include <dolphin/arq.h>
 #include "../internal.hpp"
 #include "dolphin/os.h"
 
@@ -9,7 +9,7 @@ static u32* AR_BlockLength;
 static u32 AR_FreeBlocks;
 static BOOL AR_init_flag;
 
-#define ARAM_STACK_START 0x4000;
+#define ARAM_STACK_START 0x4000
 
 // ARAM emulation: allocate a large buffer to simulate the GameCube's Auxiliary RAM.
 // ARAM "addresses" are offsets into this buffer. On GameCube, ARAM is 16 MB starting
@@ -79,7 +79,9 @@ u32 ARInit(u32* stack_index_addr, u32 num_entries) {
 
 u32 ARGetSize(void) { return aurora::g_config.mem2Size; }
 
+#if !defined(_MSC_VER)
 #pragma mark ARQ
+#endif
 void ARQPostRequest(ARQRequest* request, u32 owner, u32 type, u32 priority, uintptr_t source, uintptr_t dest,
                     u32 length, ARQCallback callback) {
   // Emulate ARAM DMA transfers using memcpy.

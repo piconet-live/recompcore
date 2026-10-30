@@ -1,10 +1,15 @@
 add_library(aurora_gx STATIC
         lib/gfx/clear.cpp
-        lib/gfx/common.cpp
-        lib/gfx/depth_peek.cpp
-        lib/gfx/efb_readback.cpp
+        lib/gfx/encoding.cpp
+        lib/gfx/frame.cpp
         lib/gfx/pipeline_cache.cpp
+        lib/gfx/readback/copy_pack.cpp
+        lib/gfx/readback/efb_gather.cpp
+        lib/gfx/readback/gpu.cpp
+        lib/gfx/readback/readback.cpp
+        lib/gfx/recording.cpp
         lib/gfx/render_worker.cpp
+        lib/gfx/resource_cache.cpp
         lib/gfx/dds_io.cpp
         lib/gfx/tex_copy_conv.cpp
         lib/gfx/tex_palette_conv.cpp
@@ -14,11 +19,13 @@ add_library(aurora_gx STATIC
         lib/gfx/texture_replacement.cpp
         lib/gx/attr_fmt.cpp
         lib/gx/command_processor.cpp
+        lib/gx/regs.cpp
         lib/gx/dl.cpp
         lib/gx/fifo.cpp
         lib/gx/gx.cpp
+        lib/gx/texture.cpp
         lib/gx/pipeline.cpp
-        lib/gx/recomp.cpp
+        lib/gx/readback.cpp
         lib/gx/shader.cpp
         lib/gx/shader_info.cpp
         lib/dolphin/gx/GXBump.cpp
@@ -46,8 +53,8 @@ add_library(aurora_gx STATIC
 add_library(aurora::gx ALIAS aurora_gx)
 set_target_properties(aurora_gx PROPERTIES FOLDER "aurora")
 
-target_link_libraries(aurora_gx PUBLIC aurora::core dawn::webgpu_dawn xxhash)
-target_link_libraries(aurora_gx PRIVATE absl::btree absl::flat_hash_map sqlite3 TracyClient PNG::PNG)
+target_link_libraries(aurora_gx PUBLIC aurora::core dawn::webgpu_dawn xxHash::xxhash)
+target_link_libraries(aurora_gx PRIVATE absl::btree absl::flat_hash_map sqlite3 Tracy::TracyClient PNG::PNG)
 target_compile_definitions(aurora_gx PRIVATE WEBGPU_DAWN)
 
 if (AURORA_ENABLE_RMLUI)
@@ -55,15 +62,4 @@ if (AURORA_ENABLE_RMLUI)
         lib/rmlui/pipeline.cpp
         lib/rmlui/pipeline.hpp
     )
-endif ()
-
-# gxcore (63/S12): Dolphin-ported GX core draws on this substrate. Present
-# only when the fork builds inside GXRuntime with the recomp modules on.
-if (TARGET GXRuntime::gxcore)
-    target_sources(aurora_gx PRIVATE
-        lib/gfx/gxcore_draw.cpp
-        lib/gfx/gxcore_draw.hpp
-    )
-    target_link_libraries(aurora_gx PRIVATE GXRuntime::gxcore)
-    target_compile_definitions(aurora_gx PRIVATE AURORA_ENABLE_GXCORE=1)
 endif ()

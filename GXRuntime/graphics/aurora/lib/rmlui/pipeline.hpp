@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../gfx/common.hpp"
+#include "../gfx/types.hpp"
 #include "WebGPURenderInterface.hpp"
 
 #include <array>
@@ -10,7 +10,7 @@
 
 namespace aurora::rmlui {
 
-constexpr uint32_t RmlPipelineConfigVersion = 2;
+constexpr uint32_t RmlPipelineConfigVersion = 3;
 
 enum class PipelineKind : uint32_t {
   Geometry,
@@ -23,6 +23,8 @@ enum class PipelineKind : uint32_t {
   RegionBlit,
   DropShadow,
   MaskImage,
+  Glass,
+  ImageEffects,
 };
 
 enum class VertexLayoutKind : uint32_t {

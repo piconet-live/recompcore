@@ -1,24 +1,21 @@
 include(FetchContent)
 
 # Don't build tests for third party dependencies
-set(_prev_build_testing ${BUILD_TESTING})
-set(BUILD_TESTING OFF CACHE INTERNAL "Build tests" FORCE)
+set(BUILD_TESTING OFF CACHE INTERNAL "Build tests")
 set(SKIP_INSTALL_ALL ON)
-if (NOT DEFINED BUILD_SHARED_LIBS)
+if (WIN32 AND NOT DEFINED BUILD_SHARED_LIBS)
   set(_USE_SHARED ON)
 else ()
   set(_USE_SHARED OFF)
 endif ()
 
 function(aurora_find_package_global)
-  set(_PREV_FIND_PACKAGE_TARGETS_GLOBAL ${CMAKE_FIND_PACKAGE_TARGETS_GLOBAL})
-  set(CMAKE_FIND_PACKAGE_TARGETS_GLOBAL ON)
-  find_package(${ARGV})
-  set(CMAKE_FIND_PACKAGE_TARGETS_GLOBAL ${_PREV_FIND_PACKAGE_TARGETS_GLOBAL})
+  find_package(${ARGV} GLOBAL)
 endfunction()
 
 if (AURORA_ENABLE_GX)
   include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/AuroraDawnProvider.cmake)
+  set(AURORA_DAWN_IS_SHARED "${AURORA_DAWN_IS_SHARED}" PARENT_SCOPE)
 endif ()
 
 # Abseil is needed for core libraries. It normally comes via Dawn's vendor build.
@@ -50,7 +47,10 @@ endif ()
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/AuroraSDL3Provider.cmake)
 
-if (NOT TARGET xxhash)
+if (NOT TARGET xxHash::xxhash)
+  aurora_find_package_global(xxHash)
+endif ()
+if (NOT TARGET xxHash::xxhash)
   message(STATUS "aurora: Fetching xxhash")
   FetchContent_Declare(xxhash
     URL https://github.com/Cyan4973/xxHash/archive/refs/tags/v0.8.3.tar.gz
@@ -84,7 +84,7 @@ if (NOT TARGET xxhash)
   unset(_aurora_xxhash_had_bsl_cache)
   unset(_aurora_xxhash_had_bsl_var)
   unset(_aurora_xxhash_saved_bsl)
-  if (NOT TARGET xxhash)
+  if (NOT TARGET xxHash::xxhash)
     message(FATAL_ERROR "Failed to make xxhash available")
   endif ()
 else ()
@@ -115,15 +115,29 @@ if (AURORA_ENABLE_GX)
     aurora_find_package_global(ZLIB QUIET)
   endif ()
   if (NOT TARGET ZLIB::ZLIB)
+    find_package(PkgConfig)
+    if (PkgConfig_FOUND)
+      pkg_check_modules(zlib IMPORTED_TARGET GLOBAL zlib)
+      if (TARGET PkgConfig::zlib)
+        add_library(ZLIB::ZLIB ALIAS PkgConfig::zlib)
+      endif ()
+    endif ()
+  endif ()
+  if (NOT TARGET ZLIB::ZLIB)
     message(STATUS "aurora: Fetching zlib")
     set(ZLIB_BUILD_SHARED ${_USE_SHARED} CACHE BOOL "Enable building zlib shared library" FORCE)
     set(ZLIB_BUILD_TESTING OFF CACHE BOOL "Enable Zlib Examples as tests" FORCE)
     set(ZLIB_INSTALL OFF CACHE BOOL "Enable installation of zlib" FORCE)
     set(ZLIB_COMPAT ON CACHE BOOL "Use the compat version of zlib instead of the newer zlib-ng" FORCE)
+    if (MSVC AND CMAKE_C_COMPILER_ID STREQUAL "Clang" AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+      # zlib-ng's NEON LD4 probe passes GNU-style -march flags that clang-cl rejects
+      set(NEON_HAS_LD4 1 CACHE INTERNAL "")
+    endif ()
     FetchContent_Declare(
       ZLIB
       URL https://github.com/zlib-ng/zlib-ng/archive/refs/tags/2.3.3.tar.gz
       URL_HASH SHA256=f9c65aa9c852eb8255b636fd9f07ce1c406f061ec19a2e7d508b318ca0c907d1
+      PATCH_COMMAND ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/PatchZlib.cmake"
       DOWNLOAD_EXTRACT_TIMESTAMP FALSE
       EXCLUDE_FROM_ALL
     )
@@ -144,6 +158,16 @@ if (AURORA_ENABLE_GX)
       add_library(PNG::PNG ALIAS png_static)
     else ()
       aurora_find_package_global(PNG QUIET)
+      if (NOT TARGET PNG::PNG)
+        find_package(PkgConfig)
+        if (PkgConfig_FOUND)
+          pkg_check_modules(libpng IMPORTED_TARGET GLOBAL libpng)
+          if (TARGET PkgConfig::libpng)
+            target_link_libraries(PkgConfig::libpng INTERFACE ZLIB::ZLIB)
+            add_library(PNG::PNG ALIAS PkgConfig::libpng)
+          endif ()
+        endif ()
+      endif ()
     endif ()
   endif ()
   if (NOT TARGET PNG::PNG)
@@ -172,6 +196,15 @@ if (AURORA_ENABLE_GX)
 
   aurora_find_package_global(Freetype QUIET)
   if (NOT TARGET Freetype::Freetype)
+    find_package(PkgConfig)
+    if (PkgConfig_FOUND)
+      pkg_check_modules(freetype2 IMPORTED_TARGET GLOBAL freetype2)
+      if (TARGET PkgConfig::freetype2)
+        add_library(Freetype::Freetype ALIAS PkgConfig::freetype2)
+      endif ()
+    endif ()
+  endif ()
+  if (NOT TARGET Freetype::Freetype)
     message(STATUS "aurora: Fetching Freetype")
     set(FT_DISABLE_BROTLI ON CACHE BOOL "" FORCE)
     set(FT_DISABLE_HARFBUZZ ON CACHE BOOL "" FORCE)
@@ -188,50 +221,8 @@ if (AURORA_ENABLE_GX)
     message(STATUS "aurora: Using existing Freetype")
   endif ()
 
-  if (NOT TARGET imgui)
-    message(STATUS "aurora: Fetching imgui")
-    FetchContent_Declare(imgui
-      URL https://github.com/ocornut/imgui/archive/refs/tags/v1.91.9b-docking.tar.gz
-      URL_HASH SHA256=466fdef9b18de15f0bb6e288e3d00ffa3d82200ec458ce5e4f724a161d9528a5
-      DOWNLOAD_EXTRACT_TIMESTAMP FALSE
-      EXCLUDE_FROM_ALL
-    )
-    FetchContent_MakeAvailable(imgui)
-
-    add_library(imgui STATIC
-      ${imgui_SOURCE_DIR}/imgui.cpp
-      ${imgui_SOURCE_DIR}/imgui_demo.cpp
-      ${imgui_SOURCE_DIR}/imgui_draw.cpp
-      ${imgui_SOURCE_DIR}/imgui_tables.cpp
-      ${imgui_SOURCE_DIR}/imgui_widgets.cpp
-      ${imgui_SOURCE_DIR}/misc/cpp/imgui_stdlib.cpp
-    )
-    target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR})
-
-    add_library(imgui_backends STATIC
-      ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
-      ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp
-      ${imgui_SOURCE_DIR}/backends/imgui_impl_wgpu.cpp
-    )
-    target_compile_definitions(imgui_backends PRIVATE IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
-    target_link_libraries(imgui_backends PRIVATE imgui ${AURORA_SDL3_TARGET} dawn::webgpu_dawn)
-    target_link_libraries(imgui PUBLIC imgui_backends)
-
-    if (TARGET Freetype::Freetype)
-      target_sources(imgui PRIVATE ${imgui_SOURCE_DIR}/misc/freetype/imgui_freetype.cpp)
-      target_compile_definitions(imgui PUBLIC IMGUI_ENABLE_FREETYPE)
-      target_link_libraries(imgui PRIVATE Freetype::Freetype)
-    endif ()
-  else ()
-    message(STATUS "aurora: Using existing imgui")
-  endif ()
-
-  if (TARGET imgui)
-    target_include_directories(imgui PUBLIC ${PROJECT_SOURCE_DIR}/include)
-    target_compile_definitions(imgui PUBLIC IMGUI_USER_CONFIG="aurora/imgui_config.h")
-    target_sources(imgui PRIVATE ${PROJECT_SOURCE_DIR}/lib/imgui_config.cpp)
-    target_link_libraries(imgui PRIVATE ${AURORA_SDL3_TARGET})
-  endif ()
+  set(AURORA_IMGUI_IMPLEMENTATION ON)
+  include(../cmake/AuroraDearImguiProvider.cmake)
 
   aurora_find_package_global(SQLite3)
   if (TARGET SQLite3::SQLite3)
@@ -241,6 +232,16 @@ if (AURORA_ENABLE_GX)
     message(STATUS "aurora: Using existing sqlite3")
     add_library(sqlite3 ALIAS SQLite::SQLite3)
   else ()
+    find_package(PkgConfig)
+    if (PkgConfig_FOUND)
+      pkg_check_modules(sqlite3 IMPORTED_TARGET GLOBAL sqlite3)
+      if (TARGET PkgConfig::sqlite3)
+        add_library(sqlite3 ALIAS PkgConfig::sqlite3)
+      endif ()
+    endif ()
+  endif ()
+
+  if (NOT TARGET sqlite3)
     message(STATUS "aurora: Fetching sqlite3")
     FetchContent_Declare(sqlite3
       URL https://sqlite.org/2026/sqlite-amalgamation-3510300.zip
@@ -287,25 +288,27 @@ if (AURORA_ENABLE_GX)
   if (AURORA_ENABLE_RMLUI AND NOT TARGET RmlUi)
     message(STATUS "aurora: Fetching RmlUi")
     FetchContent_Declare(rmlui
-      URL https://github.com/mikke89/RmlUi/archive/f9b8c9e2935d5df2c7dff2c190d3968e99b0c3dc.tar.gz
-      URL_HASH SHA256=42b830abc2509a8c07cf02ba3313505de3a4642725654f489402022d8fefdd79
+      URL https://github.com/encounter/RmlUi/archive/f00a0fee38391b2f927114e11bea18dc0a7dba1e.tar.gz
+      URL_HASH SHA256=6d9fd1164b7873c9dfba72d724753bda9e3db8280c9af802eed8e2a12035f152
       DOWNLOAD_EXTRACT_TIMESTAMP FALSE
-      PATCH_COMMAND ${CMAKE_COMMAND}
-        -DRMLUI_SOURCE_DIR=<SOURCE_DIR>
-        -P "${CMAKE_CURRENT_LIST_DIR}/../cmake/patches/apply-rmlui-keyboard-showed-state.cmake"
       EXCLUDE_FROM_ALL
     )
-    FetchContent_MakeAvailable(rmlui)
+    block(SCOPE_FOR VARIABLES PROPAGATE rmlui_SOURCE_DIR rmlui_BINARY_DIR rmlui_POPULATED)
+      set(BUILD_SHARED_LIBS OFF) # Force block scope; RmlUi uses option(BUILD_SHARED_LIBS)
+      FetchContent_MakeAvailable(rmlui)
+    endblock()
 
     add_library(rmlui_backends STATIC ${rmlui_SOURCE_DIR}/Backends/RmlUi_Platform_SDL.cpp)
-    # TODO: maybe dont hardcode this to SDL3?
     target_compile_definitions(rmlui_backends PUBLIC RMLUI_SDL_VERSION_MAJOR=3)
     target_include_directories(rmlui_backends PUBLIC ${rmlui_SOURCE_DIR}/Backends)
     target_link_libraries(rmlui_backends PRIVATE rmlui ${AURORA_SDL3_TARGET})
   endif ()
 endif ()
 
-if (NOT TARGET TracyClient)
+if (NOT TARGET Tracy::TracyClient)
+  aurora_find_package_global(Tracy CONFIG)
+endif ()
+if (NOT TARGET Tracy::TracyClient)
   message(STATUS "aurora: Fetching Tracy")
 
   # Default to off, users can enable the cache variable if they want to use it.
@@ -315,8 +318,8 @@ if (NOT TARGET TracyClient)
 
   FetchContent_Declare(
           tracy
-          URL https://github.com/wolfpld/tracy/archive/6789e7d6f9a65ec98926b602097a33a9676d2606.tar.gz
-          URL_HASH SHA256=ebfe4fb50d7c254901979355c80a7d4cd33624aa2ec0fe90b3b238153cd5d69b
+          URL https://github.com/wolfpld/tracy/archive/refs/tags/v0.14.1.zip
+          URL_HASH SHA256=908f3a2917fa86a247abfcf85dcf04bad1db6986a4d40f94b70512f3e9e98d5b
           DOWNLOAD_EXTRACT_TIMESTAMP FALSE
           EXCLUDE_FROM_ALL
   )
@@ -326,6 +329,3 @@ if (NOT TARGET TracyClient)
     message(FATAL_ERROR "Failed to make TracyClient available")
   endif ()
 endif ()
-
-# Restore BUILD_TESTING setting for the rest of the project
-set(BUILD_TESTING ${_prev_build_testing} CACHE INTERNAL "Build tests" FORCE)

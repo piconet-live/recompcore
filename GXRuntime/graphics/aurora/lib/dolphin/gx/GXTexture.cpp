@@ -2,7 +2,6 @@
 #include "__gx.h"
 
 #include "../../gfx/texture.hpp"
-#include "../../gfx/texture_replacement.hpp"
 #include "dolphin/gx/GXAurora.h"
 
 #include <algorithm>
@@ -121,7 +120,7 @@ void GXInitTexObjLOD(GXTexObj* obj_, GXTexFilter minFilt, GXTexFilter magFilt, f
                      float lodBias, GXBool biasClamp, GXBool doEdgeLod, GXAnisotropy maxAniso) {
   auto* obj = reinterpret_cast<GXTexObj_*>(obj_);
   const float clampedBias = std::clamp(lodBias, -4.0f, 3.99f);
-  const auto lbias = static_cast<u8>(static_cast<int>(32.0f * clampedBias));
+  const auto lbias = static_cast<u8>(32.0f * clampedBias);
   SET_REG_FIELD(0, obj->mode0, 8, 9, lbias);
   SET_REG_FIELD(0, obj->mode0, 1, 4, magFilt == GX_LINEAR ? 1 : 0);
   SET_REG_FIELD(0, obj->mode0, 3, 5, GX2HWFiltConv[minFilt]);
@@ -175,7 +174,7 @@ void GXInitTexObjMinLOD(GXTexObj* obj_, float minLod) {
 void GXInitTexObjLODBias(GXTexObj* obj_, float lodBias) {
   auto* obj = reinterpret_cast<GXTexObj_*>(obj_);
   const float clampedBias = std::clamp(lodBias, -4.0f, 3.99f);
-  const auto lbias = static_cast<u8>(static_cast<int>(32.0f * clampedBias));
+  const auto lbias = static_cast<u8>(32.0f * clampedBias);
   SET_REG_FIELD(0, obj->mode0, 8, 9, lbias);
 }
 
@@ -317,7 +316,6 @@ void GXInitTlutObj(GXTlutObj* obj_, const void* data, GXTlutFmt format, u16 entr
 
   SET_REG_FIELD(0, obj->tlut, 2, 10, format);
   SET_REG_FIELD(0, obj->loadTlut0, 8, 24, 0x64);
-  aurora::gfx::texture_replacement::register_tlut(obj_, data, format, entries);
 }
 
 void GXInitTlutObjData(GXTlutObj* obj_, const void* data) {
@@ -338,7 +336,6 @@ void GXLoadTlut(const GXTlutObj* obj_, u32 idx) {
   GX_WRITE_RAS_REG(loadTlut1);
   __GXFlushTextureState();
 
-  aurora::gfx::texture_replacement::load_tlut(obj_, idx);
   emit_loaded_tlut_metadata(*obj, idx);
 }
 
