@@ -1328,8 +1328,8 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
                     ind_scale(indStage.scaleS), ind_scale(indStage.scaleT), texMapId);
     fragmentFnPre += fmt::format(
         "\n    // Indirect stage {0}"
-        "\n    var t_IndTexCoord{0} = 255.0 * textureSampleBias(tex{1}, tex{1}_samp, {2}, "
-        "ubuf.tex{1}_size_bias.z).abg;",
+        "\n    var t_IndTexCoord{0} = round(255.0 * textureSampleBias(tex{1}, tex{1}_samp, {2}, "
+        "ubuf.tex{1}_size_bias.z).abg);",
         i, texMapId, scaleExpr);
   }
   if (info.usedIndStages.any()) {
@@ -1433,20 +1433,25 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
       const bool useSimpleCoords = stage.indTexMtxId == GX_ITM_OFF && !stage.indTexAddPrev;
 
       // Wrap base coord and combine with the indirect translation.
-      auto wrap_comp = [](GXIndTexWrap wrap, std::string&& coord) -> std::string {
+      // The hardware masks the fixed-point coordinate (Dolphin: fixpoint_uv & (size << 7) - 1), so a negative one wraps
+      // up into 0..size. WGSL's % keeps the dividend's sign, which read the other half of a texture twice the wrap's size.
+      const auto wrap_to = [](u32 size, const std::string& coord) {
+        return fmt::format("({0} - {1}.0 * floor({0} / {1}.0))", coord, size);
+      };
+      auto wrap_comp = [&wrap_to](GXIndTexWrap wrap, std::string&& coord) -> std::string {
         switch (wrap) {
         case GX_ITW_OFF:
           return std::move(coord);
         case GX_ITW_256:
-          return fmt::format("({} % 256.0)", coord);
+          return wrap_to(256, coord);
         case GX_ITW_128:
-          return fmt::format("({} % 128.0)", coord);
+          return wrap_to(128, coord);
         case GX_ITW_64:
-          return fmt::format("({} % 64.0)", coord);
+          return wrap_to(64, coord);
         case GX_ITW_32:
-          return fmt::format("({} % 32.0)", coord);
+          return wrap_to(32, coord);
         case GX_ITW_16:
-          return fmt::format("({} % 16.0)", coord);
+          return wrap_to(16, coord);
         case GX_ITW_0:
           return "0.0";
         default:
