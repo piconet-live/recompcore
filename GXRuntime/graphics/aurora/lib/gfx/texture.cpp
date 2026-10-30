@@ -8,6 +8,7 @@
 #include "texture_convert.hpp"
 #include "../gx/gx_fmt.hpp"
 
+#include <cstdlib>
 #include <algorithm>
 #include <cstdint>
 #include <memory>
@@ -83,6 +84,16 @@ std::pair<wgpu::FilterMode, wgpu::MipmapFilterMode> wgpu_filter_mode(GXTexFilter
   }
 }
 
+// The game's own maximum (2x, 4x), as the hardware and Dolphin at its default; AURORA_ANISO_GX=0 scales it to the
+// config's maximum (Aurora's enhancement: 8x, 16x)
+bool aniso_as_gx() noexcept {
+  static const bool v = [] {
+    const char* e = std::getenv("AURORA_ANISO_GX");
+    return e == nullptr || e[0] != '0';
+  }();
+  return v;
+}
+
 u16 wgpu_aniso(GXAnisotropy aniso) {
   switch (aniso) {
     DEFAULT_FATAL("invalid aniso {}", static_cast<int>(aniso));
@@ -90,9 +101,9 @@ u16 wgpu_aniso(GXAnisotropy aniso) {
   case GX_MAX_ANISOTROPY:
     return 1;
   case GX_ANISO_2:
-    return std::max<u16>(webgpu::g_graphicsConfig.textureAnisotropy / 2, 1);
+    return aniso_as_gx() ? 2 : std::max<u16>(webgpu::g_graphicsConfig.textureAnisotropy / 2, 1);
   case GX_ANISO_4:
-    return std::max<u16>(webgpu::g_graphicsConfig.textureAnisotropy, 1);
+    return aniso_as_gx() ? 4 : std::max<u16>(webgpu::g_graphicsConfig.textureAnisotropy, 1);
   }
 }
 } // namespace
