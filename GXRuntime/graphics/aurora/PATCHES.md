@@ -31,6 +31,8 @@ ports do not need it); **local** = tools and diagnostics for GXRuntime's harness
 | 17 | Window letterbox from the frame's own present source, worked out on the render worker | upstream | 2aa1d92 (gxr/r3) |
 | 19 | A frame's fixed staging buffers never abort: draws with no room are dropped whole and counted (`AURORA_TEST_VERTEX_LIMIT`); the display copy's lines scale with the render target; a texture coordinate a draw does not send reads as zero (course 9 aborted on it) | upstream, to discuss | new (gxr/r3) |
 | 18 | Larger vertex (32 MiB), index (8 MiB) and storage (16 MiB) buffers: a retail frame overflowed 5 MiB of vertices (course 37) and the fixed staging buffer aborted | upstream, to discuss | new |
+| 20 | Every logic op, as Dolphin's approximation table has them (INV, SET, INVCOPY exact through what the shader outputs): a cached pipeline with GX_LO_INV was fatal at every later start | upstream | gxr/r3 |
+| 21 | A byte of 0xC0 or up is no draw: the unknown-opcode path, with the last commands read in the log | local | gxr/r3 |
 
 ## Not carried, and why
 

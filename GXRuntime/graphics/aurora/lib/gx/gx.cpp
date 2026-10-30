@@ -133,6 +133,99 @@ wgpu::BlendState to_blend_state(GXBlendMode mode, GXBlendFactor srcFac, GXBlendF
   case GX_BM_LOGIC:
     switch (op) {
       DEFAULT_FATAL("unsupported logic op {}", underlying(op));
+    // The rest as Dolphin's BlendingState::ApproximateLogicOpWithBlending has them (WebGPU has no logic ops); INV, SET
+    // and INVCOPY are exact, with what the shader outputs for them (logicOutput), the others approximate
+    case GX_LO_AND:
+      colorBlendComponent = {
+          .operation = wgpu::BlendOperation::Add,
+          .srcFactor = wgpu::BlendFactor::Dst,
+          .dstFactor = wgpu::BlendFactor::Zero,
+      };
+      break;
+    case GX_LO_REVAND:
+      colorBlendComponent = {
+          .operation = wgpu::BlendOperation::ReverseSubtract,
+          .srcFactor = wgpu::BlendFactor::One,
+          .dstFactor = wgpu::BlendFactor::OneMinusSrc,
+      };
+      break;
+    case GX_LO_INVAND:
+      colorBlendComponent = {
+          .operation = wgpu::BlendOperation::ReverseSubtract,
+          .srcFactor = wgpu::BlendFactor::Dst,
+          .dstFactor = wgpu::BlendFactor::One,
+      };
+      break;
+    case GX_LO_XOR:
+      colorBlendComponent = {
+          .operation = wgpu::BlendOperation::Add,
+          .srcFactor = wgpu::BlendFactor::OneMinusDst,
+          .dstFactor = wgpu::BlendFactor::OneMinusSrc,
+      };
+      break;
+    case GX_LO_OR:
+      colorBlendComponent = {
+          .operation = wgpu::BlendOperation::Add,
+          .srcFactor = wgpu::BlendFactor::OneMinusDst,
+          .dstFactor = wgpu::BlendFactor::One,
+      };
+      break;
+    case GX_LO_NOR:
+      colorBlendComponent = {
+          .operation = wgpu::BlendOperation::Add,
+          .srcFactor = wgpu::BlendFactor::OneMinusDst,
+          .dstFactor = wgpu::BlendFactor::OneMinusSrc,
+      };
+      break;
+    case GX_LO_EQUIV:
+      colorBlendComponent = {
+          .operation = wgpu::BlendOperation::Add,
+          .srcFactor = wgpu::BlendFactor::OneMinusDst,
+          .dstFactor = wgpu::BlendFactor::Zero,
+      };
+      break;
+    case GX_LO_INV:
+      colorBlendComponent = {
+          .operation = wgpu::BlendOperation::Add,
+          .srcFactor = wgpu::BlendFactor::OneMinusDst,
+          .dstFactor = wgpu::BlendFactor::Zero,
+      };
+      break;
+    case GX_LO_REVOR:
+      colorBlendComponent = {
+          .operation = wgpu::BlendOperation::Add,
+          .srcFactor = wgpu::BlendFactor::One,
+          .dstFactor = wgpu::BlendFactor::OneMinusDstAlpha,
+      };
+      break;
+    case GX_LO_INVCOPY:
+      colorBlendComponent = {
+          .operation = wgpu::BlendOperation::Add,
+          .srcFactor = wgpu::BlendFactor::One,
+          .dstFactor = wgpu::BlendFactor::Zero,
+      };
+      break;
+    case GX_LO_INVOR:
+      colorBlendComponent = {
+          .operation = wgpu::BlendOperation::Add,
+          .srcFactor = wgpu::BlendFactor::OneMinusDst,
+          .dstFactor = wgpu::BlendFactor::One,
+      };
+      break;
+    case GX_LO_NAND:
+      colorBlendComponent = {
+          .operation = wgpu::BlendOperation::Add,
+          .srcFactor = wgpu::BlendFactor::OneMinusDst,
+          .dstFactor = wgpu::BlendFactor::OneMinusSrc,
+      };
+      break;
+    case GX_LO_SET:
+      colorBlendComponent = {
+          .operation = wgpu::BlendOperation::Add,
+          .srcFactor = wgpu::BlendFactor::One,
+          .dstFactor = wgpu::BlendFactor::Zero,
+      };
+      break;
     case GX_LO_CLEAR:
       colorBlendComponent = {
           .operation = wgpu::BlendOperation::Add,
@@ -382,6 +475,10 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
   config.shaderConfig = {};
   config.shaderConfig.fogType = g_gxState.fog.type;
   config.shaderConfig.fogRangeEnabled = g_gxState.fog.rangeEnabled;
+  if (g_gxState.blendMode == GX_BM_LOGIC) {
+    const auto op = g_gxState.blendOp;
+    config.shaderConfig.logicOutput = op == GX_LO_INV || op == GX_LO_SET ? 1 : op == GX_LO_INVCOPY ? 2 : 0;
+  }
   u8 vtxOffset = 0;
   for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
     const auto attr = static_cast<GXAttr>(i);
