@@ -19,6 +19,7 @@
 #include "Core/HW/ProcessorInterface.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/FzgxProbe.h"
+#include "VideoCommon/FzgxFifoTest.h"
 #include "Core/System.h"
 #include "VideoCommon/Fifo.h"
 #include "VideoCommon/FrameRedraw.h"
@@ -580,6 +581,31 @@ void CommandProcessorManager::SetCpControlRegister()
 {
   const bool reads_turned_off =
       m_fifo.bFF_GPReadEnable.load(std::memory_order_relaxed) && !m_cp_ctrl_reg.GPReadEnable;
+  if (!m_fifo.bFF_GPReadEnable.load(std::memory_order_relaxed) && m_cp_ctrl_reg.GPReadEnable)
+    m_system.GetFifo().OnListHandedOver();
+  if (FzgxFifoTest::On() &&
+      (m_fifo.bFF_GPReadEnable.load(std::memory_order_relaxed) != 0) != (m_cp_ctrl_reg.GPReadEnable != 0))
+  {
+    auto& pi = m_system.GetProcessorInterface();
+    FzgxFifoTest::g_handovers.Note({static_cast<u32>(m_cp_ctrl_reg.GPReadEnable),
+                                    m_fifo.CPReadPointer.load(std::memory_order_relaxed),
+                                    m_fifo.CPWritePointer.load(std::memory_order_relaxed),
+                                    m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed),
+                                    m_fifo.CPBase.load(std::memory_order_relaxed),
+                                    m_fifo.CPEnd.load(std::memory_order_relaxed),
+                                    pi.m_fifo_cpu_write_pointer, pi.m_fifo_cpu_base});
+    FzgxFifoTest::Line("reads %s read %08x write %08x distance %x base %08x cpu write %08x",
+                       m_cp_ctrl_reg.GPReadEnable ? "on" : "off",
+                       m_fifo.CPReadPointer.load(std::memory_order_relaxed),
+                       m_fifo.CPWritePointer.load(std::memory_order_relaxed),
+                       m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed),
+                       m_fifo.CPBase.load(std::memory_order_relaxed), pi.m_fifo_cpu_write_pointer);
+    if (m_cp_ctrl_reg.GPReadEnable)
+    {
+      FzgxFifoTest::g_list_on_us.store(FzgxFifoTest::NowMicros(), std::memory_order_relaxed);
+      FzgxFifoTest::g_new_list.store(true);
+    }
+  }
   // Just before disabling reads, give the GPU a chance to catch up.
   if (reads_turned_off)
   {

@@ -14,10 +14,18 @@
 
 #include "VideoCommon/OpcodeDecoding.h"
 
+#include <atomic>
+#include <cstring>
+#include <string>
+
+#include <fmt/format.h>
+
 #include "Common/Assert.h"
 #include "Common/Logging/Log.h"
 #include "Core/FifoPlayer/FifoRecorder.h"
 #include "Core/HW/Memmap.h"
+#include "Core/HW/ProcessorInterface.h"
+#include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 #include "VideoCommon/AuroraPresent.h"
 #include "VideoCommon/BPMemory.h"
@@ -25,6 +33,7 @@
 #include "VideoCommon/CommandProcessor.h"
 #include "VideoCommon/DataReader.h"
 #include "VideoCommon/Fifo.h"
+#include "VideoCommon/FzgxFifoTest.h"
 #include "VideoCommon/Statistics.h"
 #include "VideoCommon/VertexLoaderBase.h"
 #include "VideoCommon/VertexLoaderManager.h"
@@ -169,6 +178,16 @@ public:
       }
       else
       {
+        m_list_address = address;
+        m_list_size = size;
+        system.GetFifo().RecordDisplayList(address, size);
+        if (FzgxFifoTest::On())
+        {
+          FzgxFifoTest::g_lists.Note({address, size, 0, 0, 0, 0, 0, 0});
+          if (FzgxFifoTest::Watching() && FzgxFifoTest::InWatch(address, 1))
+            FzgxFifoTest::Line("gpu calls list %08x size %x", address, size);
+          FzgxFifoTest::Stall(FzgxFifoTest::Where::DisplayList);
+        }
         const u8* start_address;
 
         auto& fifo = system.GetFifo();
@@ -201,6 +220,76 @@ public:
       m_in_display_list = false;
     }
   }
+  // A test's record of an unknown opcode (FzgxFifoTest.h): is it in a display list or the stream, and whose bytes
+  void ReportUnknown(u8 opcode, const u8* data)
+  {
+    static std::atomic<int> reports{0};
+    if (reports.fetch_add(1) >= 3)
+      return;
+    namespace T = FzgxFifoTest;
+    auto& system = Core::System::GetInstance();
+    auto& memory = system.GetMemory();
+    auto& pi = system.GetProcessorInterface();
+    const auto& fifo = system.GetCommandProcessor().GetFifo();
+    const u64 now = T::NowMicros();
+    const u32 burst = T::g_burst_guest.load(std::memory_order_relaxed);
+    const u8* burst_host = T::g_burst_host.load(std::memory_order_relaxed);
+    u32 guest = 0;
+    if (m_in_display_list)
+    {
+      const u8* list = memory.GetPointerForRange(m_list_address, m_list_size);
+      guest = m_list_address + static_cast<u32>(data - list);
+    }
+    else
+    {
+      guest = burst + static_cast<u32>(data - burst_host);
+    }
+    const u8* ram_now = memory.GetPointerForRange(guest, 128);
+    ERROR_LOG_FMT(VIDEO,
+                  "fzgx test: bad opcode {:#04x} in {}: list {:08x} size {:#x}; byte at guest {:08x}; burst guest "
+                  "{:08x}, byte is {} bytes after the burst's start; {} us after the last reads on; stalls {} ({} us)",
+                  opcode, m_in_display_list ? "a DISPLAY LIST" : "the STREAM", m_in_display_list ? m_list_address : 0,
+                  m_in_display_list ? m_list_size : 0, guest, burst, data - burst_host,
+                  now - T::g_list_on_us.load(std::memory_order_relaxed),
+                  T::g_stalls.load(std::memory_order_relaxed), T::g_stalled_us.load(std::memory_order_relaxed));
+    ERROR_LOG_FMT(VIDEO,
+                  "fzgx test: CP base {:08x} end {:08x} read {:08x} write {:08x} distance {:#x}; CPU fifo base {:08x} "
+                  "end {:08x} write {:08x}; PC {:08x} LR {:08x}",
+                  fifo.CPBase.load(), fifo.CPEnd.load(), fifo.CPReadPointer.load(), fifo.CPWritePointer.load(),
+                  fifo.CPReadWriteDistance.load(), pi.m_fifo_cpu_base, pi.m_fifo_cpu_end,
+                  pi.m_fifo_cpu_write_pointer, system.GetPPCState().pc, LR(system.GetPPCState()));
+    ERROR_LOG_FMT(VIDEO, "fzgx test: before: {}", T::Hex(data - 64, 64));
+    ERROR_LOG_FMT(VIDEO, "fzgx test: read:   {}", T::Hex(data, 128));
+    if (ram_now)
+    {
+      ERROR_LOG_FMT(VIDEO, "fzgx test: RAM now {} what was read: {}",
+                    std::memcmp(ram_now, data, 128) ? "DIFFERS from" : "equals", T::Hex(ram_now, 128));
+    }
+    T::g_handovers.Each([&](const auto& e) {
+      ERROR_LOG_FMT(VIDEO,
+                    "fzgx test: reads {} -{} us: read {:08x} write {:08x} distance {:#x} base {:08x} end {:08x} cpu "
+                    "write {:08x} cpu base {:08x}",
+                    e.v[0] ? "on " : "off", now - e.us, e.v[1], e.v[2], e.v[3], e.v[4], e.v[5], e.v[6], e.v[7]);
+    });
+    std::string lists;
+    T::g_lists.Each([&](const auto& e) {
+      lists += fmt::format("-{}us:{:08x}+{:#x} ", now - e.us, e.v[0], e.v[1]);
+    });
+    ERROR_LOG_FMT(VIDEO, "fzgx test: lists: {}", lists);
+    std::string aram;
+    T::g_aram.Each([&](const auto& e) {
+      const bool touches = e.v[3] && e.v[0] < guest + 128 && guest < e.v[0] + e.v[2];
+      if (e.v[3])
+        aram += fmt::format("-{}us:{:08x}+{:#x}{} ", now - e.us, e.v[0], e.v[2], touches ? "(OVER THE BYTE)" : "");
+    });
+    ERROR_LOG_FMT(VIDEO, "fzgx test: ARAM to RAM: {}", aram);
+    std::string commands;
+    T::g_commands.Each([&](const auto& e) {
+      commands += fmt::format("{:02x}{}+{} ", e.v[0], e.v[2] ? "d" : "s", e.v[1]);
+    });
+    ERROR_LOG_FMT(VIDEO, "fzgx test: commands (opcode, d list / s stream, size): {}", commands);
+  }
+
   OPCODE_CALLBACK(void OnNop(u32 count))
   {
     m_cycles += 6 * count;  // Hm, this means that we scan over nop streams pretty slowly...
@@ -221,6 +310,11 @@ public:
     }
     else
     {
+      if constexpr (!is_preprocess)
+      {
+        if (FzgxFifoTest::On())
+          ReportUnknown(opcode, data);
+      }
       auto& system = Core::System::GetInstance();
       system.GetCommandProcessor().HandleUnknownOpcode(opcode, data, is_preprocess);
       m_cycles += 1;
@@ -232,6 +326,8 @@ public:
     ASSERT(size >= 1);
     if constexpr (!is_preprocess)
     {
+      if (FzgxFifoTest::On())
+        FzgxFifoTest::g_commands.Note({data[0], size, m_in_display_list, 0, 0, 0, 0, 0});
       // Display lists get added directly into the FIFO stream since this same callback is used to
       // process them.
       if (g_record_fifo_data && static_cast<Opcode>(data[0]) != Opcode::GX_CMD_CALL_DL)
@@ -261,6 +357,8 @@ public:
 
   u32 m_cycles = 0;
   bool m_in_display_list = false;
+  u32 m_list_address = 0;
+  u32 m_list_size = 0;
 };
 
 template <bool is_preprocess>

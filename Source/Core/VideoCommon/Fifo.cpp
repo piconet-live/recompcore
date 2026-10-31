@@ -4,6 +4,19 @@
 #include "VideoCommon/Fifo.h"
 #include "VideoCommon/AuroraPresent.h"
 #include "VideoCommon/FrameRedraw.h"
+#include "VideoCommon/FzgxFifoTest.h"
+
+#include <array>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <thread>
+#include <utility>
+
+#include "Common/Thread.h"
+#include "Core/HW/Memmap.h"
+#include "Core/PowerPC/PowerPC.h"
 
 #include <atomic>
 #include <thread>
@@ -330,6 +343,9 @@ void FifoManager::RunGpuLoop()
             if (m_config_sync_gpu && m_sync_ticks.load() < m_config_sync_gpu_min_distance)
               break;
 
+            if (FzgxFifoTest::On() && FzgxFifoTest::g_new_list.exchange(false))
+              FzgxFifoTest::Stall(FzgxFifoTest::Where::Head);
+
             // fzgx: the pass is in flight from here to its stores (WaitForGpuPass); reads turned
             // off since the loop's check end it before it touches the pointer
             m_gpu_pass_active.store(true, std::memory_order_seq_cst);
@@ -353,7 +369,45 @@ void FifoManager::RunGpuLoop()
                               fifo.CPEnd.load(std::memory_order_relaxed));
               }
             }
+            if (FzgxFifoTest::On())
+              FzgxFifoTest::Stall(FzgxFifoTest::Where::Pass);
             ReadDataFromFifo(readPtr);
+            if (FzgxFifoTest::On())
+            {
+              static bool watch_started = false;
+              if (!watch_started)
+              {
+                watch_started = true;
+                const char* ranges = std::getenv("AURORA_TEST_WATCH");
+                const char* path = std::getenv("AURORA_TEST_TIMELINE");
+                if (ranges && path && (FzgxFifoTest::g_timeline = std::fopen(path, "w")))
+                {
+                  std::string text = ranges;
+                  size_t at = 0;
+                  while (at < text.size())
+                  {
+                    unsigned a = 0, s = 0;
+                    if (std::sscanf(text.c_str() + at, "%x:%x", &a, &s) == 2)
+                      FzgxFifoTest::g_watches.push_back({a, s, {}});
+                    const size_t comma = text.find(',', at);
+                    if (comma == std::string::npos)
+                      break;
+                    at = comma + 1;
+                  }
+                  const u8* base = m_system.GetMemory().GetRAM();
+                  std::thread([this, base] {
+                    Common::SetCurrentThreadName("Fifo test watch");
+                    auto& ppc = m_system.GetPPCState();
+                    FzgxFifoTest::WatchLoop(base, [&ppc] {
+                      return std::pair<u32, u32>(ppc.pc, LR(ppc));
+                    });
+                  }).detach();
+                }
+              }
+              FzgxFifoTest::g_burst_guest.store(readPtr, std::memory_order_relaxed);
+              FzgxFifoTest::g_burst_host.store(m_video_buffer_write_ptr - GPFifo::GATHER_PIPE_SIZE,
+                                               std::memory_order_relaxed);
+            }
             VideoCommon::FrameRedraw::OnBurstRead();  // (before it is decoded)
             VideoCommon::AuroraPresent::OnBurstRead(m_video_buffer_write_ptr - GPFifo::GATHER_PIPE_SIZE,
                                                     GPFifo::GATHER_PIPE_SIZE);
@@ -383,6 +437,8 @@ void FifoManager::RunGpuLoop()
                                            std::memory_order_relaxed);
             }
             m_gpu_pass_active.store(false, std::memory_order_seq_cst);
+            if (FzgxFifoTest::On())
+              FzgxFifoTest::Stall(FzgxFifoTest::Where::Between);
 
             command_processor.SetCPStatusFromGPU();
 
@@ -434,6 +490,58 @@ void FifoManager::PresentHeldPicture()
     return;
   if (const auto due = g_presenter->PresentHeldSwap())
     m_gpu_mainloop.WakeBy(*due);
+}
+
+// fzgx: the game copies data from ARAM over display lists it no longer needs, about 2.7 ms after handing the GP a
+// command list that still calls them: it counts on the GP having read that far, which a console's has. A GPU thread
+// later than that reads the new bytes as commands ("FIFO: Unknown Opcode"). The pages lists were called from are
+// stamped with the command list's count; a copy over a page of the last two waits for the one in hand to be read.
+// The wait is the host's only: nothing the game can see changes.
+namespace
+{
+constexpr u32 FZGX_PAGE_SHIFT = 12;
+constexpr u32 FZGX_PAGES = 0x2000000 >> FZGX_PAGE_SHIFT;
+std::array<std::atomic<u32>, FZGX_PAGES> s_list_page_stamp{};
+std::atomic<u32> s_list_count{2};
+}  // namespace
+
+void FifoManager::OnListHandedOver()
+{
+  s_list_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+void FifoManager::RecordDisplayList(u32 address, u32 size)
+{
+  const u32 stamp = s_list_count.load(std::memory_order_relaxed);
+  const u32 start = (address & 0x1ffffff) >> FZGX_PAGE_SHIFT;
+  const u32 end = ((address & 0x1ffffff) + size - 1) >> FZGX_PAGE_SHIFT;
+  for (u32 page = start; page <= end && page < FZGX_PAGES; ++page)
+    s_list_page_stamp[page].store(stamp, std::memory_order_relaxed);
+}
+
+void FifoManager::WaitBeforeCopyToRam(u32 address, u32 size)
+{
+  static const bool off = std::getenv("AURORA_TEST_NO_DMA_WAIT") != nullptr;
+  if (off || !size || !m_system.IsDualCoreMode() || m_use_deterministic_gpu_thread)
+    return;
+  const u32 now = s_list_count.load(std::memory_order_relaxed);
+  const u32 start = (address & 0x1ffffff) >> FZGX_PAGE_SHIFT;
+  const u32 end = ((address & 0x1ffffff) + size - 1) >> FZGX_PAGE_SHIFT;
+  bool recent = false;
+  for (u32 page = start; page <= end && page < FZGX_PAGES && !recent; ++page)
+    recent = now - s_list_page_stamp[page].load(std::memory_order_relaxed) <= 2;
+  if (!recent)
+    return;
+  auto& fifo = m_system.GetCommandProcessor().GetFifo();
+  const u64 begin = FzgxFifoTest::NowMicros();
+  while (fifo.bFF_GPReadEnable.load(std::memory_order_seq_cst) &&
+         fifo.CPReadWriteDistance.load(std::memory_order_seq_cst) &&
+         FzgxFifoTest::NowMicros() - begin < 100000)
+  {
+    std::this_thread::yield();
+  }
+  FzgxFifoTest::Line("copy over lists %08x size %x waited %llu us", address, size,
+                     static_cast<unsigned long long>(FzgxFifoTest::NowMicros() - begin));
 }
 
 bool FifoManager::WaitForGpuPass()

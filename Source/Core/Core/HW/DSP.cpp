@@ -39,6 +39,8 @@
 #include "Core/HW/ProcessorInterface.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
+#include "VideoCommon/Fifo.h"
+#include "VideoCommon/FzgxFifoTest.h"
 
 namespace DSP
 {
@@ -459,6 +461,20 @@ void DSPManager::Do_ARAM_DMA()
   auto& memory = m_system.GetMemory();
 
   m_dsp_control.DMAState = 1;
+  if (m_aram_dma.Cnt.dir)
+    m_system.GetFifo().WaitBeforeCopyToRam(m_aram_dma.MMAddr, m_aram_dma.Cnt.count);
+  if (FzgxFifoTest::On())
+  {
+    FzgxFifoTest::g_aram.Note({m_aram_dma.MMAddr, m_aram_dma.ARAddr,
+                               static_cast<u32>(m_aram_dma.Cnt.count),
+                               static_cast<u32>(m_aram_dma.Cnt.dir), m_system.GetPPCState().pc, 0, 0, 0});
+    if (FzgxFifoTest::Watching() && m_aram_dma.Cnt.dir &&
+        FzgxFifoTest::InWatch(m_aram_dma.MMAddr, m_aram_dma.Cnt.count))
+    {
+      FzgxFifoTest::Line("ARAM dma to %08x from %08x size %x PC %08x", m_aram_dma.MMAddr, m_aram_dma.ARAddr,
+                         static_cast<u32>(m_aram_dma.Cnt.count), m_system.GetPPCState().pc);
+    }
+  }
 
   // ARAM DMA transfer rate has been measured on real hw
   int ticksToTransfer = (m_aram_dma.Cnt.count / 32) * 246;

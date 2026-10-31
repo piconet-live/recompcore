@@ -28,6 +28,7 @@
 
 #include "DiscIO/Enums.h"
 #include "DiscIO/Volume.h"
+#include "VideoCommon/FzgxFifoTest.h"
 
 namespace DVD
 {
@@ -283,6 +284,8 @@ void DVDThread::FinishRead(u64 id, s64 cycles_late)
     if (request.copy_to_ram)
     {
       auto& memory = m_system.GetMemory();
+      if (FzgxFifoTest::Watching() && FzgxFifoTest::InWatch(request.output_address, request.length))
+        FzgxFifoTest::Line("DVD read to %08x size %x", request.output_address, request.length);
       memory.CopyToEmu(request.output_address, buffer.data(), request.length);
     }
 

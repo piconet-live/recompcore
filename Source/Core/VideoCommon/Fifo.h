@@ -73,6 +73,12 @@ public:
   // began before reads were turned off); true when one was. FlushGpu is no such barrier: its
   // loop may run the payload again in its busy state, where Wait returns at once.
   bool WaitForGpuPass();
+  // fzgx: a copy into main RAM by the CPU's thread (ARAM DMA) over display lists that recent command lists call waits
+  // for the command list in hand to be read (it may call them, and on a console the GP has long passed them), at
+  // most 100 ms. See FifoManager::RecordDisplayList.
+  void RecordDisplayList(u32 address, u32 size);
+  void OnListHandedOver();
+  void WaitBeforeCopyToRam(u32 address, u32 size);
   void RunGpu();
   void GpuMaySleep();
   void RunGpuLoop();
