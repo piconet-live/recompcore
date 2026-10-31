@@ -462,7 +462,10 @@ void DSPManager::Do_ARAM_DMA()
 
   m_dsp_control.DMAState = 1;
   if (m_aram_dma.Cnt.dir)
+  {
     m_system.GetFifo().WaitBeforeCopyToRam(m_aram_dma.MMAddr, m_aram_dma.Cnt.count);
+    m_system.GetFifo().NoteCopyToRam(m_aram_dma.MMAddr, m_aram_dma.Cnt.count, "aram");
+  }
   if (FzgxFifoTest::On())
   {
     FzgxFifoTest::g_aram.Note({m_aram_dma.MMAddr, m_aram_dma.ARAddr,

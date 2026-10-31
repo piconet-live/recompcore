@@ -14,6 +14,7 @@
 
 #include "VideoCommon/OpcodeDecoding.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <string>
@@ -209,7 +210,11 @@ public:
           // temporarily swap dl and non-dl (small "hack" for the stats)
           g_stats.SwapDL();
 
-          Run(start_address, size, *this);
+          m_list_start = start_address;
+          m_list_good = size;
+          const u32 read = Run(start_address, size, *this);
+          // Aurora is handed what the emulator read as commands: see AuroraPresent::OnListRead
+          VideoCommon::AuroraPresent::OnListRead(std::min(read, m_list_good));
           INCSTAT(g_stats.this_frame.num_dlists_called);
 
           // un-swap
@@ -312,6 +317,8 @@ public:
     {
       if constexpr (!is_preprocess)
       {
+        if (m_in_display_list)
+          m_list_good = std::min(m_list_good, static_cast<u32>(data - m_list_start));
         if (FzgxFifoTest::On())
           ReportUnknown(opcode, data);
       }
@@ -328,6 +335,10 @@ public:
     {
       if (FzgxFifoTest::On())
         FzgxFifoTest::g_commands.Note({data[0], size, m_in_display_list, 0, 0, 0, 0, 0});
+      // an XF load over 16 words is no command the hardware takes: the emulator reads 16 of them, Aurora the length
+      if (m_in_display_list && static_cast<Opcode>(data[0]) == Opcode::GX_LOAD_XF_REG &&
+          (data[1] | (data[2] & 0xf0)) != 0)
+        m_list_good = std::min(m_list_good, static_cast<u32>(data - m_list_start));
       // Display lists get added directly into the FIFO stream since this same callback is used to
       // process them.
       if (g_record_fifo_data && static_cast<Opcode>(data[0]) != Opcode::GX_CMD_CALL_DL)
@@ -357,6 +368,8 @@ public:
 
   u32 m_cycles = 0;
   bool m_in_display_list = false;
+  const u8* m_list_start = nullptr;
+  u32 m_list_good = 0;
   u32 m_list_address = 0;
   u32 m_list_size = 0;
 };

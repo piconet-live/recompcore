@@ -8,6 +8,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -21,6 +23,7 @@
 #include "VideoCommon/AbstractGfx.h"
 #include "VideoCommon/AbstractTexture.h"
 #include "VideoCommon/FrameRedrawFrame.h"
+#include "VideoCommon/FzgxFifoTest.h"
 #include "VideoCommon/FramebufferManager.h"
 #include "VideoCommon/TextureConfig.h"
 
@@ -91,6 +94,11 @@ bool s_cut = false;  // a cut waits for the copy's command to end
 const u8* s_list = nullptr;  // the display list the command decoded now called (its bytes in RAM), and its size
 u32 s_list_size = 0;
 u64 s_lists = 0, s_list_bytes = 0;  // the lists put in place of their calls
+u64 s_cut_lists = 0;                // the lists of which Aurora got less than all (OnListRead)
+// A test's look (AURORA_TEST_FIFO_LOG): the list's bytes as the emulator was about to read them, and each frame's lists
+std::vector<u8> s_test_list;
+u64 s_test_changed = 0, s_test_kept = 0, s_test_nested = 0;
+FILE* s_test_table = nullptr;
 
 // the presenter's (the GPU thread's)
 std::unique_ptr<AbstractTexture> s_texture;
@@ -204,7 +212,8 @@ std::string MakeReport()
                      st.present_ms_median, st.readback_ms_median, st.stopped ? "; STOPPED (fell behind or failed)" : "",
                      st.failed ? "; Aurora could not start" : "",
                      s_bad_cuts ? fmt::format("; {} frame cuts outside the stream", s_bad_cuts) : "",
-                     fmt::format("; {} display lists put in place of their calls ({} KB)", s_lists, s_list_bytes / 1024));
+                     fmt::format("; {} display lists put in place of their calls ({} KB), {} cut short", s_lists,
+                                 s_list_bytes / 1024, s_cut_lists));
 }
 
 // Aurora's thread ended (it reads the guest's RAM: before the RAM goes), the report kept.
@@ -222,6 +231,15 @@ void StopAll()
     std::fclose(s_shown_log);
     s_shown_log = nullptr;
   }
+  if (s_test_table)
+  {
+    std::fclose(s_test_table);
+    s_test_table = nullptr;
+  }
+  if (FzgxFifoTest::On())
+    std::fprintf(stderr, "fzgx11: Aurora's feed: lists changed under the read %llu, calls left in the stream %llu, nested %llu\n",
+                 static_cast<unsigned long long>(s_test_changed), static_cast<unsigned long long>(s_test_kept),
+                 static_cast<unsigned long long>(s_test_nested));
 }
 }  // namespace
 
@@ -244,7 +262,7 @@ void Configure(const Settings& settings)
   g_pending = false;
   s_cut = false;
   s_list = nullptr;
-  s_lists = s_list_bytes = 0;
+  s_lists = s_list_bytes = s_cut_lists = 0;
   if (!Load(settings.library))
   {
     ERROR_LOG_FMT(VIDEO, "AuroraPresent: {}; the emulator's own pictures are shown", s_load_problem);
@@ -302,9 +320,27 @@ void OnDisplayList(const u8* bytes, u32 size)
 {
   if (!s_started || !bytes || !size)
     return;
+  if (FzgxFifoTest::On())
+  {
+    if (s_list && s_test_nested++ < 20)
+      std::fprintf(stderr, "fzgx11: a list called inside a list: size %u inside size %u\n", size, s_list_size);
+    s_test_list.assign(bytes, bytes + size);
+  }
   s_list = bytes;
   s_list_size = size;
   g_pending = true;
+}
+
+void OnListRead(u32 good)
+{
+  if (s_list && good < s_list_size)
+  {
+    if (s_cut_lists++ < 20)
+      std::fprintf(stderr, "[aurora-present] list at RAM+%#zx: only %u of %u bytes are commands (copy %llu)\n",
+                   static_cast<size_t>(s_list - Core::System::GetInstance().GetMemory().GetRAM()), good, s_list_size,
+                   static_cast<unsigned long long>(s_copies));
+    s_list_size = good;
+  }
 }
 
 void OnCommandEnd(const u8* data, u32 size)
@@ -321,6 +357,31 @@ void OnCommandEnd(const u8* data, u32 size)
     tail = static_cast<size_t>(s_fed_end - end);
   if (s_list)
   {
+    if (FzgxFifoTest::On())
+    {
+      if (std::memcmp(s_test_list.data(), s_list, std::min<size_t>(s_test_list.size(), s_list_size)) != 0)
+      {
+        size_t off = 0;
+        while (s_test_list[off] == s_list[off])
+          ++off;
+        if (s_test_changed++ < 60)
+          std::fprintf(stderr, "fzgx11: list at RAM+%#zx size %#x changed while the emulator read it, first at %#zx; copy %llu\n",
+                       static_cast<size_t>(s_list - Core::System::GetInstance().GetMemory().GetRAM()), s_list_size, off,
+                       static_cast<unsigned long long>(s_copies));
+      }
+      if (!(inside && size == 9) && s_test_kept++ < 60)
+        std::fprintf(stderr, "fzgx11: a call left in the stream (Aurora will read RAM late): inside %d size %u list size %#x copy %llu\n",
+                     inside, size, s_list_size, static_cast<unsigned long long>(s_copies));
+      static const char* table = std::getenv("AURORA_TEST_LISTS");
+      if (table && !s_test_table)
+        s_test_table = std::fopen(table, "wb");
+      if (s_test_table && inside && size == 9)
+      {
+        const u64 rec[3] = {s_copies, s_pending.size() - tail - size,
+                            (static_cast<u64>(s_list - Core::System::GetInstance().GetMemory().GetRAM()) << 32) | s_list_size};
+        std::fwrite(rec, sizeof(rec), 1, s_test_table);
+      }
+    }
     // the call (its 9 bytes) gives its place to the list's bytes
     if (inside && size == 9)
     {

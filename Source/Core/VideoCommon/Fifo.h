@@ -79,6 +79,7 @@ public:
   void RecordDisplayList(u32 address, u32 size);
   void OnListHandedOver();
   void WaitBeforeCopyToRam(u32 address, u32 size);
+  void NoteCopyToRam(u32 address, u32 size, const char* kind);
   void RunGpu();
   void GpuMaySleep();
   void RunGpuLoop();

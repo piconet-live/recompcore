@@ -57,6 +57,11 @@ void OnXFBCopy();
 // decodes the frame later, when the game may have rewritten the list: the list's bytes take the call's place in
 // the stream Aurora is handed (OnCommandEnd).
 void OnDisplayList(const u8* bytes, u32 size);
+// OpcodeDecoder, the list read: `good` of its bytes were whole commands. The emulator stops a list at a command that
+// does not fit it and takes a byte that is no command as one byte; Aurora, with the list in the stream, has no list's
+// end to stop at and would read on through whatever follows. A list the game overwrote while the GPU was late (a heap
+// block's header, new data from ARAM) is such a list. Aurora gets only the good bytes.
+void OnListRead(u32 good);
 // OpcodeDecoder, after each command of the FIFO stream itself (not of a display list) while a cut or a list is
 // pending: [data, data + size) is the command in the video buffer, whose bytes up to the last burst read were
 // handed in already.

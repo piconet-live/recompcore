@@ -299,9 +299,21 @@ void stop_for_run(const char* why) {
 // In place of Aurora's abort, on whichever thread of Aurora's it happened: an abort would end the game and its race,
 // and nothing of the race depends on Aurora. The thread never returns (Aurora's state is not to be trusted from here),
 // Aurora is stopped for the run and the emulator's own picture comes back.
+// AURORA_TEST_DUMP_BAD=PATH: the frame being decoded goes to PATH at a fatal error
+const std::vector<std::uint8_t>* s_test_frame = nullptr;
+std::uint64_t s_test_frame_copy = 0;
 [[noreturn]] void on_fatal(const char* message) {
   std::fprintf(stderr, "[aurora-present] fatal error, Aurora stopped for the run: %s\n", message);
   std::fflush(stderr);
+  if (const char* dump = std::getenv("AURORA_TEST_DUMP_BAD"); dump && s_test_frame) {
+    if (FILE* out = std::fopen(dump, "wb")) {
+      std::fwrite(s_test_frame->data(), 1, s_test_frame->size(), out);
+      std::fclose(out);
+      std::fprintf(stderr, "[aurora-present] frame of copy %llu dumped, %zu bytes\n",
+                   static_cast<unsigned long long>(s_test_frame_copy), s_test_frame->size());
+    }
+    s_test_frame = nullptr;
+  }
   s->fatal = true;
   stop_for_run("a fatal error");
   for (;;)
@@ -462,6 +474,8 @@ void run() {
       f.bytes.insert(f.bytes.end(), {0xFF, 0xFF, 0x00, 0x00});
       f.bytes.insert(f.bytes.end(), 65536u * 4u, 0x3F);
     }
+    s_test_frame = &f.bytes;
+    s_test_frame_copy = f.copy;
     for (std::size_t off = 0; off < f.bytes.size(); off += 32768) {
       const std::size_t n = std::min<std::size_t>(32768, f.bytes.size() - off);
       aurora_backend_gx_write_burst(f.bytes.data() + off, static_cast<u32>(n));

@@ -503,7 +503,30 @@ constexpr u32 FZGX_PAGE_SHIFT = 12;
 constexpr u32 FZGX_PAGES = 0x2000000 >> FZGX_PAGE_SHIFT;
 std::array<std::atomic<u32>, FZGX_PAGES> s_list_page_stamp{};
 std::atomic<u32> s_list_count{2};
+// A test's watch for the whole class (AURORA_TEST_FIFO_LOG): a list called in the command list during which a copy went
+// over its bytes. The race itself, whether or not the new bytes look like a bad command.
+struct TestCopy
+{
+  std::atomic<u32> address{0}, size{0}, count{0};
+};
+std::array<TestCopy, 64> s_test_copies;
+std::atomic<u64> s_test_copy_at{0}, s_test_waited{0}, s_test_races{0};
 }  // namespace
+
+void FifoManager::NoteCopyToRam(u32 address, u32 size, const char* kind)
+{
+  if (!FzgxFifoTest::On())
+    return;
+  const u64 n = s_test_copy_at.fetch_add(1);
+  auto& c = s_test_copies[n % s_test_copies.size()];
+  c.address.store(address & 0x1ffffff);
+  c.size.store(size);
+  c.count.store(s_list_count.load(std::memory_order_relaxed));
+  if ((n + 1) % 200 == 0)
+    std::fprintf(stderr, "fzgx11: copies to RAM %llu, waited %llu, races %llu (%s)\n", static_cast<unsigned long long>(n + 1),
+                 static_cast<unsigned long long>(s_test_waited.load()), static_cast<unsigned long long>(s_test_races.load()),
+                 kind);
+}
 
 void FifoManager::OnListHandedOver()
 {
@@ -513,6 +536,17 @@ void FifoManager::OnListHandedOver()
 void FifoManager::RecordDisplayList(u32 address, u32 size)
 {
   const u32 stamp = s_list_count.load(std::memory_order_relaxed);
+  if (FzgxFifoTest::On())
+  {
+    const u32 a = address & 0x1ffffff;
+    for (auto& c : s_test_copies)
+    {
+      const u32 ca = c.address.load(), cs = c.size.load();
+      if (cs && c.count.load() == stamp && ca < a + size && a < ca + cs && s_test_races.fetch_add(1) < 60)
+        std::fprintf(stderr, "fzgx11: RACE list %08x size %#x called after a copy over it (%08x size %#x) in command list %u\n",
+                     a, size, ca, cs, stamp);
+    }
+  }
   const u32 start = (address & 0x1ffffff) >> FZGX_PAGE_SHIFT;
   const u32 end = ((address & 0x1ffffff) + size - 1) >> FZGX_PAGE_SHIFT;
   for (u32 page = start; page <= end && page < FZGX_PAGES; ++page)
@@ -539,6 +573,19 @@ void FifoManager::WaitBeforeCopyToRam(u32 address, u32 size)
          FzgxFifoTest::NowMicros() - begin < 100000)
   {
     std::this_thread::yield();
+  }
+  s_test_waited.fetch_add(1, std::memory_order_relaxed);
+  if (FzgxFifoTest::On())
+  {
+    const u64 waited = FzgxFifoTest::NowMicros() - begin;
+    static std::atomic<u64> most{0}, total{0};
+    total.fetch_add(waited);
+    if (waited > most.load())
+    {
+      most.store(waited);
+      std::fprintf(stderr, "fzgx11: longest copy wait so far %llu us (total %llu us)\n",
+                   static_cast<unsigned long long>(waited), static_cast<unsigned long long>(total.load()));
+    }
   }
   FzgxFifoTest::Line("copy over lists %08x size %x waited %llu us", address, size,
                      static_cast<unsigned long long>(FzgxFifoTest::NowMicros() - begin));
