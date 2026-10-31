@@ -6,6 +6,8 @@
 #include "texture.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <cstddef>
 #include <bit>
 #include <cmath>
 #include <utility>
@@ -1166,6 +1168,20 @@ void handle_cp(u8 addr, u32 value) noexcept {
   }
 }
 
+// A garbled stream can ask for an XF load of any length, up to 65536 words, and CHECK is empty in a release build: a
+// load past the end of its matrices would write on over the rest of g_gxState and off the end of this library's data,
+// which ends the game. Such a load is left out; a stream the game means never goes past the end of these arrays.
+static bool xf_fits(u32 addr, u32 lastWord, size_t arrayBytes, size_t firstByte) noexcept {
+  if (firstByte + (static_cast<size_t>(lastWord) + 1) * sizeof(f32) <= arrayBytes) {
+    return true;
+  }
+  static std::atomic<u32> s_said{0};
+  if (s_said.fetch_add(1, std::memory_order_relaxed) < 8) {
+    Log.error("XF load out of bounds left out: addr 0x{:04X}, last word {}", addr, lastWord);
+  }
+  return false;
+}
+
 bool copy_xf_data(u32 addr, const u8* data, u32 len, std::endian e) noexcept {
   if (addr < 0x78) {
     // Position matrices (0x0000-0x0077)
@@ -1173,6 +1189,9 @@ bool copy_xf_data(u32 addr, const u8* data, u32 len, std::endian e) noexcept {
     u32 startOffset = addr % 12;
     CHECK(mtxIdx < MaxPnMtx, "XF: PosMtx copy oob? Should never happen; mtxIdx={}", mtxIdx);
     CHECK(startOffset == 0 && len == 12, "XF: PosMtx sub-copy unsupported: offs={}, len={}", startOffset, len);
+    if (len != 0 && !xf_fits(addr, len - 1, sizeof(g_gxState.pnMtx), mtxIdx * sizeof(PnMtx))) {
+      return true;
+    }
     f32* flat = reinterpret_cast<f32*>(&g_gxState.pnMtx[mtxIdx].pos);
     bool changed = false;
     for (u32 i = 0; i < len; i++) {
@@ -1192,6 +1211,9 @@ bool copy_xf_data(u32 addr, const u8* data, u32 len, std::endian e) noexcept {
     CHECK(startOffset == 0 && (len == 8 || len == 12), "XF TexMtx sub-copy unsupported: offs={}, len={}", startOffset,
           len);
 
+    if (len != 0 && !xf_fits(addr, len - 1, sizeof(g_gxState.texMtxs), mtxIdx * sizeof(g_gxState.texMtxs[0]))) {
+      return true;
+    }
     f32* flat = reinterpret_cast<f32*>(&g_gxState.texMtxs[mtxIdx]);
     bool changed = false;
     for (u32 i = 0; i < len; i++) {
@@ -1219,6 +1241,10 @@ bool copy_xf_data(u32 addr, const u8* data, u32 len, std::endian e) noexcept {
     u32 startOffset = nrmBase % 9;
     CHECK(mtxIdx < MaxPnMtx, "XF: NrmMtx copy oob? Should never happen; mtxIdx={}", mtxIdx);
     CHECK(startOffset == 0 && len == 9, "XF: NrmMtx sub-copy unsupported: offs={}, len={}", startOffset, len);
+    if (len != 0 && !xf_fits(addr, (len - 1) / 3 * 4 + (len - 1) % 3, sizeof(g_gxState.pnMtx),
+                             mtxIdx * sizeof(PnMtx) + offsetof(PnMtx, nrm))) {
+      return true;
+    }
     f32* flat = reinterpret_cast<f32*>(&g_gxState.pnMtx[mtxIdx].nrm);
     bool changed = false;
     for (u32 i = 0; i < len; i++) {
@@ -1239,6 +1265,9 @@ bool copy_xf_data(u32 addr, const u8* data, u32 len, std::endian e) noexcept {
     u32 startOffset = ptBase % 12;
     CHECK(mtxIdx < MaxPTTexMtx, "XF: PTTexMtx copy oob? Should never happen; mtxIdx={}", mtxIdx);
     CHECK(startOffset == 0 && len == 12, "XF: PTTexMtx sub-copy unsupported: offs={}, len={}", startOffset, len);
+    if (len != 0 && !xf_fits(addr, len - 1, sizeof(g_gxState.ptTexMtxs), mtxIdx * sizeof(g_gxState.ptTexMtxs[0]))) {
+      return true;
+    }
     f32* flat = reinterpret_cast<f32*>(&g_gxState.ptTexMtxs[mtxIdx]);
     bool changed = false;
     for (u32 i = 0; i < len; i++) {

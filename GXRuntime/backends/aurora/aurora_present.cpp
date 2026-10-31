@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <deque>
 #include <fstream>
 #include <mutex>
@@ -307,8 +308,34 @@ void stop_for_run(const char* why) {
     std::this_thread::sleep_for(std::chrono::hours(24));
 }
 
+#ifdef _WIN32
+bool on_auroras_thread() {
+  if (GetCurrentThreadId() == s_aurora_thread_id)
+    return true;
+  PWSTR name = nullptr;
+  if (FAILED(GetThreadDescription(GetCurrentThread(), &name)) || name == nullptr)
+    return false;
+  const bool ours = std::wcsncmp(name, L"Aurora", 6) == 0;
+  LocalFree(name);
+  return ours;
+}
+// An access violation on a thread of Aurora's goes the way of its fatal errors: nothing of the race depends on Aurora,
+// so Aurora stops for the run and the game goes on. No other thread is touched (Dolphin's own faults, fastmem above
+// all, pass through). A wild write that faults nothing is not seen here.
+void install_fault_stop() {
+  AddVectoredExceptionHandler(0, [](EXCEPTION_POINTERS* e) -> LONG {
+    if (e->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && s != nullptr && on_auroras_thread())
+      on_fatal("an access violation on a thread of Aurora's");
+    return EXCEPTION_CONTINUE_SEARCH;
+  });
+}
+#else
+void install_fault_stop() {}
+#endif
+
 void run() {
   install_mtx_check();
+  install_fault_stop();
   aurora_backend_set_fatal_handler(on_fatal);
   aurora_backend_set_guest_address_resolver(ram_resolver, nullptr);
   const AuroraBackendConfig config = {
@@ -364,6 +391,14 @@ void run() {
   // AURORA_TEST_FATAL=<copy> (a test): a fatal error at this copy, the way any of Aurora's goes
   const char* test_fatal_text = std::getenv("AURORA_TEST_FATAL");
   const std::uint64_t test_fatal = test_fatal_text != nullptr ? std::strtoull(test_fatal_text, nullptr, 10) : 0;
+  // AURORA_TEST_FAULT=<copy> (a test): an access violation at this copy. AURORA_TEST_BAD_XF=<copy> (a test): that
+  // copy's stream ends in the largest XF load a garbled stream can ask for, to the position matrices.
+  const auto test_copy = [](const char* name) -> std::uint64_t {
+    const char* v = std::getenv(name);
+    return v != nullptr ? std::strtoull(v, nullptr, 10) : 0;
+  };
+  const std::uint64_t test_fault = test_copy("AURORA_TEST_FAULT");
+  const std::uint64_t test_bad_xf = test_copy("AURORA_TEST_BAD_XF");
 
   // Speed tests (stage 8), one at a time. AURORA_NO_READBACK=1: Aurora draws and presents into its hidden window and
   // no picture comes back (the emulator's own stays on screen), a stand-in for the later PresentTarget design.
@@ -418,6 +453,14 @@ void run() {
     g_auroraDrawDump = dump_copy != 0 && f.copy == dump_copy;
     if (test_fatal != 0 && f.copy == test_fatal) {
       on_fatal("AURORA_TEST_FATAL");
+    }
+    if (test_fault != 0 && f.copy == test_fault) {
+      *static_cast<volatile int*>(nullptr) = 1;
+    }
+    if (test_bad_xf != 0 && f.copy == test_bad_xf) {
+      f.bytes.push_back(0x10);
+      f.bytes.insert(f.bytes.end(), {0xFF, 0xFF, 0x00, 0x00});
+      f.bytes.insert(f.bytes.end(), 65536u * 4u, 0x3F);
     }
     for (std::size_t off = 0; off < f.bytes.size(); off += 32768) {
       const std::size_t n = std::min<std::size_t>(32768, f.bytes.size() - off);
