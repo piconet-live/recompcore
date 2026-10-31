@@ -365,6 +365,16 @@ void run() {
   const char* test_fatal_text = std::getenv("AURORA_TEST_FATAL");
   const std::uint64_t test_fatal = test_fatal_text != nullptr ? std::strtoull(test_fatal_text, nullptr, 10) : 0;
 
+  // Speed tests (stage 8), one at a time. AURORA_NO_READBACK=1: Aurora draws and presents into its hidden window and
+  // no picture comes back (the emulator's own stays on screen), a stand-in for the later PresentTarget design.
+  // AURORA_DISCARD=1: frames are copied to this thread and thrown away, nothing drawn: what the copying costs alone.
+  const auto env_on = [](const char* name) {
+    const char* v = std::getenv(name);
+    return v != nullptr && v[0] == '1';
+  };
+  const bool no_readback = env_on("AURORA_NO_READBACK");
+  const bool discard = env_on("AURORA_DISCARD");
+
   FILE* log = s->log_path.empty() ? nullptr : std::fopen(s->log_path.c_str(), "w");
   if (log)
     std::fprintf(log, "copy,in_us,start_us,fed_us,presented_us,picture_us,waiting,bytes\n");
@@ -396,6 +406,11 @@ void run() {
         s->up = true;
     }
     const auto start = Clock::now();
+    if (discard) {
+      std::lock_guard g{s->lock};
+      ++s->stats.frames_drawn;
+      continue;
+    }
     static const std::uint64_t dump_copy = [] {
       const char* v = std::getenv("AURORA_DUMP_COPY");
       return v != nullptr ? std::strtoull(v, nullptr, 10) : 0ull;
@@ -421,7 +436,7 @@ void run() {
       }
       asked = false;
     }
-    if (!asked && (waiting == 0 || shot)) {
+    if (!asked && (waiting == 0 || shot) && (!no_readback || shot)) {
       aurora_request_framebuffer_readback();
       asked = true;
       asked_copy = f.copy;
