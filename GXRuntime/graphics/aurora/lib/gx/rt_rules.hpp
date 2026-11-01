@@ -101,6 +101,7 @@ struct GpuDraw {
 };
 struct Tuning {
   float machineGain = 2.f, machineCap = 0.45f, sceneryCap = 0.25f;
+  std::uint32_t maxLights = 16;
 };
 struct Frame {
   std::vector<Vertex> verts;        // scene triangles first, then the sky's
@@ -154,6 +155,13 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
   out.lights = engine_lights(draws, count, verts, [](const DrawRec& d) {
     return d.projType == 0 && std::array<int, 2>{static_cast<int>(d.proj[0] * 1000), static_cast<int>(d.proj[5] * 1000)} == s_best;
   });
+  // the nearest few: a packed grid must stay affordable (the camera is the origin)
+  if (out.lights.size() > t.maxLights) {
+    const auto dist = [](const EngineLight& l) { return l.pos[0] * l.pos[0] + l.pos[1] * l.pos[1] + l.pos[2] * l.pos[2]; };
+    std::nth_element(out.lights.begin(), out.lights.begin() + t.maxLights, out.lights.end(),
+                     [&](const EngineLight& a, const EngineLight& b) { return dist(a) < dist(b); });
+    out.lights.resize(t.maxLights);
+  }
   out.draws.resize(count);
   std::vector<float> extent(count, 0.f);
   float largest = 0.f;

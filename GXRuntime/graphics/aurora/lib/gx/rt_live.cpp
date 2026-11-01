@@ -308,6 +308,11 @@ ComPtr<ID3D12Resource> shared_texture(u32 w, u32 h, DXGI_FORMAT fmt, D3D12_RESOU
 void make_targets(u32 w, u32 h, wgpu::TextureFormat format) {
   if (w == g.w && h == g.h && g.input)
     return;
+  // a new size: the old textures may still be in flight
+  if (g.fenceValue != 0 && g.fence->GetCompletedValue() < g.fenceValue) {
+    g.fence->SetEventOnCompletion(g.fenceValue, g.event);
+    WaitForSingleObject(g.event, INFINITE);
+  }
   g.w = w, g.h = h;
   const DXGI_FORMAT dxgi = format == wgpu::TextureFormat::BGRA8Unorm ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
   g.inputRes = shared_texture(w, h, dxgi, D3D12_RESOURCE_FLAG_NONE, g.inputMem, g.input);

@@ -10,4 +10,7 @@ d['match']['match']['setup']['seats'][0]['machine']=m
 d['match']['match']['setup']['seats'][0].pop('color',None)
 d['bundle']='D:\\FZero\\aurora-mi19\\port\\bundle-mi18b'
 d['debug']={'auroraLog':H+'runs\\'+n+'\\aurora','autopilot':True,'windowNoActivate':True,'automation':True,'pad':'0:0','auroraShots':[int(s) for s in shot.split(',')],'paceLog':H+'runs\\'+n+'\\pace.csv'}
+import os
+if os.environ.get('GRID')=='back':
+  g=d['match']['match']['setup']['grid']; g[:]=list(reversed(g))
 json.dump(d,open('/mnt/d/FZero/aurora-rt/runs/'+n+'/launch.json','w'),indent=1)
