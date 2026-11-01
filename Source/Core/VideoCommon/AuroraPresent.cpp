@@ -121,6 +121,7 @@ struct Library
   void (*overlay_forget)(u64) = nullptr;
   void (*overlay_frame)(const void*) = nullptr;
   int (*picture_rect)(s32*) = nullptr;
+  void (*model_file)(const char*, const u8*, u64) = nullptr;
 };
 
 Settings s_settings;
@@ -188,7 +189,8 @@ bool Load(const std::string& path)
       !Bind(&s_lib.overlay_texture, "aurora_present_overlay_texture") ||
       !Bind(&s_lib.overlay_forget, "aurora_present_overlay_forget") ||
       !Bind(&s_lib.overlay_frame, "aurora_present_overlay_frame") ||
-      !Bind(&s_lib.picture_rect, "aurora_present_picture_rect"))
+      !Bind(&s_lib.picture_rect, "aurora_present_picture_rect") ||
+      !Bind(&s_lib.model_file, "aurora_present_model_file"))
   {
     s_load_problem = fmt::format("{} lacks an aurora_present function", path);
     s_lib = {};
@@ -309,6 +311,17 @@ void StopAll()
 }  // namespace
 
 bool g_pending = false;
+
+bool WantsModelFiles()
+{
+  return s_on.load(std::memory_order_relaxed) && s_lib.model_file != nullptr;
+}
+
+void ModelFile(const std::string& path, const u8* bytes, u64 size)
+{
+  if (WantsModelFiles())
+    s_lib.model_file(path.c_str(), bytes, size);
+}
 
 void Configure(const Settings& settings)
 {

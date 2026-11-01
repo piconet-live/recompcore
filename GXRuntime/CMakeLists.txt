@@ -122,7 +122,8 @@ if(GXRUNTIME_ENABLE_AURORA)
         # loads it at run time: gxruntime/aurora_present.h)
         add_library(gxruntime_aurora_present SHARED
             backends/aurora/aurora_present.cpp
-            backends/aurora/aurora_overlay.cpp)
+            backends/aurora/aurora_overlay.cpp
+            backends/aurora/model_pipelines.cpp)
         set_target_properties(gxruntime_aurora_present PROPERTIES
             OUTPUT_NAME aurora-present PREFIX "")
         target_include_directories(gxruntime_aurora_present

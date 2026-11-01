@@ -111,6 +111,9 @@ AURORA_PRESENT_API int aurora_present_picture_rect(int32_t out[4]);
 // Dawn) happens on its thread; a failure there shows in the stats.
 AURORA_PRESENT_API int aurora_present_start(const AuroraPresentConfig* config);
 // The GPU thread: `size` bytes of the command stream, in order. Copied; never blocks.
+// A model or course file the game is reading from the disc (its path, its whole bytes, copied here). Its materials' pipelines
+// compile on Aurora's compile threads. Any thread, at any time, before or after the start.
+AURORA_PRESENT_API void aurora_present_model_file(const char* path, const uint8_t* bytes, uint64_t size);
 AURORA_PRESENT_API void aurora_present_write(const uint8_t* bytes, uint32_t size);
 // The GPU thread: the stream so far ends frame `copy` (its XFB copy, numbered from 1). Never blocks.
 AURORA_PRESENT_API void aurora_present_frame(uint64_t copy);

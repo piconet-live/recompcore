@@ -44,6 +44,10 @@ struct Settings
 // The host, before the video thread draws: loads the library (Aurora itself starts at the GPU thread's first burst,
 // once the guest's RAM is there). Configure({}) at the end stops it.
 void Configure(const Settings& settings);
+// True while the library wants the model files the game reads (the disc thread asks).
+bool WantsModelFiles();
+// A model or course file the game is reading: its materials' pipelines compile ahead. Disc bytes only; any thread.
+void ModelFile(const std::string& path, const u8* bytes, u64 size);
 // The Null video backend, at its start: the emulator will draw nothing, so Aurora presents straight into this window
 // (a window system's handle; none in a headless run) and no picture comes back.
 void SetVideoOffWindow(void* window);

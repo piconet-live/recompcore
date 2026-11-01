@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -16,6 +17,8 @@
 
 #include "DiscIO/Filesystem.h"
 #include "DiscIO/Volume.h"
+
+#include "VideoCommon/AuroraPresent.h"
 
 namespace FileMonitor
 {
@@ -49,8 +52,32 @@ FileLogger::FileLogger() = default;
 
 FileLogger::~FileLogger() = default;
 
+// A model file (or a course file, for its fog) the game starts to read goes to Aurora, which compiles its materials'
+// pipelines ahead of their first draw. The disc's bytes, read here on the disc thread; the game's read goes on as it would.
+void FileLogger::ModelFiles(const DiscIO::Volume& volume, const DiscIO::Partition& partition, u64 offset)
+{
+  const DiscIO::FileSystem* file_system = volume.GetFileSystem(partition);
+  if (!file_system)
+    return;
+  const std::unique_ptr<DiscIO::FileInfo> file_info = file_system->FindFileInfo(offset);
+  if (!file_info || file_info->IsDirectory())
+    return;
+  const u64 file_offset = file_info->GetOffset();
+  if (!m_model_files_seen.insert(file_offset).second)
+    return;
+  const std::string path = file_info->GetPath();
+  if (path.find(".gma") == std::string::npos && path.find("COLI_COURSE") == std::string::npos)
+    return;
+  std::vector<u8> bytes(file_info->GetSize());
+  if (volume.Read(file_offset, bytes.size(), bytes.data(), partition))
+    VideoCommon::AuroraPresent::ModelFile(path, bytes.data(), bytes.size());
+}
+
 void FileLogger::Log(const DiscIO::Volume& volume, const DiscIO::Partition& partition, u64 offset)
 {
+  if (VideoCommon::AuroraPresent::WantsModelFiles())
+    ModelFiles(volume, partition, offset);
+
   // Do nothing if the log isn't selected
   if (!Common::Log::LogManager::GetInstance()->IsEnabled(Common::Log::LogType::FILEMON,
                                                          Common::Log::LogLevel::LWARNING))
