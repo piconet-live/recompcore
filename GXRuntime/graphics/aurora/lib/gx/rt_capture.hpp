@@ -23,6 +23,7 @@ void neutralise(ShaderConfig& config) noexcept;
 void before_draw() noexcept;
 void efb_cleared() noexcept;
 extern bool g_live;
+extern bool g_hook;  // the rays or the look (AURORA_LOOK_POST=1) want to know where the HUD begins
 
 // The command processor, once a draw's pipeline and textures are settled: `vertices` are the draw's raw bytes
 void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertices, size_t rawBytes) noexcept;

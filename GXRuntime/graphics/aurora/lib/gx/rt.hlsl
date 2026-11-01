@@ -346,3 +346,101 @@ void compose(uint3 id : SV_DispatchThreadID) {
   }
   Final[c] = float4(saturate(Raster[c].rgb + sum / weight), 1);
 }
+
+// The look (AURORA_LOOK_POST=1), from the frame's own pixels, for any course; rays or not. The numbers tuned by eye are named at their use.
+struct PostParams { float2 texel; float range, bloom, dt, grade; uint rayed, autoExposure, frame, levels; };
+ConstantBuffer<PostParams> PP : register(b1);
+Texture2D<float4> ReadA : register(t8);
+Texture2D<float4> ReadB : register(t9);
+RWTexture2D<float4> Dest : register(u2);
+RWTexture2D<float> Expo : register(u3);
+SamplerState Edge : register(s1);
+
+float3 term_at(int2 c) {
+  float4 mid = Term[c];
+  float3 sum = mid.rgb;
+  float weight = 1;
+  static const int2 off[8] = {int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1), int2(1, 1), int2(-1, 1), int2(1, -1), int2(-1, -1)};
+  for (int i = 0; i < 8; ++i) {
+    float4 o = Term[c + off[i]];
+    float w = (i < 4 ? 0.6 : 0.35) * saturate(1 - abs(o.a - mid.a) / max(mid.a * 0.02, 0.02));
+    sum += o.rgb * w;
+    weight += w;
+  }
+  return sum / weight;
+}
+// The frame is 8 bits, so all above white is lost: range is an estimate. Near-white with all channels high means clipped: bright light gets its range back, saturated paint at full value mostly does not.
+// Tuned: 0.8..1 where it starts, 0.5..1 how white, 0.35 what saturated colour keeps; P range the strength (AURORA_LOOK_RANGE).
+[numthreads(8, 8, 1)]
+void hdr_in(uint3 id : SV_DispatchThreadID) {
+  int2 c = id.xy;
+  float3 raster = Raster[c].rgb;
+  float3 shown = raster;
+  if ((PP.rayed & 1) != 0) shown += term_at(c);
+  float most = max(shown.r, max(shown.g, shown.b)), least = min(shown.r, min(shown.g, shown.b));
+  float clip = smoothstep(0.8, 1.0, most) * (0.35 + 0.65 * smoothstep(0.5, 1.0, least));
+  Dest[c] = float4(pow(max(shown, 0), 2.2) * (1 + PP.range * clip * clip), 1);
+}
+float3 tap(float2 uv) { return ReadA.SampleLevel(Edge, uv, 0).rgb; }
+float karis(float3 c) { return 1 / (1 + dot(c, float3(0.3, 0.59, 0.11))); }
+// Bloom, the usual chain: thirteen taps down, a tent up
+[numthreads(8, 8, 1)]
+void bloom_down(uint3 id : SV_DispatchThreadID) {
+  uint w, h; Dest.GetDimensions(w, h);
+  float2 uv = (id.xy + 0.5) / float2(w, h), t = PP.texel;
+  float3 a = tap(uv + t * float2(-2, -2)), b = tap(uv + t * float2(0, -2)), c = tap(uv + t * float2(2, -2));
+  float3 d = tap(uv + t * float2(-2, 0)), e = tap(uv), f = tap(uv + t * float2(2, 0));
+  float3 g = tap(uv + t * float2(-2, 2)), h2 = tap(uv + t * float2(0, 2)), i = tap(uv + t * float2(2, 2));
+  float3 j = tap(uv + t * float2(-1, -1)), k = tap(uv + t * float2(1, -1)), l = tap(uv + t * float2(-1, 1)), m = tap(uv + t * float2(1, 1));
+  float3 o;
+  if ((PP.rayed & 2) != 0) {
+    float3 g0 = (a + b + d + e) / 4, g1 = (b + c + e + f) / 4, g2 = (d + e + g + h2) / 4, g3 = (e + f + h2 + i) / 4, g4 = (j + k + l + m) / 4;
+    float w0 = karis(g0) * 0.125, w1 = karis(g1) * 0.125, w2 = karis(g2) * 0.125, w3 = karis(g3) * 0.125, w4 = karis(g4) * 0.5;
+    o = (g0 * w0 + g1 * w1 + g2 * w2 + g3 * w3 + g4 * w4) / (w0 + w1 + w2 + w3 + w4);
+  } else {
+    o = e * 0.125 + (a + c + g + i) * 0.03125 + (b + d + f + h2) * 0.0625 + (j + k + l + m) * 0.125;
+  }
+  Dest[id.xy] = float4(o, 1);
+}
+[numthreads(8, 8, 1)]
+void bloom_up(uint3 id : SV_DispatchThreadID) {
+  uint w, h; Dest.GetDimensions(w, h);
+  float2 uv = (id.xy + 0.5) / float2(w, h), t = PP.texel;
+  float3 up = tap(uv) * 4 + (tap(uv + t * float2(1, 0)) + tap(uv - t * float2(1, 0)) + tap(uv + t * float2(0, 1)) + tap(uv - t * float2(0, 1))) * 2 +
+              tap(uv + t) + tap(uv - t) + tap(uv + t * float2(1, -1)) + tap(uv + t * float2(-1, 1));
+  Dest[id.xy] = float4(up / 16 + ReadB[id.xy].rgb, 1);
+}
+// Exposure: the log mean of a small copy, the middle counting more; it follows slowly and lives in a one-pixel texture. Tuned: key 0.2, between 0.6 and 1.7, 1.2 a second.
+[numthreads(1, 1, 1)]
+void exposure(uint3 id : SV_DispatchThreadID) {
+  uint w, h; ReadA.GetDimensions(w, h);
+  float sum = 0, weight = 0;
+  for (uint y = 0; y < h; ++y)
+    for (uint x = 0; x < w; ++x) {
+      float2 p = (float2(x, y) + 0.5) / float2(w, h) * 2 - 1;
+      float k = 1 - 0.7 * saturate(dot(p, p) * 0.5);
+      sum += k * log(max(dot(ReadA[int2(x, y)].rgb, float3(0.3, 0.59, 0.11)), 1e-3));
+      weight += k;
+    }
+  float target = PP.autoExposure != 0 ? clamp(0.2 / exp(sum / weight), 0.6, 1.7) : 1;
+  float now = Expo[int2(0, 0)];
+  Expo[int2(0, 0)] = now > 0 ? lerp(now, target, 1 - exp(-PP.dt * 1.2)) : target;
+}
+float3 aces(float3 x) { return saturate(x * (2.51 * x + 0.03) / (x * (2.43 * x + 0.59) + 0.14)); }
+// Bloom by its share, exposure, filmic curve, a slight grade (saturation 1.1, vignette 0.12, both by AURORA_LOOK_GRADE), and dither so 8 bits show no bands.
+[numthreads(8, 8, 1)]
+void tone(uint3 id : SV_DispatchThreadID) {
+  float2 uv = (id.xy + 0.5) * PP.texel;
+  float3 hdr = ReadA[id.xy].rgb;
+  float3 bloomed = ReadB.SampleLevel(Edge, uv, 0).rgb / PP.levels;
+  float3 c = lerp(hdr, bloomed, PP.bloom) * Expo[int2(0, 0)];
+  c = aces(c);
+  float l = dot(c, float3(0.3, 0.59, 0.11));
+  c = lerp(l.xxx, c, 1 + 0.1 * PP.grade);
+  float2 v = uv * 2 - 1;
+  c *= 1 - 0.12 * PP.grade * saturate(dot(v, v) * 0.5);
+  c = pow(saturate(c), 1 / 2.2);
+  float n = frac(52.9829189 * frac(dot(float2(id.xy) + 5.588238 * (PP.frame & 63), float2(0.06711056, 0.00583715))));
+  Final[id.xy] = float4(c + (n - 0.5) / 255, 1);
+}
+

@@ -827,7 +827,7 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
       reader.skip(totalVtxBytes);
       return;
     }
-  if (rt::g_live) UNLIKELY { rt::before_draw(); }
+  if (rt::g_hook) UNLIKELY { rt::before_draw(); }
   if (recomp::has_guest_address_resolver()) {
     reserve_indexed_arrays(fmt, vtxCount, reader.data() + reader.offset());
   }

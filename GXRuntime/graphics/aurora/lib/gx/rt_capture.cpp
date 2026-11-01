@@ -33,6 +33,7 @@ bool g_neutral = false;
 bool g_capturing = false;
 bool g_noHud = false;
 bool g_live = false;
+bool g_hook = false;
 static bool s_seenPerspective = false;
 
 bool skip_draw() noexcept {
@@ -211,6 +212,9 @@ void start() noexcept {
   if (const char* at = std::getenv("AURORA_RT_CAPTURE_COPY"))
     s_atCopy = std::strtoull(at, nullptr, 10);
   g_capturing = g_live || (!s_path.empty() && s_at == 0 && s_atCopy == 0);
+#if defined(AURORA_RT_LIVE)
+  g_hook = g_live || live::look_on();
+#endif
   // AURORA_RT_LOOK=1, the overhaul look: reflections you can't miss. Each number can still be set by its own switch below. All tuned by eye.
   if (const char* v = std::getenv("AURORA_RT_LOOK"); v != nullptr && v[0] == '1') {
     s_road = 1.4f, s_glow = 0.5f, s_calm = 0.3f, s_wet = 0.35f, s_machineCap = 0.9f, s_sceneryCap = 0.7f, s_machineGain = 3.f;
@@ -607,6 +611,7 @@ std::deque<live::Job*> s_rulesToRun;
 live::Job* s_job = nullptr;
 std::unique_ptr<live::Job> s_jobOwned;
 std::unique_ptr<Chunk> s_chunk;
+u32 s_viewDraws = 0;
 u32 s_epoch = 0, s_baseDraw = 0, s_baseVert = 0, s_nextDraw = 0, s_nextVert = 0;
 
 // A light's middle hops as the draws in it change from frame to frame: half a step towards where it was, when it was near
@@ -984,8 +989,25 @@ static void send_rays() noexcept {
     return;
   s_rayed = true;
   g_capturing = false;
-  if (!s_job)
+  if (!s_job) {
+    // the look alone, or a frame with nothing for the rays
+    if (g_live || !g_hook)
+      return;
+    // a real view is many draws (a logo or a menu piece is not): those frames stay as they are
+    const u32 viewDraws = s_viewDraws;
+    s_viewDraws = 0;
+    if (viewDraws < 100)
+      return;
+    auto look = live::take_job();
+    look->postOnly = true, look->drawable = true;
+    look->captureMs = 0, look->rulesMs = 0, look->road = look->light = look->glow = look->calm = look->wet = 0;
+    look->copy = s_copyNow;
+    look->done = std::promise<void>();
+    look->rules = look->done.get_future();
+    look->done.set_value();
+    live::submit_job(std::move(look));
     return;
+  }
   const u32 draws = s_nextDraw - s_baseDraw;
   publish_chunk();
   auto job = std::move(s_jobOwned);
@@ -1012,15 +1034,16 @@ void before_draw() noexcept {
 #if defined(AURORA_RT_LIVE)
   if (s_rayed)
     return;
-  if (g_gxState.projType == GX_PERSPECTIVE)
+  if (g_gxState.projType == GX_PERSPECTIVE) {
     s_seenPerspective = true;
-  else if (s_seenPerspective)
+    ++s_viewDraws;
+  } else if (s_seenPerspective)
     send_rays();
 #endif
 }
 
 void efb_cleared() noexcept {
-  if (!g_live || s_rayed)
+  if (!g_hook || s_rayed)
     return;
 #if defined(AURORA_RT_LIVE)
   forget_draws();
@@ -1040,13 +1063,14 @@ void begin_copy(std::uint64_t copy) noexcept {
 
 void frame_end() noexcept {
 #if defined(AURORA_RT_LIVE)
-  if (g_live) {
+  if (g_hook) {
     if (s_seenPerspective)
       send_rays();
     s_rayed = false;
     s_seenPerspective = false;
     forget_draws();
-    g_capturing = !live::failed();
+    s_viewDraws = 0;
+    g_capturing = g_live && !live::failed();
     return;
   }
 #endif

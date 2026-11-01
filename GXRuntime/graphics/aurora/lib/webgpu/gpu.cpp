@@ -966,10 +966,11 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
       if (feature == wgpu::FeatureName::Depth32FloatStencil8 && timewarp_pin_wanted()) {
         requiredFeatures.push_back(feature);
       }
-      // the ray-traced picture's two textures, shared with D3D12 (AURORA_RT=1)
+      // the ray-traced picture's two textures, shared with D3D12 (AURORA_RT=1 or AURORA_LOOK_POST=1)
       if (feature == wgpu::FeatureName::SharedTextureMemoryD3D12Resource) {
         const char* rt = std::getenv("AURORA_RT");
-        if (rt != nullptr && rt[0] == '1')
+        const char* look = std::getenv("AURORA_LOOK_POST");
+        if ((rt != nullptr && rt[0] == '1') || (look != nullptr && look[0] == '1'))
           requiredFeatures.push_back(feature);
       }
       if (feature == wgpu::FeatureName::CoreFeaturesAndLimits || feature == wgpu::FeatureName::TextureCompressionBC ||

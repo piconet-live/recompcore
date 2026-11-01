@@ -30,12 +30,14 @@ struct Job {
   std::uint64_t copy = 0;
   std::uint32_t mergedLights = 0, lightPicks = 0;
   bool drawable;
+  bool postOnly = false;  // the look alone: no rays this frame, nothing was captured
 };
 std::unique_ptr<Job> take_job();
 bool submit_job(std::unique_ptr<Job> job);
 void before_frame_submit();
 void after_frame_submit();
 bool failed() noexcept;
+bool look_on() noexcept;  // AURORA_LOOK_POST=1
 // The name Aurora's fault handler knows its own threads by
 void name_thread() noexcept;
 } // namespace aurora::gx::rt::live

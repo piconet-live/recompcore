@@ -24,6 +24,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "../webgpu/gpu.hpp"
@@ -61,7 +62,16 @@ struct Params {
   float wet;
 };
 
-constexpr u32 Frames = 3, SlotDescriptors = 12, MaxTextures = 8192;
+constexpr u32 Frames = 3, SlotDescriptors = 12, MaxTextures = 8192, PostLevels = 6;
+// As rt.hlsl's PostParams
+struct PostParams {
+  float texel[2], range, bloom, dt, grade;
+  u32 rayed, autoExposure, frame, levels;
+};
+// The look's descriptors, after the textures': for good until the size changes. Each texture a read view, then a write view
+constexpr u32 PostDescriptors = 2 * (1 + PostLevels + PostLevels - 1) + 1;
+constexpr u32 PostFirst = Frames * SlotDescriptors + MaxTextures;
+constexpr u32 ViewHdr = PostFirst, ViewDown = ViewHdr + 2, ViewUp = ViewDown + 2 * PostLevels, ViewExpo = ViewUp + 2 * (PostLevels - 1);
 
 struct Slot {
   ComPtr<ID3D12CommandAllocator> alloc;
@@ -90,6 +100,11 @@ struct State {
   UINT inc = 0;
   ComPtr<ID3D12RootSignature> root;
   ComPtr<ID3D12PipelineState> trace, compose;
+  // The picture's look (AURORA_LOOK_POST=1): high range, bloom chain down and up, exposure, tone curve
+  ComPtr<ID3D12PipelineState> hdrIn, bloomDown, bloomUp, exposure, tone;
+  ComPtr<ID3D12Resource> hdrRes, downRes[PostLevels], upRes[PostLevels - 1], expoRes;
+  u32 levelW[PostLevels]{}, levelH[PostLevels]{};
+  std::chrono::steady_clock::time_point lastPost{};
   ComPtr<ID3D12QueryHeap> queries;
   ComPtr<ID3D12Resource> queryResult;
   u64 gpuTicks = 0;
@@ -98,6 +113,7 @@ struct State {
   std::vector<ComPtr<ID3D12Resource>> textureRes;
 
   u32 w = 0, h = 0;
+  wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
   ComPtr<ID3D12Resource> inputRes, outputRes, termRes;
   wgpu::SharedTextureMemory inputMem, outputMem;
   wgpu::Texture input, output;
@@ -171,8 +187,12 @@ D3D12_GPU_DESCRIPTOR_HANDLE gpuh(u32 i) {
   return h;
 }
 
+// AURORA_RT_SHADER=<file>: the shader read from there instead of the build's own copy, to try a change without a build
+std::string s_shaderFile;
 ComPtr<IDxcBlob> compile(IDxcCompiler3* comp, const wchar_t* entry) {
   DxcBuffer src{kShader, sizeof kShader, DXC_CP_UTF8};
+  if (!s_shaderFile.empty())
+    src.Ptr = s_shaderFile.data(), src.Size = s_shaderFile.size();
   LPCWSTR args[] = {L"-T", L"cs_6_5", L"-E", entry, L"-O3", L"-HV", L"2021"};
   ComPtr<IDxcResult> res;
   if (FAILED(comp->Compile(&src, args, _countof(args), nullptr, IID_PPV_ARGS(&res))))
@@ -207,7 +227,7 @@ void init_device() {
   g.event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
   D3D12_DESCRIPTOR_HEAP_DESC hd{};
   hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-  hd.NumDescriptors = Frames * SlotDescriptors + MaxTextures;
+  hd.NumDescriptors = Frames * SlotDescriptors + MaxTextures + PostDescriptors;
   hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   RT_HR(g.dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g.heap)));
   g.inc = g.dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -230,8 +250,17 @@ void init_device() {
   ComPtr<IDxcCompiler3> comp;
   if (!create || FAILED(create(CLSID_DxcCompiler, IID_PPV_ARGS(&comp))))
     return fail("no shader compiler");
+  if (const char* path = std::getenv("AURORA_RT_SHADER"))
+    if (FILE* f = std::fopen(path, "rb")) {
+      char buf[65536];
+      for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;)
+        s_shaderFile.append(buf, n);
+      std::fclose(f);
+    }
   auto traceCs = compile(comp.Get(), L"main"), composeCs = compile(comp.Get(), L"compose");
-  if (!traceCs || !composeCs)
+  auto hdrCs = compile(comp.Get(), L"hdr_in"), downCs = compile(comp.Get(), L"bloom_down"), upCs = compile(comp.Get(), L"bloom_up"),
+       expoCs = compile(comp.Get(), L"exposure"), toneCs = compile(comp.Get(), L"tone");
+  if (!traceCs || !composeCs || !hdrCs || !downCs || !upCs || !expoCs || !toneCs)
     return fail("the shader does not compile");
 
   D3D12_DESCRIPTOR_RANGE1 r1[2]{};
@@ -247,7 +276,14 @@ void init_device() {
   r2.NumDescriptors = UINT_MAX;
   r2.RegisterSpace = 1;
   r2.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
-  D3D12_ROOT_PARAMETER1 rp[3]{};
+  D3D12_DESCRIPTOR_RANGE1 one[4]{};
+  for (u32 i = 0; i < 4; ++i) {
+    one[i].RangeType = i < 2 ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV : D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    one[i].NumDescriptors = 1;
+    one[i].BaseShaderRegister = i < 2 ? 8 + i : i;  // t8, t9, u2, u3
+    one[i].Flags = r1[0].Flags;
+  }
+  D3D12_ROOT_PARAMETER1 rp[8]{};
   rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   rp[0].Constants.Num32BitValues = sizeof(Params) / 4;
   rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -256,17 +292,28 @@ void init_device() {
   rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
   rp[2].DescriptorTable.NumDescriptorRanges = 1;
   rp[2].DescriptorTable.pDescriptorRanges = &r2;
-  D3D12_STATIC_SAMPLER_DESC ss{};
-  ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-  ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-  ss.MaxLOD = D3D12_FLOAT32_MAX;
-  ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  rp[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  rp[3].Constants.ShaderRegister = 1;
+  rp[3].Constants.Num32BitValues = sizeof(PostParams) / 4;
+  for (u32 i = 0; i < 4; ++i) {
+    rp[4 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[4 + i].DescriptorTable.NumDescriptorRanges = 1;
+    rp[4 + i].DescriptorTable.pDescriptorRanges = &one[i];
+  }
+  D3D12_STATIC_SAMPLER_DESC ss[2]{};
+  ss[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+  ss[0].AddressU = ss[0].AddressV = ss[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+  ss[0].MaxLOD = D3D12_FLOAT32_MAX;
+  ss[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  ss[1] = ss[0];
+  ss[1].ShaderRegister = 1;
+  ss[1].AddressU = ss[1].AddressV = ss[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
   D3D12_VERSIONED_ROOT_SIGNATURE_DESC rs{};
   rs.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
-  rs.Desc_1_1.NumParameters = 3;
+  rs.Desc_1_1.NumParameters = 8;
   rs.Desc_1_1.pParameters = rp;
-  rs.Desc_1_1.NumStaticSamplers = 1;
-  rs.Desc_1_1.pStaticSamplers = &ss;
+  rs.Desc_1_1.NumStaticSamplers = 2;
+  rs.Desc_1_1.pStaticSamplers = ss;
   ComPtr<ID3DBlob> rsb, rse;
   // the runtime's serializer, by name: Aurora's link has no d3d12.lib of its own to rely on here
   const auto ser = reinterpret_cast<PFN_D3D12_SERIALIZE_VERSIONED_ROOT_SIGNATURE>(
@@ -281,6 +328,11 @@ void init_device() {
   RT_HR(g.dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.trace)));
   pd.CS = {composeCs->GetBufferPointer(), composeCs->GetBufferSize()};
   RT_HR(g.dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.compose)));
+  const std::pair<ComPtr<ID3D12PipelineState>*, IDxcBlob*> posts[] = {{&g.hdrIn, hdrCs.Get()}, {&g.bloomDown, downCs.Get()}, {&g.bloomUp, upCs.Get()}, {&g.exposure, expoCs.Get()}, {&g.tone, toneCs.Get()}};
+  for (const auto& [pso, cs] : posts) {
+    pd.CS = {cs->GetBufferPointer(), cs->GetBufferSize()};
+    RT_HR(g.dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(pso->GetAddressOf())));
+  }
   if (const char* path = std::getenv("AURORA_RT_TIMELOG")) {
     g.timeLog = std::fopen(path, "wb");
     if (g.timeLog != nullptr) {
@@ -321,15 +373,73 @@ ComPtr<ID3D12Resource> shared_texture(u32 w, u32 h, DXGI_FORMAT fmt, D3D12_RESOU
   return r;
 }
 
+bool post_on() {
+  static const bool on = [] {
+    const char* v = std::getenv("AURORA_LOOK_POST");
+    return v != nullptr && v[0] == '1';
+  }();
+  return on;
+}
+float post_setting(const char* name, float otherwise) {
+  const char* v = std::getenv(name);
+  return v != nullptr ? static_cast<float>(std::atof(v)) : otherwise;
+}
+ComPtr<ID3D12Resource> post_texture(u32 w, u32 h, DXGI_FORMAT fmt, u32 at) {
+  D3D12_HEAP_PROPERTIES hp{};
+  hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC d{};
+  d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  d.Width = w;
+  d.Height = h;
+  d.DepthOrArraySize = 1;
+  d.MipLevels = 1;
+  d.Format = fmt;
+  d.SampleDesc.Count = 1;
+  d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  ComPtr<ID3D12Resource> r;
+  if (FAILED(g.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&r)))) {
+    fail("no texture for the look");
+    return nullptr;
+  }
+  D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+  sv.Format = fmt;
+  sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  sv.Texture2D.MipLevels = 1;
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+  uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+  uv.Format = fmt;
+  if (fmt == DXGI_FORMAT_R32_FLOAT) {
+    g.dev->CreateUnorderedAccessView(r.Get(), nullptr, &uv, cpuh(at));
+    return r;
+  }
+  g.dev->CreateShaderResourceView(r.Get(), &sv, cpuh(at));
+  g.dev->CreateUnorderedAccessView(r.Get(), nullptr, &uv, cpuh(at + 1));
+  return r;
+}
+void make_post_targets(u32 w, u32 h) {
+  const DXGI_FORMAT f = DXGI_FORMAT_R16G16B16A16_FLOAT;
+  g.hdrRes = post_texture(w, h, f, ViewHdr);
+  for (u32 i = 0; i < PostLevels; ++i) {
+    w = std::max(w / 2, 1u), h = std::max(h / 2, 1u);
+    g.levelW[i] = w, g.levelH[i] = h;
+    g.downRes[i] = post_texture(w, h, f, ViewDown + 2 * i);
+    if (i + 1 < PostLevels)
+      g.upRes[i] = post_texture(w, h, f, ViewUp + 2 * i);
+  }
+  if (!g.expoRes)
+    g.expoRes = post_texture(1, 1, DXGI_FORMAT_R32_FLOAT, ViewExpo);
+}
+
 void make_targets(u32 w, u32 h, wgpu::TextureFormat format) {
-  if (w == g.w && h == g.h && g.input)
+  if (w == g.w && h == g.h && format == g.format && g.input)
     return;
   // a new size: the old textures may still be in flight
   if (g.fenceValue != 0 && g.fence->GetCompletedValue() < g.fenceValue) {
     g.fence->SetEventOnCompletion(g.fenceValue, g.event);
     WaitForSingleObject(g.event, INFINITE);
   }
-  g.w = w, g.h = h;
+  g.w = w, g.h = h, g.format = format;
   const DXGI_FORMAT dxgi = format == wgpu::TextureFormat::BGRA8Unorm ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
   g.inputRes = shared_texture(w, h, dxgi, D3D12_RESOURCE_FLAG_NONE, g.inputMem, g.input);
   g.outputRes = shared_texture(w, h, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, g.outputMem, g.output);
@@ -347,6 +457,10 @@ void make_targets(u32 w, u32 h, wgpu::TextureFormat format) {
   d.SampleDesc.Count = 1;
   d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
   RT_HR(g.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&g.termRes)));
+  if (post_on())
+    make_post_targets(w, h);
+  if (g.failed)
+    return;
   const wgpu::BindGroupLayoutEntry e{.binding = 0,
                                      .visibility = wgpu::ShaderStage::Fragment,
                                      .texture = {.sampleType = wgpu::TextureSampleType::UnfilterableFloat}};
@@ -463,42 +577,12 @@ void build_blas(Slot& s, u32 which, D3D12_GPU_VIRTUAL_ADDRESS addr, u32 count, u
   s.cl->BuildRaytracingAccelerationStructure(&bd, 0, nullptr);
 }
 
-// What the rays do for one frame, on Dawn's queue, between the frame's two command buffers
-void run_rays(Job& job) {
-  const auto t0 = std::chrono::steady_clock::now();
-  g.slot = (g.slot + 1) % Frames;
-  Slot& s = g.slots[g.slot];
-  if (g.fence->GetCompletedValue() < s.fence) {
-    RT_HR(g.fence->SetEventOnCompletion(s.fence, g.event));
-    WaitForSingleObject(g.event, INFINITE);
-  }
-  // this slot's last timings, now done
-  if (s.fence != 0) {
-    u64* ts = nullptr;
-    const D3D12_RANGE range{8 * 4 * g.slot, 8 * 4 * (g.slot + 1)};
-    if (SUCCEEDED(g.queryResult->Map(0, &range, reinterpret_cast<void**>(&ts)))) {
-      const double k = 1000.0 / g.gpuTicks, all = double(ts[4 * g.slot + 3] - ts[4 * g.slot]) * k;
-      g.msGpu += all;
-      g.msGpuMost = std::max(g.msGpuMost, all);
-      g.msTrace += double(ts[4 * g.slot + 2] - ts[4 * g.slot + 1]) * k;
-      // AURORA_RT_TIMELOG=<file>: a line a frame, to find one slow frame by its copy and what it carried
-      if (g.timeLog != nullptr)
-        std::fprintf(g.timeLog, "%llu,%.3f,%.3f,%.3f,%u,%u,%u\n", static_cast<unsigned long long>(s.copy), double(ts[4 * g.slot + 1] - ts[4 * g.slot]) * k,
-                     double(ts[4 * g.slot + 2] - ts[4 * g.slot + 1]) * k, double(ts[4 * g.slot + 3] - ts[4 * g.slot + 2]) * k, s.tris, s.lightCount, s.uploads);
-      g.queryResult->Unmap(0, nullptr);
-    }
-  }
-  s.keep.clear();
-  s.copy = job.copy, s.tris = static_cast<u32>(job.frame.verts.size() / 3), s.lightCount = static_cast<u32>(job.frame.lights.size()), s.uploads = static_cast<u32>(job.textures.size());
-  RT_HR(s.alloc->Reset());
-  RT_HR(s.cl->Reset(s.alloc.Get(), nullptr));
-  ID3D12GraphicsCommandList4* cl = s.cl.Get();
-  ID3D12DescriptorHeap* heaps[] = {g.heap.Get()};
-  cl->SetDescriptorHeaps(1, heaps);
-  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 4 * g.slot);
+// The rays' part: this frame's structures and the trace itself
+void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   for (const auto& t : job.textures)
     upload_texture(s, t);
   auto& fr = job.frame;
+  ID3D12GraphicsCommandList4* cl = s.cl.Get();
   if (fr.lights.empty())
     fr.lights.push_back({{0, 0, 1e6f}, {0, 0, 0}, 1.f});
   if (fr.stages.empty())
@@ -509,7 +593,7 @@ void run_rays(Job& job) {
   stage(s, s.lights, fr.lights.data(), fr.lights.size() * sizeof(EngineLight));
   if (fr.glows.empty())
     fr.glows.push_back({});
-  const u32 glowCount = job.glow > 0 ? static_cast<u32>(fr.glows.size()) : 0;
+  glowCount = job.glow > 0 ? static_cast<u32>(fr.glows.size()) : 0;
   stage(s, s.glows, fr.glows.data(), fr.glows.size() * sizeof(GlowLight));
   if (g.failed)
     return;
@@ -564,7 +648,6 @@ void run_rays(Job& job) {
   cl->ResourceBarrier(1, &uav);
   cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 4 * g.slot + 1);
 
-  const u32 base = g.slot * SlotDescriptors;
   D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
   sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
   sv.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
@@ -575,21 +658,6 @@ void run_rays(Job& job) {
   srv_buffer(s.lights.gpu.Get(), static_cast<u32>(fr.lights.size()), sizeof(EngineLight), base + 4);
   srv_buffer(s.stages.gpu.Get(), static_cast<u32>(fr.stages.size()), sizeof(StageRec), base + 5);
   srv_buffer(s.glows.gpu.Get(), static_cast<u32>(fr.glows.size()), sizeof(GlowLight), base + 7);
-  sv = {};
-  sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-  sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-  sv.Format = g.inputRes->GetDesc().Format;
-  sv.Texture2D.MipLevels = 1;
-  g.dev->CreateShaderResourceView(g.inputRes.Get(), &sv, cpuh(base + 3));
-  sv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-  g.dev->CreateShaderResourceView(g.termRes.Get(), &sv, cpuh(base + 6));
-  D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
-  uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-  uv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-  g.dev->CreateUnorderedAccessView(g.termRes.Get(), nullptr, &uv, cpuh(base + 8));
-  uv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-  g.dev->CreateUnorderedAccessView(g.outputRes.Get(), nullptr, &uv, cpuh(base + 9));
-
   Params p{};
   p.size[0] = static_cast<float>(g.w), p.size[1] = static_cast<float>(g.h);
   p.rectWH[0] = 640.f, p.rectWH[1] = 528.f;  // the EFB as the snapshot holds it, all of it
@@ -625,13 +693,138 @@ void run_rays(Job& job) {
   p.glowGain = job.glow;
   static const u32 glowShow = std::getenv("AURORA_RT_GLOW_SHOW") != nullptr ? 1 : 0;
   p.glowShow = glowShow;
-  cl->SetComputeRootSignature(g.root.Get());
   cl->SetComputeRoot32BitConstants(0, sizeof(Params) / 4, &p, 0);
-  cl->SetComputeRootDescriptorTable(1, gpuh(base));
-  cl->SetComputeRootDescriptorTable(2, gpuh(Frames * SlotDescriptors));
   cl->SetPipelineState(g.trace.Get());
   cl->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
   cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 4 * g.slot + 2);
+}
+
+// The look: the frame's high range, a bloom chain, exposure, the tone curve. On the frame's own queue: no frame waits for it.
+void run_post(Slot& s, Job& job) {
+  ID3D12GraphicsCommandList4* cl = s.cl.Get();
+  static const float range = post_setting("AURORA_LOOK_RANGE", 12.f), bloom = post_setting("AURORA_LOOK_BLOOM", 0.18f), grade = post_setting("AURORA_LOOK_GRADE", 1.f);
+  static const u32 autoExposure = post_setting("AURORA_LOOK_EXPOSURE", 1.f) != 0.f ? 1 : 0;
+  const auto now = std::chrono::steady_clock::now();
+  const float dt = g.lastPost == std::chrono::steady_clock::time_point{} ? 0.f : std::min(std::chrono::duration<float>(now - g.lastPost).count(), 0.25f);
+  g.lastPost = now;
+  PostParams pp{{0.f, 0.f}, range, bloom, dt, grade, job.postOnly ? 0u : 1u, autoExposure, g.frame++, PostLevels};
+  const auto transition = [&](ID3D12Resource* r, bool toRead) {
+    D3D12_RESOURCE_BARRIER b{};
+    b.Transition.pResource = r;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = toRead ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    b.Transition.StateAfter = toRead ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    cl->ResourceBarrier(1, &b);
+  };
+  const auto pass = [&](ID3D12PipelineState* pso, u32 readA, u32 readB, u32 write, u32 w, u32 h, float tx, float ty) {
+    cl->SetPipelineState(pso);
+    pp.texel[0] = tx, pp.texel[1] = ty;
+    cl->SetComputeRoot32BitConstants(3, sizeof(PostParams) / 4, &pp, 0);
+    cl->SetComputeRootDescriptorTable(4, gpuh(readA));
+    cl->SetComputeRootDescriptorTable(5, gpuh(readB));
+    cl->SetComputeRootDescriptorTable(6, gpuh(write));
+    cl->SetComputeRootDescriptorTable(7, gpuh(ViewExpo));
+    cl->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+  };
+  pass(g.hdrIn.Get(), ViewHdr, ViewHdr, ViewHdr + 1, g.w, g.h, 0.f, 0.f);
+  transition(g.hdrRes.Get(), true);
+  for (u32 i = 0; i < PostLevels; ++i) {
+    const u32 from = i == 0 ? ViewHdr : ViewDown + 2 * (i - 1);
+    const u32 fw = i == 0 ? g.w : g.levelW[i - 1], fh = i == 0 ? g.h : g.levelH[i - 1];
+    pp.rayed = (job.postOnly ? 0u : 1u) | (i == 0 ? 2u : 0u);  // bit 1: the first step down keeps a lone bright pixel from flickering
+    pass(g.bloomDown.Get(), from, from, ViewDown + 2 * i + 1, g.levelW[i], g.levelH[i], 1.f / fw, 1.f / fh);
+    transition(g.downRes[i].Get(), true);
+  }
+  pp.rayed = job.postOnly ? 0u : 1u;
+  for (u32 i = PostLevels - 1; i-- > 0;) {
+    const u32 lower = i == PostLevels - 2 ? ViewDown + 2 * (PostLevels - 1) : ViewUp + 2 * (i + 1);
+    const u32 lw = g.levelW[i + 1], lh = g.levelH[i + 1];
+    pass(g.bloomUp.Get(), lower, ViewDown + 2 * i, ViewUp + 2 * i + 1, g.levelW[i], g.levelH[i], 1.f / lw, 1.f / lh);
+    transition(g.upRes[i].Get(), true);
+  }
+  // exposure from the frame's small copy, kept on the GPU
+  cl->SetPipelineState(g.exposure.Get());
+  cl->SetComputeRoot32BitConstants(3, sizeof(PostParams) / 4, &pp, 0);
+  cl->SetComputeRootDescriptorTable(4, gpuh(ViewDown + 2 * (PostLevels - 2)));
+  cl->SetComputeRootDescriptorTable(7, gpuh(ViewExpo));
+  cl->Dispatch(1, 1, 1);
+  D3D12_RESOURCE_BARRIER uav{};
+  uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+  uav.UAV.pResource = g.expoRes.Get();
+  cl->ResourceBarrier(1, &uav);
+  pass(g.tone.Get(), ViewHdr, ViewUp, ViewHdr + 1, g.w, g.h, 1.f / g.w, 1.f / g.h);
+  transition(g.hdrRes.Get(), false);
+  for (u32 i = 0; i < PostLevels; ++i)
+    transition(g.downRes[i].Get(), false);
+  for (u32 i = 0; i + 1 < PostLevels; ++i)
+    transition(g.upRes[i].Get(), false);
+}
+
+// What the rays do for one frame, on Dawn's queue, between the frame's two command buffers
+void run_rays(Job& job) {
+  const auto t0 = std::chrono::steady_clock::now();
+  g.slot = (g.slot + 1) % Frames;
+  Slot& s = g.slots[g.slot];
+  if (g.fence->GetCompletedValue() < s.fence) {
+    RT_HR(g.fence->SetEventOnCompletion(s.fence, g.event));
+    WaitForSingleObject(g.event, INFINITE);
+  }
+  // this slot's last timings, now done
+  if (s.fence != 0) {
+    u64* ts = nullptr;
+    const D3D12_RANGE range{8 * 4 * g.slot, 8 * 4 * (g.slot + 1)};
+    if (SUCCEEDED(g.queryResult->Map(0, &range, reinterpret_cast<void**>(&ts)))) {
+      const double k = 1000.0 / g.gpuTicks, all = double(ts[4 * g.slot + 3] - ts[4 * g.slot]) * k;
+      g.msGpu += all;
+      g.msGpuMost = std::max(g.msGpuMost, all);
+      g.msTrace += double(ts[4 * g.slot + 2] - ts[4 * g.slot + 1]) * k;
+      // AURORA_RT_TIMELOG=<file>: a line a frame, to find one slow frame by its copy and what it carried
+      if (g.timeLog != nullptr)
+        std::fprintf(g.timeLog, "%llu,%.3f,%.3f,%.3f,%u,%u,%u\n", static_cast<unsigned long long>(s.copy), double(ts[4 * g.slot + 1] - ts[4 * g.slot]) * k,
+                     double(ts[4 * g.slot + 2] - ts[4 * g.slot + 1]) * k, double(ts[4 * g.slot + 3] - ts[4 * g.slot + 2]) * k, s.tris, s.lightCount, s.uploads);
+      g.queryResult->Unmap(0, nullptr);
+    }
+  }
+  s.keep.clear();
+  s.copy = job.copy, s.tris = static_cast<u32>(job.frame.verts.size() / 3), s.lightCount = static_cast<u32>(job.frame.lights.size()), s.uploads = static_cast<u32>(job.textures.size());
+  RT_HR(s.alloc->Reset());
+  RT_HR(s.cl->Reset(s.alloc.Get(), nullptr));
+  ID3D12GraphicsCommandList4* cl = s.cl.Get();
+  ID3D12DescriptorHeap* heaps[] = {g.heap.Get()};
+  cl->SetDescriptorHeaps(1, heaps);
+  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 4 * g.slot);
+  auto& fr = job.frame;
+  const u32 base = g.slot * SlotDescriptors;
+  u32 glowCount = 0;
+  {
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Format = g.inputRes->GetDesc().Format;
+    sv.Texture2D.MipLevels = 1;
+    g.dev->CreateShaderResourceView(g.inputRes.Get(), &sv, cpuh(base + 3));
+    sv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    g.dev->CreateShaderResourceView(g.termRes.Get(), &sv, cpuh(base + 6));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+    uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    uv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    g.dev->CreateUnorderedAccessView(g.termRes.Get(), nullptr, &uv, cpuh(base + 8));
+    uv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    g.dev->CreateUnorderedAccessView(g.outputRes.Get(), nullptr, &uv, cpuh(base + 9));
+  }
+  cl->SetComputeRootSignature(g.root.Get());
+  cl->SetComputeRootDescriptorTable(1, gpuh(base));
+  cl->SetComputeRootDescriptorTable(2, gpuh(Frames * SlotDescriptors));
+  if (job.postOnly) {
+    cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 4 * g.slot + 1);
+    cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 4 * g.slot + 2);
+  } else {
+    trace_part(s, job, base, glowCount);
+    if (g.failed)
+      return;
+  }
+  D3D12_RESOURCE_BARRIER uav{};
+  uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
   uav.UAV.pResource = g.termRes.Get();
   cl->ResourceBarrier(1, &uav);
   D3D12_RESOURCE_BARRIER tb{};
@@ -640,8 +833,12 @@ void run_rays(Job& job) {
   tb.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
   tb.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
   cl->ResourceBarrier(1, &tb);
-  cl->SetPipelineState(g.compose.Get());
-  cl->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
+  if (post_on()) {
+    run_post(s, job);
+  } else {
+    cl->SetPipelineState(g.compose.Get());
+    cl->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
+  }
   std::swap(tb.Transition.StateBefore, tb.Transition.StateAfter);
   cl->ResourceBarrier(1, &tb);
   cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 4 * g.slot + 3);
@@ -825,5 +1022,6 @@ void after_frame_submit() {
   }
 }
 bool failed() noexcept { return g.failed; }
+bool look_on() noexcept { return post_on(); }
 void name_thread() noexcept { SetThreadDescription(GetCurrentThread(), L"Aurora RT"); }
 } // namespace aurora::gx::rt::live
