@@ -102,6 +102,10 @@ int main(int argc, char** argv) {
   static std::pair<int,int> s_best; s_best = best;
   auto lights = engine_lights(draws, nDraws, verts, [](const DrawRec& d) { return d.projType == 0 && std::make_pair((int)(d.proj[0] * 1000), (int)(d.proj[5] * 1000)) == s_best; });
   std::printf("engine lights %zu:", lights.size()); for (auto& l : lights) std::printf(" (%.1f %.1f %.1f; %.2f %.2f %.2f)", l.pos[0], l.pos[1], l.pos[2], l.colour[0], l.colour[1], l.colour[2]); std::puts("");
+  { const float cap = std::getenv("RT_SCENERY_CAP") ? (float)atof(std::getenv("RT_SCENERY_CAP")) : 0.25f; u32 mach = 0;
+    for (u32 i = 0; i < nDraws; ++i) { auto& g = gpu[i]; if (g.strength <= 0) continue;
+      if (beside_engine_light(draws[i], verts, lights)) { g.strength = std::max(g.strength, std::min(g.strength * gain, 0.45f)); ++mach; } else g.strength = std::min(g.strength, cap); }
+    std::printf("machine draws %u\n", mach); }
   if (lights.empty()) lights.push_back({{0,0,1e6f},{0,0,0}});
   float maxz = -1e30f, minz = 1e30f; u32 behind = 0;
   for (auto& v : kept) { maxz = std::max(maxz, v.pos[2]); minz = std::min(minz, v.pos[2]); if (v.pos[2] > 0) ++behind; }

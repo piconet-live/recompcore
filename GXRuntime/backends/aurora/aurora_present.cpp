@@ -2,6 +2,7 @@
 // aurora_present (gxruntime/aurora_present.h): Aurora on a thread of its own, fed the retail command stream by an
 // emulator that keeps running the game's GPU, its pictures read back for the emulator to show.
 
+#include "gx/rt_capture.hpp"
 #include "gxruntime/aurora_present.h"
 
 #include "aurora_backend_private.h"
@@ -589,6 +590,7 @@ void run() {
     }
     s_test_frame = &f.bytes;
     s_test_frame_copy = f.copy;
+    aurora::gx::rt::begin_copy(f.copy);
     const bool not_drawn = s->window != nullptr && waiting >= most_waiting_to_draw && !is_shot(f.copy);
     aurora::gx::fifo::set_drawing_off(not_drawn);
     for (std::size_t off = 0; off < f.bytes.size(); off += 32768) {
@@ -708,6 +710,12 @@ int aurora_present_start(const AuroraPresentConfig* config) {
     s->most_behind = config->most_behind;
   s->window = config->window;
   s->scale = std::clamp<std::uint32_t>(config->scale, 1u, 8u);
+  // AURORA_TEST_SIZE=<w>x<h> (tests): the picture's size, whatever the window's
+  if (const char* v = std::getenv("AURORA_TEST_SIZE")) {
+    unsigned w = 0, h = 0;
+    if (std::sscanf(v, "%ux%u", &w, &h) == 2 && w > 0 && h > 0)
+      s->width = w, s->height = h;
+  }
   if (const char* v = std::getenv("AURORA_MOST_BEHIND"); v != nullptr && std::atoi(v) > 0)  // (tests)
     s->most_behind = static_cast<std::uint32_t>(std::atoi(v));
   s->building.reserve(512u * 1024u);

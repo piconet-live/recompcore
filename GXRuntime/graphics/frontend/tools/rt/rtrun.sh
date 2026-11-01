@@ -7,7 +7,7 @@ R=$H/runs/$n; mkdir -p $R; python3 $H/rt-tool/rtrun.py $n $c $m $shots
 first=${shots%%,*}
 export SDL_JOYSTICK_HIDAPI_GAMECUBE=0 DOL_AURORA_DATA_DIR="$W\\port\\rt-user\\Aurora" AURORA_ANISO_GX=0 AURORA_RT=${RT:-0} AURORA_RT_NO_HUD=${NOHUD:-0}
 wl=SDL_JOYSTICK_HIDAPI_GAMECUBE:DOL_AURORA_DATA_DIR:AURORA_ANISO_GX:AURORA_RT:AURORA_RT_NO_HUD
-if [ -n "${CAP:-1}" ] && [ "${CAP:-1}" != 0 ]; then export AURORA_RT_CAPTURE="$W\\runs\\$n\\capture.bin" AURORA_RT_CAPTURE_AT=$((first-1)); wl=$wl:AURORA_RT_CAPTURE:AURORA_RT_CAPTURE_AT; fi
+if [ -n "${CAP:-1}" ] && [ "${CAP:-1}" != 0 ]; then export AURORA_RT_CAPTURE="$W\\runs\\$n\\capture.bin" AURORA_RT_CAPTURE_COPY=$first; wl=$wl:AURORA_RT_CAPTURE:AURORA_RT_CAPTURE_COPY; fi
 for kv in ${XENV:-}; do export "$kv"; wl=$wl:${kv%%=*}; done
 export WSLENV=$wl
 cd $H/run

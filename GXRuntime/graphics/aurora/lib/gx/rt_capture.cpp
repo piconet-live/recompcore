@@ -35,6 +35,7 @@ namespace {
 std::string s_path;
 u64 s_at = 0;
 u64 s_frame = 0;
+u64 s_atCopy = 0;
 std::vector<DrawRec> s_draws;
 std::vector<Vertex> s_verts;
 struct Tex {
@@ -160,7 +161,9 @@ void start() noexcept {
     s_at = std::strtoull(at, nullptr, 10);
   const char* noHud = std::getenv("AURORA_RT_NO_HUD");
   g_noHud = noHud != nullptr && noHud[0] == '1';
-  g_capturing = !s_path.empty() && s_at == 0;
+  if (const char* at = std::getenv("AURORA_RT_CAPTURE_COPY"))
+    s_atCopy = std::strtoull(at, nullptr, 10);
+  g_capturing = !s_path.empty() && s_at == 0 && s_atCopy == 0;
   if (g_neutral || !s_path.empty())
     std::fprintf(stderr, "[rt] reflection stages %s; capture %s at display copy %llu\n", g_neutral ? "off" : "on",
                  s_path.c_str(), static_cast<unsigned long long>(s_at));
@@ -278,9 +281,14 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
   };
   d.hasNormal = fields[GX_VA_NRM].type != GX_NONE;
   d.hasColor = fields[GX_VA_CLR0].type != GX_NONE;
-  const auto& cc = st.colorChannelConfig[0];
-  const auto& cs = st.colorChannelState[0];
-  d.lit = cc.lightingEnabled;
+  // one rasterised colour to a vertex: the channel the draw's stages read
+  u32 chan = 0;
+  for (u32 i = 0; i < d.stages && i < 16; ++i)
+    if (st.tevStages[i].channelId == GX_COLOR1A1 || st.tevStages[i].channelId == GX_COLOR1 || st.tevStages[i].channelId == GX_ALPHA1) {
+      chan = 1;
+      break;
+    }
+  d.lit = st.colorChannelConfig[GX_COLOR0 + chan].lightingEnabled;
 
   const auto read_vertex = [&](const u8* v) {
     Vertex out{};
@@ -314,37 +322,40 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
       const float len = std::sqrt(x * x + y * y + z * z);
       out.nrm[0] = len > 0 ? x / len : 0, out.nrm[1] = len > 0 ? y / len : 0, out.nrm[2] = len > 0 ? z / len : 1;
     }
+    // The channel the stages read, computed as the hardware does: colour and alpha each by their own control
     float vc[4]{1.f, 1.f, 1.f, 1.f};
-    if (d.hasColor)
-      if (const u8* s = source(GX_VA_CLR0, v))
-        rd_color(s, vf.attrs[GX_VA_CLR0].type, vc);
-    float mat[4], amb[4];
-    for (int c = 0; c < 4; ++c) {
-      mat[c] = cc.matSrc == GX_SRC_VTX ? vc[c] : cs.matColor[c];
-      amb[c] = cc.ambSrc == GX_SRC_VTX ? vc[c] : cs.ambColor[c];
-    }
-    if (cc.lightingEnabled) {
-      float sum[3] = {amb[0], amb[1], amb[2]};
-      for (u32 l = 0; l < GX::MaxLights; ++l) {
-        if (!cs.lightMask.test(l))
-          continue;
-        const auto& light = st.lights[l];
-        float lx = light.pos[0] - out.pos[0], ly = light.pos[1] - out.pos[1], lz = light.pos[2] - out.pos[2];
-        const float ll = std::sqrt(lx * lx + ly * ly + lz * lz);
-        if (ll > 0)
-          lx /= ll, ly /= ll, lz /= ll;
-        float ndl = lx * out.nrm[0] + ly * out.nrm[1] + lz * out.nrm[2];
-        ndl = cc.diffFn == GX_DF_NONE ? 1.f : cc.diffFn == GX_DF_SIGN ? ndl : std::max(ndl, 0.f);
-        for (int c = 0; c < 3; ++c)
-          sum[c] += light.color[c] * ndl;
+    const int clrAttr = GX_VA_CLR0 + chan;
+    if (fields[clrAttr].type != GX_NONE)
+      if (const u8* s = source(clrAttr, v))
+        rd_color(s, vf.attrs[clrAttr].type, vc);
+    const auto lit = [&](u32 ctrl, int first, int last) {
+      const auto& cc = st.colorChannelConfig[ctrl];
+      const auto& cs = st.colorChannelState[ctrl];
+      float sum[4]{};
+      for (int c = first; c < last; ++c)
+        sum[c] = cc.ambSrc == GX_SRC_VTX ? vc[c] : cs.ambColor[c];
+      if (cc.lightingEnabled) {
+        for (u32 l = 0; l < GX::MaxLights; ++l) {
+          if (!cs.lightMask.test(l))
+            continue;
+          const auto& light = st.lights[l];
+          float lx = light.pos[0] - out.pos[0], ly = light.pos[1] - out.pos[1], lz = light.pos[2] - out.pos[2];
+          const float ll = std::sqrt(lx * lx + ly * ly + lz * lz);
+          if (ll > 0)
+            lx /= ll, ly /= ll, lz /= ll;
+          float ndl = lx * out.nrm[0] + ly * out.nrm[1] + lz * out.nrm[2];
+          ndl = cc.diffFn == GX_DF_NONE ? 1.f : cc.diffFn == GX_DF_SIGN ? ndl : std::max(ndl, 0.f);
+          for (int c = first; c < last; ++c)
+            sum[c] += light.color[c] * ndl;
+        }
       }
-      for (int c = 0; c < 3; ++c)
-        out.ras[c] = mat[c] * std::clamp(sum[c], 0.f, 1.f);
-      out.ras[3] = mat[3];
-    } else {
-      for (int c = 0; c < 4; ++c)
-        out.ras[c] = mat[c];
-    }
+      for (int c = first; c < last; ++c) {
+        const float mat = cc.matSrc == GX_SRC_VTX ? vc[c] : cs.matColor[c];
+        out.ras[c] = cc.lightingEnabled ? mat * std::clamp(sum[c], 0.f, 1.f) : mat;
+      }
+    };
+    lit(GX_COLOR0 + chan, 0, 3);
+    lit(GX_ALPHA0 + chan, 3, 4);
     for (u32 t = 0; t < MaxUv && t < st.numTexGens; ++t) {
       const auto& g = st.tcgs[t];
       float in[4] = {0.f, 0.f, 1.f, 1.f};
@@ -416,6 +427,13 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
   s_draws.push_back(d);
 }
 
+void begin_copy(std::uint64_t copy) noexcept {
+  if (s_atCopy != 0 && copy == s_atCopy) {
+    g_capturing = true;
+    s_atCopy = 0;
+  }
+}
+
 void frame_end() noexcept {
   s_seenPerspective = false;
   if (g_capturing) {
@@ -442,7 +460,7 @@ void frame_end() noexcept {
     s_texs.clear();
   }
   ++s_frame;
-  if (!s_path.empty() && s_frame == s_at)
+  if (!s_path.empty() && s_atCopy == 0 && s_at != 0 && s_frame == s_at)
     g_capturing = true;
 }
 } // namespace aurora::gx::rt

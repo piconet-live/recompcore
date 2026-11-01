@@ -195,6 +195,7 @@ void main(uint3 id : SV_DispatchThreadID) {
       float t = q.CommittedRayT();
       Hit h = fetch(q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
       Draw d = Draws[h.draw];
+      if (P.mode == 7) { dbg = float3(h.draw & 255, (h.draw >> 8) & 255, 1) / 255.0; break; }
       if (d.cls >= 2) { tmin = t + 0.02; continue; }
       float4 surf = 0;
       if (d.cls == 1 && d.strength <= 0) {
@@ -204,8 +205,9 @@ void main(uint3 id : SV_DispatchThreadID) {
       float3 N = h.nrm;
       if (dot(N, v) > 0) N = -N;
       if (P.mode == 3) { dbg += N * 0.5 + 0.5; break; }
+      if (P.mode == 6) { dbg = float3(h.draw & 255, (h.draw >> 8) & 255, 1) / 255.0; break; }
       if (P.mode == 4) { dbg += shade(h, 0).rgb; break; }
-      float k = d.strength > 0 ? max(d.strength, min(d.strength * P.gain, 0.45)) : 0;
+      float k = d.strength;
       float cosv = saturate(-dot(N, v));
       float fres = pow(1 - cosv, 5);
       // the surface's own colour: pale paint shows a reflection as dirt, so less of it, softer; dark road shines more than pale road
@@ -233,12 +235,15 @@ void main(uint3 id : SV_DispatchThreadID) {
         // dim only the surface itself, never a flame or glow the raster drew over it
         float3 under = min(raster, baseCol * 1.2);
         term = strength * (seen - under * P.conserve * (k > 0 ? 1 - 0.6 * pale : 0.5));
+        // road: only what is brighter than the road itself shows; dim shapes would only print themselves on it as ghosts
+        if (k <= 0) term = max(term, 0);
         term *= bare;
       }
       break;
     }
     sum += term;
   }
+  if (P.mode >= 6) { Out[id.xy] = float4(dbg, 1); return; }
   if (P.mode >= 2) { Out[id.xy] = float4(dbg / P.spp, 1); return; }
   float3 refl = sum / P.spp;
   float3 lit = raster * light / P.spp;

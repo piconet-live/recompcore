@@ -22,4 +22,6 @@ void neutralise(ShaderConfig& config) noexcept;
 void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertices) noexcept;
 // copy_xfb, before the copy: a frame ends here
 void frame_end() noexcept;
+// The host's display copy about to be drawn. AURORA_RT_CAPTURE_COPY=<copy>: capture exactly that frame, the one its test picture shows
+void begin_copy(std::uint64_t copy) noexcept;
 } // namespace aurora::gx::rt

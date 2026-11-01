@@ -19,7 +19,7 @@ struct EngineLight {
 inline std::vector<EngineLight> engine_lights(const DrawRec* draws, std::uint32_t count, const Vertex* verts,
                                               bool (*in_view)(const DrawRec&)) {
   constexpr std::uint32_t MinRun = 4, Look = 3;  // quads in a run; draws looked ahead for the next (degenerate twins between)
-  constexpr float MaxStep = 3.f, MinBright = 0.1f;
+  constexpr float MaxStep = 3.f, MinBright = 0.25f;
   const auto bright = [](const DrawRec& d) { return std::max({d.stage[0].k[0], d.stage[0].k[1], d.stage[0].k[2]}); };
   const auto plume = [&](const DrawRec& d) {
     return in_view(d) && d.vertices > 0 && d.blendMode == 1 && d.blendDst == 1 && !d.depthUpdate && d.stages == 1;
@@ -66,5 +66,19 @@ inline std::vector<EngineLight> engine_lights(const DrawRec* draws, std::uint32_
     i = last;
   }
   return out;
+}
+
+// A machine: a draw right beside an engine light. Only machines earn the boosted reflection; nothing else is told apart.
+inline bool beside_engine_light(const DrawRec& d, const Vertex* verts, const std::vector<EngineLight>& lights, float reach = 5.f) {
+  if (d.vertices == 0)
+    return false;
+  float c[3]{};
+  for (std::uint32_t v = 0; v < d.vertices; ++v)
+    for (int a = 0; a < 3; ++a)
+      c[a] += verts[d.firstVertex + v].pos[a] / d.vertices;
+  for (const auto& l : lights)
+    if (std::hypot(c[0] - l.pos[0], c[1] - l.pos[1], c[2] - l.pos[2]) < reach)
+      return true;
+  return false;
 }
 } // namespace aurora::gx::rt
