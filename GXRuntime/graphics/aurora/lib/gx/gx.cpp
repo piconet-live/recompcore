@@ -1,4 +1,5 @@
 #include "gx.hpp"
+#include "rt_capture.hpp"
 
 #include "pipeline.hpp"
 #include "texture.hpp"
@@ -562,6 +563,7 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
   for (u8 i = 0; i < g_gxState.numTexGens; ++i) {
     config.shaderConfig.tcgs[i] = g_gxState.tcgs[i];
   }
+  if (rt::g_neutral) UNLIKELY { rt::neutralise(config.shaderConfig); }
   if (g_gxState.alphaCompare) {
     config.shaderConfig.alphaCompare = g_gxState.alphaCompare;
   }

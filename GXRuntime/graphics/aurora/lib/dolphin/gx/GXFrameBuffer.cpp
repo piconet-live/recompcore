@@ -1,4 +1,5 @@
 #include "gx.hpp"
+#include "../../gx/rt_capture.hpp"
 #include "__gx.h"
 
 #include "../../gfx/texture.hpp"
@@ -62,6 +63,7 @@ static gfx::TextureHandle g_xfbCopy;
 void release_xfb_copy() noexcept { g_xfbCopy.reset(); }
 
 void copy_xfb(u32 copyValue) noexcept {
+  rt::frame_end();
   // Bits of BP 0x52 (Dolphin's UPE_Copy): 0 clamp top, 1 clamp bottom, 7-8 gamma, 10 y-scale invert, 11 clear
   static const bool enabled = [] {
     const char* v = std::getenv("AURORA_XFB");

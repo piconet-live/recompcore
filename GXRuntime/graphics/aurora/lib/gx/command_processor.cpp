@@ -1,4 +1,5 @@
 #include "command_processor.hpp"
+#include "rt_capture.hpp"
 #include "fifo.hpp"
 
 #include "../gfx/recording.hpp"
@@ -820,7 +821,7 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
   u32 totalVtxBytes = vtxCount * vtxSize;
   if (totalVtxBytes > reader.remaining())
     UNLIKELY { handle_draw_overrun(totalVtxBytes, reader); }
-  if (g_gxState.cullMode == GX_CULL_ALL || g_drawingOff)
+  if (g_gxState.cullMode == GX_CULL_ALL || g_drawingOff || (rt::g_noHud && rt::skip_draw()))
     UNLIKELY {
       // GX_CULL_ALL rasterises nothing (the hardware culls both faces; lines and points too)
       reader.skip(totalVtxBytes);
@@ -884,10 +885,12 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
     lastDraw->vtxCount += vtxCount;
     lastDraw->indexCount += numIndices;
     gfx::detail::increment_merged_draw_count();
+    if (rt::g_capturing) UNLIKELY { rt::capture_draw(prim, fmt, vtxCount, vertexData.data()); }
     return;
   }
 
   handle_draw_unmerged(prim, fmt, vtxCount, vertRange);
+  if (rt::g_capturing) UNLIKELY { rt::capture_draw(prim, fmt, vtxCount, vertexData.data()); }
 }
 
 static void handle_draw(u8 cmd, ByteReader& reader) noexcept {

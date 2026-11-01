@@ -8,6 +8,7 @@
 #include "gfx/recording.hpp"
 #include "gfx/render_worker.hpp"
 #include "gx/command_processor.hpp"
+#include "gx/rt_capture.hpp"
 #include "gx/fifo.hpp"
 #include "gx/gx.hpp"
 #include "gx/texture.hpp"
@@ -196,6 +197,7 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
 #ifdef AURORA_ENABLE_GX
   gfx::initialize();
   gx::fifo::init();
+  gx::rt::start();
   imgui::create_context();
 #endif
   const auto size = window::get_window_size();
