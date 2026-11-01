@@ -2060,7 +2060,16 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTar
       normalAttachment = i;
     }
   }
-  const auto shaderSource = build_shader_source(config, dstAlphaMode, normalAttachment);
+  auto shaderSource = build_shader_source(config, dstAlphaMode, normalAttachment);
+  // A test of a truly empty cache: every shader differs from any run before, so neither Dawn's cache nor the driver's own
+  // (which no switch empties) has seen it. The branch never runs: no vertex has this index.
+  static const char* const salt = std::getenv("AURORA_TEST_SHADER_SALT");
+  if (salt != nullptr) {
+    const std::string line = fmt::format("if (vidx == {}u) {{ out.pos.x = 0.0; }}\n    return out;", 4000000000ull + std::strtoull(salt, nullptr, 10) % 100000000ull);
+    if (const auto at = shaderSource.find("return out;"); at != std::string::npos) {
+      shaderSource.replace(at, 11, line);
+    }
+  }
   const auto hash = xxh3_hash(dstAlphaMode, xxh3_hash(normalAttachment, xxh3_hash(config)));
   wgpu::ShaderSourceWGSL wgslDescriptor{};
   wgslDescriptor.code = shaderSource.c_str();
