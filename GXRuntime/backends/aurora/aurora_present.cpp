@@ -46,6 +46,12 @@ void set_host_window(void* window) noexcept;  // dawn/BackendBinding.cpp
 namespace aurora::window {
 void set_frame_buffer_size(int width, int height) noexcept;  // window.cpp
 }
+namespace aurora::gfx::timewarp {  // gfx/timewarp.cpp
+void start();
+void stop();
+void true_frame_coming() noexcept;
+void true_frame_done();
+}
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -446,6 +452,7 @@ void run() {
   const bool no_readback = env_on("AURORA_NO_READBACK") || s->window != nullptr;
   const bool discard = env_on("AURORA_DISCARD");
 
+  aurora::gfx::timewarp::start();
   FILE* log = s->log_path.empty() ? nullptr : std::fopen(s->log_path.c_str(), "w");
   if (log)
     std::fprintf(log, "copy,in_us,start_us,fed_us,presented_us,picture_us,waiting,bytes\n");
@@ -522,7 +529,9 @@ void run() {
       asked = true;
       asked_copy = f.copy;
     }
+    aurora::gfx::timewarp::true_frame_coming();
     aurora_backend_present();
+    aurora::gfx::timewarp::true_frame_done();
     const auto presented = Clock::now();
     auto pictured = presented;
     bool got = false;
@@ -578,6 +587,7 @@ void run() {
   }
   if (log)
     std::fclose(log);
+  aurora::gfx::timewarp::stop();
   dol_aurora_shutdown();
 }
 }  // namespace

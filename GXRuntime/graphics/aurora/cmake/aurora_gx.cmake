@@ -3,6 +3,7 @@ add_library(aurora_gx STATIC
         lib/gfx/encoding.cpp
         lib/gfx/frame.cpp
         lib/gfx/efb_readback.cpp
+        lib/gfx/timewarp.cpp
         lib/gfx/pipeline_cache.cpp
         lib/gfx/readback/copy_pack.cpp
         lib/gfx/readback/efb_gather.cpp

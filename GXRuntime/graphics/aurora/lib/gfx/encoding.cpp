@@ -1,4 +1,5 @@
 #include "encoding.hpp"
+#include "timewarp.hpp"
 
 #include "frame.hpp"
 
@@ -275,6 +276,12 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
         // The display copy is what the hardware shows: present it (render worker, as the present and readback)
         webgpu::set_present_override(passInfo.resolveTarget->texture, passInfo.resolveTarget->sampleTextureView,
                                      dstSize, passInfo.resolveTarget->format);
+        if (timewarp::g_on) {
+          timewarp::capture(cmd, passInfo.resolveTarget->texture, passInfo.resolveTarget->sampleTextureView, dstSize,
+                            passInfo.copySourceDepthView, passInfo.msaaSamples,
+                            passInfo.colorAttachments[SceneColorAttachmentIndex].size, passInfo.resolveRect.x,
+                            passInfo.resolveRect.y, passInfo.resolveRect.width, passInfo.resolveRect.height);
+        }
       }
     } else if (needsScaling || needsOpaqueAlpha || !sameFormat) {
       tex_copy_conv::blit(cmd, convReq);

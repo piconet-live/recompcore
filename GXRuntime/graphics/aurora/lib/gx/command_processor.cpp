@@ -1,6 +1,7 @@
 #include "command_processor.hpp"
 
 #include "../gfx/recording.hpp"
+#include "../gfx/timewarp.hpp"
 #include "../internal.hpp"
 #include "dolphin/gd/GDGeometry.h"
 #include "dolphin/gx/GXAurora.h"
@@ -880,7 +881,11 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
 static void handle_draw(u8 cmd, ByteReader& reader) noexcept {
   const auto fmt = static_cast<GXVtxFmt>(cmd & CP_VAT_MASK);
   const auto prim = static_cast<GXPrimitive>(cmd & CP_OPCODE_MASK);
-  draw_prim(prim, fmt, reader.read<u16>(), reader);
+  const u16 vtxCount = reader.read<u16>();
+  if (gfx::timewarp::g_on) {
+    gfx::timewarp::note_draw(cmd, vtxCount, reader.data() + reader.offset(), reader.remaining());
+  }
+  draw_prim(prim, fmt, vtxCount, reader);
 }
 
 void handle_aurora(ByteReader& reader) noexcept {
