@@ -12,6 +12,12 @@
 #include "../sqlite_utils.hpp"
 #include "../webgpu/gpu.hpp"
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -994,6 +1000,12 @@ static void pipeline_worker() {
 #ifdef TRACY_ENABLE
   tracy::SetThreadName("Pipeline compilation thread");
 #endif
+#ifdef _WIN32
+  // Never ahead of the game's thread or Aurora's: a race beside a load of compiles keeps its pace
+  if (g_hasPipelineThread) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+  }
+#endif
 
   bool wantedByDraw = false;
   while (g_hasPipelineThread || g_pipelinesPerFrame < BuildPipelinesPerFrame) {
@@ -1148,7 +1160,7 @@ PipelineRef find_pipeline(const rmlui::PipelineConfig& config) {
 #endif
 
 void precompile_pipeline(const gx::PipelineConfig& config) {
-  // Ahead of the warmup and behind any draw that is waiting. Remembered for a change of the render target's layout, and
+  // Behind any draw that is waiting (a draw moves its own pipeline to the front of the line). Remembered for a change of the render target's layout, and
   // written to the cache only when a draw uses it (find_pipeline).
   remember_pipeline_config(ShaderType::GX, config, UINT32_MAX, false);
   const auto scene = scene_render_target_layout();
@@ -1156,9 +1168,9 @@ void precompile_pipeline(const gx::PipelineConfig& config) {
   offscreen.colorAttachmentCount = 1;
   offscreen.sampleCount = 1;
   detail::finalize_render_target_layout(offscreen);
-  resolve_pipeline(ShaderType::GX, config, scene, PipelinePriority::Normal);
+  resolve_pipeline(ShaderType::GX, config, scene, PipelinePriority::Background);
   if (offscreen.key != scene.key) {
-    resolve_pipeline(ShaderType::GX, config, offscreen, PipelinePriority::Normal);
+    resolve_pipeline(ShaderType::GX, config, offscreen, PipelinePriority::Background);
   }
 }
 

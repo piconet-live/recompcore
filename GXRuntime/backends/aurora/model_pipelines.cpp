@@ -53,6 +53,7 @@ std::vector<PipelineConfig> s_bases;  // fog left at none
 std::set<std::vector<uint8_t>> s_seen;
 std::vector<bool> s_base_takes_fog;
 std::set<uint8_t> s_fogs{0};
+bool s_machine_file = false;  // a machine's: the renderer's post stages (a machine's flash) are tried too
 uint64_t s_meshes = 0, s_meshes_left_out = 0, s_configs = 0;
 FILE* s_dump = nullptr;
 
@@ -238,7 +239,7 @@ void attrs(const Mesh& m, ShaderConfig& c) {
     off = static_cast<u8>(off + size);
   };
   for (auto& a : c.attrs) a = {};
-  if (va & 1) add(GX_VA_PNMTXIDX, 1, 0, 0, 1);
+  if ((va & 1) || (m.model & 4)) add(GX_VA_PNMTXIDX, 1, 0, 0, 1);  // (a stitched model: a matrix index on every vertex)
   add(GX_VA_POS, 3, small ? GX_S16 : GX_F32, small ? 13 : 0, small ? 6 : 12);
   if (va & 0x02000000) add(GX_VA_NRM, 9, small ? GX_S16 : GX_F32, small ? 14 : 0, small ? 18 : 36);
   else if (va & 0x400) add(GX_VA_NRM, 3, small ? GX_S16 : GX_F32, small ? 14 : 0, small ? 6 : 12);
@@ -265,7 +266,8 @@ void forms(const Mesh& m) {
     return;
   }
   const uint32_t flags = m.flags;
-  const bool takes_fog = !(flags & 4);
+  // (seen: a mesh with the no-fog flag drawn with fog on, and one without it drawn with fog off: both forms for all)
+  const bool takes_fog = true;
   ShaderConfig shader{};
   shader.tevSwapTable = {TevSwap{GX_CH_RED, GX_CH_GREEN, GX_CH_BLUE, GX_CH_ALPHA},
                          TevSwap{GX_CH_RED, GX_CH_GREEN, GX_CH_BLUE, GX_CH_RED},
@@ -274,9 +276,9 @@ void forms(const Mesh& m) {
   attrs(m, shader);
   const auto blend_src = (flags & 0x20) ? static_cast<GXBlendFactor>(m.blend & 0xF) : GX_BL_SRCALPHA;
   const auto blend_dst = (flags & 0x40) ? static_cast<GXBlendFactor>(m.blend >> 4 & 0xF) : GX_BL_INVSRCALPHA;
-  for (const bool plain : {false, true}) {
-    if (plain && (flags & 0x80)) continue;
-    for (int post = 0; post < 4; ++post) {
+  {
+    const bool plain = false;
+    for (int post = 0; post < (s_machine_file ? 4 : 1); ++post) {
       ShaderConfig c = shader;
       stages(m, c, plain, post);
       // the texture coordinates in use; what stands beyond them is not in a real key either
@@ -378,6 +380,7 @@ void read_file(const File& f) {
     }
     return;
   }
+  s_machine_file = f.path.find("vehicle") != std::string::npos;
   read_models(d);
 }
 
@@ -446,6 +449,8 @@ void run() {
 }  // namespace
 
 extern "C" void aurora_present_model_file(const char* path, const uint8_t* bytes, uint64_t size) {
+  static const bool off = std::getenv("AURORA_TEST_NO_MODELS") != nullptr;  // a test: today's behaviour, to compare
+  if (off) return;
   File f;
   f.path = path;
   f.bytes.assign(bytes, bytes + size);
