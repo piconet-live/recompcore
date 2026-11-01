@@ -48,6 +48,7 @@ enum class CommandType {
   Draw,
   CustomDraw,
   DebugMarker,
+  SetStencilRef,
 };
 
 struct Command {
@@ -61,6 +62,7 @@ struct Command {
     DrawCommand draw;
     CustomDrawCommand customDraw;
     size_t debugMarkerIndex;
+    u32 setStencilRef;
   } data;
 };
 

@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -47,6 +48,7 @@
 
 namespace aurora::gfx::timewarp {
 bool g_on = false;
+bool g_pin = false;
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -71,6 +73,18 @@ struct Sample {
 
 // --- the camera, from the stream: the FIFO processor's during a frame, Aurora's thread's once it has drained
 std::vector<Sample> s_now, s_before;
+// the frame before's models by key, for the pinning (first at, then a chain through s_beforeNext)
+absl::flat_hash_map<u64, int> s_beforeFirst;
+std::vector<int> s_beforeNext;
+// the pinning, the FIFO processor's
+u32 s_drawClass = 0;
+bool s_sawWorld = false;
+bool s_modelPinned = false;
+double s_worldMove = 0;           // the camera's move, frame before (the test's scale; 0: no pinning this frame)
+std::array<float, 3> s_machineAt{}, s_machineAtNow{};  // the followed machine in view space, the frame before's and this frame's
+float s_machineSizeNow = 0;
+bool s_haveMachine = false;
+u64 s_pinnedDraws = 0, s_hudDraws = 0;
 std::array<float, 12> s_lastMv{};
 int s_rejected = 0;
 
@@ -233,17 +247,51 @@ fn source_pixel(h0: vec3f) -> vec2f {
   let q = u.vp.xy + vec2f(n.x * 0.5 + 0.5, 0.5 - n.y * 0.5) * u.vp.zw;
   return clamp(q, u.rect.xy, u.rect.xy + u.rect.zw - vec2f(1.0));
 }
+fn at(q: vec2f) -> vec4f {
+  return vec4f(textureSampleLevel(color, samp, (q - u.rect.xy) / u.rect.zw, 0.0).rgb, 1.0);
+}
+// The stored depth: z; a pinned pixel (machine, HUD) -z; a pixel an effect by the machine drew on -z - 10. An effect's
+// quads are mostly clear, and the stencil cannot tell: only where it shows bright is the pixel the effect's.
+fn effect_shows(q: vec2f) -> bool {
+  let c = at(q).rgb;
+  return max(c.r, max(c.g, c.b)) > 0.6;
+}
+fn pinned(q: vec2f) -> bool {
+  let v = textureLoad(depth, vec2i(q), 0).r;
+  if (v < -5.0) { return effect_shows(q); }
+  return v < 0.0;
+}
+// To the search a pinned pixel is no surface at all: the world goes on behind it.
 fn surface_iz(q: vec2f) -> f32 {
-  let d = textureLoad(depth, vec2i(q), 0).r;
+  var d = textureLoad(depth, vec2i(q), 0).r;
+  if (d < -5.0) {
+    if (effect_shows(q)) { return 0.0; }
+    d = -d - 10.0;
+  } else if (d < 0.0) {
+    return 0.0;
+  }
   return max((u.z.x - (d - u.z.z) / u.z.w) / u.z.y, 0.0);
 }
+var<private> g_fb: vec2f;
+// World colour for a shown world pixel: a source pixel that is pinned has none, the nearest world pixel towards the
+// shown place stands in (only what the pinned thing hid in the true frame comes here).
 fn show(q: vec2f) -> vec4f {
-  return vec4f(textureSampleLevel(color, samp, (q - u.rect.xy) / u.rect.zw, 0.0).rgb, 1.0);
+  if (!pinned(q)) { return at(q); }
+  let to = g_fb - q;
+  let l = length(to);
+  let way = select(vec2f(0.0, 1.0), to / l, l > 0.5);
+  for (var i = 1; i <= 8; i++) {
+    let p = clamp(q + way * f32(i) * 12.0, u.rect.xy, u.rect.xy + u.rect.zw - vec2f(1.0));
+    if (!pinned(p)) { return at(p); }
+  }
+  return at(q);
 }
 
 @fragment fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   let uv = (pos.xy - u.present.xy) / u.present.zw;
   let fb = u.rect.xy + uv * u.rect.zw;
+  g_fb = fb;
+  if (pinned(fb)) { return at(fb); }
   let n = (fb - u.vp.xy) / u.vp.zw * 2.0 - vec2f(1.0);
   let dir = vec3f((n.x + u.proj.y) / u.proj.x, (-n.y + u.proj.w) / u.proj.z, -1.0);
   let a = vec3f(dot(u.r0.xyz, dir), dot(u.r1.xyz, dir), dot(u.r2.xyz, dir));
@@ -352,6 +400,79 @@ struct TableRow {
   int count;
 };
 std::vector<TableRow> s_shotTable;
+
+// Depth (sample 0) into the warp's texture, negative where any sample's stencil says pinned
+constexpr std::string_view PinShaderMS = R"(
+@group(0) @binding(0) var d: texture_depth_multisampled_2d;
+@group(0) @binding(1) var m: texture_multisampled_2d<u32>;
+@vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  var p = array<vec2f, 3>(vec2f(-1.0, 1.0), vec2f(-1.0, -3.0), vec2f(3.0, 1.0));
+  return vec4f(p[i], 0.0, 1.0);
+}
+@fragment fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+  let c = vec2i(pos.xy);
+  var hit = 0u;
+  for (var s = 0; s < i32(textureNumSamples(m)); s++) { hit |= textureLoad(m, c, s).r; }
+  let z = textureLoad(d, c, 0);
+  if ((hit & 5u) != 0u) { return vec4f(-max(z, 1e-7), 0.0, 0.0, 1.0); }
+  if (hit != 0u) { return vec4f(-z - 10.0, 0.0, 0.0, 1.0); }
+  return vec4f(z, 0.0, 0.0, 1.0);
+}
+)";
+constexpr std::string_view PinShader = R"(
+@group(0) @binding(0) var d: texture_depth_2d;
+@group(0) @binding(1) var m: texture_2d<u32>;
+@vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  var p = array<vec2f, 3>(vec2f(-1.0, 1.0), vec2f(-1.0, -3.0), vec2f(3.0, 1.0));
+  return vec4f(p[i], 0.0, 1.0);
+}
+@fragment fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+  let c = vec2i(pos.xy);
+  let z = textureLoad(d, c, 0);
+  let hit = textureLoad(m, c, 0).r;
+  if ((hit & 5u) != 0u) { return vec4f(-max(z, 1e-7), 0.0, 0.0, 1.0); }
+  if (hit != 0u) { return vec4f(-z - 10.0, 0.0, 0.0, 1.0); }
+  return vec4f(z, 0.0, 0.0, 1.0);
+}
+)";
+wgpu::RenderPipeline s_pinPipeline;
+AfterWarp s_afterWarp;
+
+void snapshot_pinned(const wgpu::CommandEncoder& encoder, uint32_t msaaSamples) {
+  if (!s_pinPipeline) {
+    const std::string source{msaaSamples > 1 ? PinShaderMS : PinShader};
+    const wgpu::ShaderSourceWGSL wgsl{wgpu::ShaderSourceWGSL::Init{.code = source.c_str()}};
+    const wgpu::ShaderModuleDescriptor moduleDesc{.nextInChain = &wgsl, .label = "Timewarp pin"};
+    const auto module = g_device.CreateShaderModule(&moduleDesc);
+    const std::array targets{wgpu::ColorTargetState{.format = wgpu::TextureFormat::R32Float}};
+    const wgpu::FragmentState fragment{
+        .module = module, .entryPoint = "fs_main", .targetCount = targets.size(), .targets = targets.data()};
+    const wgpu::RenderPipelineDescriptor desc{
+        .label = "Timewarp pin",
+        .vertex = wgpu::VertexState{.module = module, .entryPoint = "vs_main"},
+        .primitive = wgpu::PrimitiveState{.topology = wgpu::PrimitiveTopology::TriangleList},
+        .multisample = wgpu::MultisampleState{.count = 1, .mask = UINT32_MAX},
+        .fragment = &fragment,
+    };
+    s_pinPipeline = g_device.CreateRenderPipeline(&desc);
+  }
+  const std::array entries{
+      wgpu::BindGroupEntry{.binding = 0, .textureView = webgpu::g_depthOnlyView},
+      wgpu::BindGroupEntry{.binding = 1, .textureView = webgpu::g_stencilOnlyView},
+  };
+  const wgpu::BindGroupDescriptor bindDesc{
+      .layout = s_pinPipeline.GetBindGroupLayout(0), .entryCount = entries.size(), .entries = entries.data()};
+  const auto bind = g_device.CreateBindGroup(&bindDesc);
+  const std::array attachments{wgpu::RenderPassColorAttachment{
+      .view = s_depthView, .loadOp = wgpu::LoadOp::Clear, .storeOp = wgpu::StoreOp::Store}};
+  const wgpu::RenderPassDescriptor passDesc{
+      .label = "Timewarp pin", .colorAttachmentCount = attachments.size(), .colorAttachments = attachments.data()};
+  const auto pass = encoder.BeginRenderPass(&passDesc);
+  pass.SetPipeline(s_pinPipeline);
+  pass.SetBindGroup(0, bind);
+  pass.Draw(3);
+  pass.End();
+}
 
 void make_resources() {
   if (s_pipeline)
@@ -517,7 +638,17 @@ void warp_job(int64_t due) {
   static uint64_t count = 0;
   const bool timed = s_queries && ++count % 120 == 0 && s_queryState.load(std::memory_order_acquire) == 0;
   const auto encoder = g_device.CreateCommandEncoder();
-  draw_warp(encoder, surfaceTexture.CreateView(), present, f, timed);
+  const auto surfaceView = surfaceTexture.CreateView();
+  draw_warp(encoder, surfaceView, present, f, timed);
+  if (s_afterWarp) {
+    const std::array attachments{wgpu::RenderPassColorAttachment{
+        .view = surfaceView, .loadOp = wgpu::LoadOp::Load, .storeOp = wgpu::StoreOp::Store}};
+    const wgpu::RenderPassDescriptor overDesc{
+        .label = "After warp", .colorAttachmentCount = attachments.size(), .colorAttachments = attachments.data()};
+    const auto over = encoder.BeginRenderPass(&overDesc);
+    s_afterWarp(over, present, config.width, config.height);
+    over.End();
+  }
   if (timed) {
     encoder.ResolveQuerySet(s_queries, 0, 4, s_queryResolve, 0);
     encoder.CopyBufferToBuffer(s_queryResolve, 0, s_queryRead, 0, 32);
@@ -640,6 +771,8 @@ void shoot_depth() {
   const auto& c = s_shown.c;
   const auto& p = s_shown.proj;
   const auto& v = s_shown.viewport;
+  std::fprintf(stderr, "[timewarp] pinned draws so far %llu, HUD draws %llu\n", static_cast<unsigned long long>(s_pinnedDraws),
+               static_cast<unsigned long long>(s_hudDraws));
   std::fprintf(stderr,
                "[timewarp] shot state: proj %g %g %g %g %g %g; viewport %g %g %g %g z %g %g; rect %g %g %g %g; depth %ux%u; "
                "C rows %.5f %.5f %.5f %.3f / %.5f %.5f %.5f %.3f / %.5f %.5f %.5f %.3f\n",
@@ -799,6 +932,9 @@ void start() {
     s_shotPrefix = shot;
   if (const char* at = std::getenv("AURORA_TIMEWARP_SHOT_AT"))
     s_shotAt = std::strtoull(at, nullptr, 10);
+  // (the format was chosen with the device; without the feature there is no mask)
+  g_pin = static_cast<bool>(webgpu::g_stencilOnlyView);
+  std::fprintf(stderr, "[timewarp] pinning %s\n", g_pin ? "on" : "off");
   s_now.reserve(4096);
   s_before.reserve(4096);
   s_logStartNs = ns_now();
@@ -826,6 +962,8 @@ void stop() {
     s_depth = {};
     s_depthView = {};
     s_pipeline = {};
+    s_pinPipeline = {};
+    s_afterWarp = nullptr;
     s_uniform = {};
     s_sampler = {};
     s_queries = {};
@@ -835,38 +973,159 @@ void stop() {
   render_worker::synchronize();
 }
 
+void set_after_warp(AfterWarp hook) {
+  render_worker::enqueue_work([hook = std::move(hook)]() mutable { s_afterWarp = std::move(hook); });
+}
+
+uint32_t draw_class() noexcept { return s_drawClass; }  // stencil bits: 1 the machine, 2 an effect by it, 4 the HUD
+
+namespace {
+// The first position of a draw whose positions come as big-endian floats in the stream (effects, trails, 2D): false
+// for indexed models, whose matrix tells instead.
+bool direct_positions(uint8_t cmd, const uint8_t* vertices, size_t available, uint32_t& offset, uint32_t& size, uint32_t& count) {
+  const auto& state = gx::g_gxState;
+  if (state.vtxDesc[GX_VA_POS] != GX_DIRECT)
+    return false;
+  const auto& fmt = state.vtxFmts[cmd & 7].attrs[GX_VA_POS];
+  if (fmt.type != GX_F32)
+    return false;
+  count = fmt.cnt == GX_POS_XYZ ? 3u : 2u;
+  offset = 0;
+  for (int attr = GX_VA_PNMTXIDX; attr < GX_VA_POS; ++attr)
+    offset += state.vtxDesc[attr] != GX_NONE ? 1u : 0u;
+  size = offset + count * 4u;
+  (void)vertices;
+  (void)available;
+  return true;
+}
+float read_be_float(const uint8_t* p) {
+  const uint32_t v = (uint32_t{p[0]} << 24) | (uint32_t{p[1]} << 16) | (uint32_t{p[2]} << 8) | p[3];
+  return std::bit_cast<float>(v);
+}
+constexpr float NearMachine = 10.f;
+} // namespace
+
 void note_draw(uint8_t cmd, uint16_t vtxCount, const uint8_t* vertices, size_t available) noexcept {
   const auto& state = gx::g_gxState;
-  if (state.projType != GX_PERSPECTIVE || vtxCount < 3 || s_now.size() >= 8192)
-    return;
-  const auto& pos = state.pnMtx[std::min<u32>(state.currentPnMtx, gx::MaxPnMtx - 1)].pos;
-  std::array<float, 12> mv;
-  std::memcpy(mv.data(), &pos, sizeof mv);
-  if (mv == s_lastMv)
+  s_drawClass = 0;
+  if (vtxCount < 1)
     return;
   const auto& vp = state.renderViewport;
   const auto [targetWidth, targetHeight] = gfx::get_render_target_size();
   // only the main view: the shadows, faces and emblems are drawn in small viewports
   if (vp.width < 0.8f * static_cast<float>(targetWidth) || vp.height < 0.5f * static_cast<float>(targetHeight))
     return;
-  s_lastMv = mv;
-  // the model: its vertex data (for a model, indices), its arrays
-  u64 key = 0xcbf29ce484222325ull;
-  const auto mix = [&key](u64 value) { key = (key ^ value) * 0x100000001b3ull; };
-  mix(cmd);
-  mix(vtxCount);
-  mix(reinterpret_cast<uintptr_t>(state.arrays[GX_VA_POS].data));
-  const size_t bytes = std::min<size_t>(available, 32);
-  for (size_t i = 0; i < bytes; ++i)
-    mix(vertices[i]);
-  const auto& proj = state.proj;
-  s_now.push_back({
-      .key = key,
-      .mv = mv,
-      .weight = static_cast<float>(vtxCount),
-      .proj = {proj.m0[0], proj.m0[2], proj.m1[1], proj.m1[2], proj.m2[2], proj.m2[3]},
-      .viewport = vp,
-  });
+  const auto& pos = state.pnMtx[std::min<u32>(state.currentPnMtx, gx::MaxPnMtx - 1)].pos;
+  std::array<float, 12> mv;
+  std::memcpy(mv.data(), &pos, sizeof mv);
+  uint32_t offset = 0, posSize = 0, posCount = 0;
+  const bool direct = direct_positions(cmd, vertices, available, offset, posSize, posCount);
+
+  if (state.projType != GX_PERSPECTIVE) {
+    // 2D after the world: the HUD. A picture over most of the screen (a flash, a blur) is no HUD: it goes with the world.
+    if (!s_sawWorld || !g_pin)
+      return;
+    bool whole = false;
+    if (direct && vtxCount <= 8) {
+      const u32 vtxSize = state.lastVtxSize;  // (as this draw's, from the draw before at worst)
+      float lowX = 1e9f, highX = -1e9f, lowY = 1e9f, highY = -1e9f;
+      const auto& proj = state.proj;
+      if (state.lastVtxFmt == static_cast<GXVtxFmt>(cmd & 7) && vtxSize != 0 && vtxSize * vtxCount <= available) {
+        for (u16 i = 0; i < vtxCount; ++i) {
+          const uint8_t* v = vertices + i * vtxSize + offset;
+          const float x = read_be_float(v), y = read_be_float(v + 4), z = posCount == 3 ? read_be_float(v + 8) : 0.f;
+          const float vx = mv[0] * x + mv[1] * y + mv[2] * z + mv[3], vy = mv[4] * x + mv[5] * y + mv[6] * z + mv[7];
+          const float nx = proj.m0[0] * vx + proj.m0[3], ny = proj.m1[1] * vy + proj.m1[3];
+          lowX = std::min(lowX, nx), highX = std::max(highX, nx), lowY = std::min(lowY, ny), highY = std::max(highY, ny);
+        }
+        whole = (highX - lowX) * (highY - lowY) > 2.0f;  // half of the 4 square units of the screen
+      }
+    }
+    if (!whole) {
+      s_drawClass = 5;  // (a draw that writes depth keeps 1, one that does not keeps 4)
+      ++s_hudDraws;
+    }
+    return;
+  }
+
+  const bool newModel = mv != s_lastMv;
+  if (newModel) {
+    s_lastMv = mv;
+    s_sawWorld = true;
+    s_modelPinned = false;
+    if (vtxCount >= 3 && s_now.size() < 8192) {
+      // the model: its vertex data (for a model, indices), its arrays
+      u64 key = 0xcbf29ce484222325ull;
+      const auto mix = [&key](u64 value) { key = (key ^ value) * 0x100000001b3ull; };
+      mix(cmd);
+      mix(vtxCount);
+      mix(reinterpret_cast<uintptr_t>(state.arrays[GX_VA_POS].data));
+      const size_t bytes = std::min<size_t>(available, 32);
+      for (size_t i = 0; i < bytes; ++i)
+        mix(vertices[i]);
+      const auto& proj = state.proj;
+      s_now.push_back({
+          .key = key,
+          .mv = mv,
+          .weight = static_cast<float>(vtxCount),
+          .proj = {proj.m0[0], proj.m0[2], proj.m1[1], proj.m1[2], proj.m2[2], proj.m2[3]},
+          .viewport = vp,
+      });
+      // The followed machine, by how it moves and never by what it is: a model that stays nearly where it was in the
+      // view while the world moves past, close to the camera.
+      const float dist = std::sqrt(mv[3] * mv[3] + mv[7] * mv[7] + mv[11] * mv[11]);
+      if (g_pin && s_worldMove > 1.0 && dist < 30.f) {
+        const auto found = s_beforeFirst.find(key);
+        double bestMove = 1e9, bestTurn = 0;
+        if (found != s_beforeFirst.end()) {
+          for (int at = found->second; at >= 0; at = s_beforeNext[at]) {
+            bool ok = false;
+            const Rigid c = correction(mv, s_before[at].mv, ok);
+            if (!ok)
+              continue;
+            const double move = std::sqrt(c.t[0] * c.t[0] + c.t[1] * c.t[1] + c.t[2] * c.t[2]);
+            if (move < bestMove) {
+              bestMove = move;
+              bestTurn = turn_of(c);
+            }
+          }
+        }
+        if (bestMove < 0.35 * s_worldMove + 0.3 && bestTurn < 0.15) {
+          s_modelPinned = true;
+          if (static_cast<float>(vtxCount) > s_machineSizeNow) {
+            s_machineSizeNow = static_cast<float>(vtxCount);
+            s_machineAtNow = {mv[3], mv[7], mv[11]};
+          }
+        }
+      }
+    }
+  }
+  if (!g_pin)
+    return;
+  if (s_modelPinned) {
+    s_drawClass = 1;
+    ++s_pinnedDraws;
+    return;
+  }
+  // What clings to it (flame, sparks, its shadow): a small draw built at its place in the view
+  if (s_haveMachine) {
+    float at[3] = {mv[3], mv[7], mv[11]};
+    bool have = false;
+    if (direct && available >= posSize) {
+      const uint8_t* v = vertices + offset;
+      const float x = read_be_float(v), y = read_be_float(v + 4), z = posCount == 3 ? read_be_float(v + 8) : 0.f;
+      for (int r = 0; r < 3; ++r)
+        at[r] = mv[r * 4] * x + mv[r * 4 + 1] * y + mv[r * 4 + 2] * z + mv[r * 4 + 3];
+      have = vtxCount <= 1024;
+    }
+    if (have) {
+      const float dx = at[0] - s_machineAt[0], dy = at[1] - s_machineAt[1], dz = at[2] - s_machineAt[2];
+      if (dx * dx + dy * dy + dz * dz < NearMachine * NearMachine) {
+        s_drawClass = 2;
+        ++s_pinnedDraws;
+      }
+    }
+  }
 }
 
 void capture(const wgpu::CommandEncoder& encoder, const wgpu::Texture& colorTexture, const wgpu::TextureView& colorView,
@@ -886,7 +1145,11 @@ void capture(const wgpu::CommandEncoder& encoder, const wgpu::Texture& colorText
   }
   if (s_queries)
     encoder.WriteTimestamp(s_queries, 2);
-  tex_copy_conv::snapshot_depth(encoder, depthView, msaaSamples, s_depthView);
+  if (g_pin && webgpu::g_stencilOnlyView) {
+    snapshot_pinned(encoder, msaaSamples);
+  } else {
+    tex_copy_conv::snapshot_depth(encoder, depthView, msaaSamples, s_depthView);
+  }
   if (s_queries)
     encoder.WriteTimestamp(s_queries, 3);
   s_coming.colorTexture = colorTexture;
@@ -923,6 +1186,20 @@ void true_frame_done() {
   s_before.swap(s_now);
   s_now.clear();
   s_lastMv = {};
+  s_beforeFirst.clear();
+  s_beforeNext.assign(s_before.size(), -1);
+  for (int k = static_cast<int>(s_before.size()) - 1; k >= 0; --k) {
+    auto [it, fresh] = s_beforeFirst.try_emplace(s_before[k].key, k);
+    if (!fresh) {
+      s_beforeNext[k] = it->second;
+      it->second = k;
+    }
+  }
+  s_worldMove = solved.valid ? std::sqrt(solved.c.t[0] * solved.c.t[0] + solved.c.t[1] * solved.c.t[1] + solved.c.t[2] * solved.c.t[2]) : 0.0;
+  s_haveMachine = s_machineSizeNow > 0;
+  s_machineAt = s_machineAtNow;
+  s_machineSizeNow = 0;
+  s_sawWorld = false;
   render_worker::enqueue_work([solved] { true_frame_shown(solved); });
 }
 } // namespace aurora::gfx::timewarp

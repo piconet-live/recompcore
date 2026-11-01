@@ -423,7 +423,7 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
   const float depthBiasSlopeScale = (UseReversedZ ? -1.0f : 1.0f) * std::bit_cast<float>(config.polygonOffsetScaleBits);
   const float depthBiasClamp = webgpu::g_hasCoreFeatures ? std::bit_cast<float>(config.polygonOffsetClampBits) : 0.0f;
   const bool writesDepth = config.depthCompare && options.depthUpdate;
-  const wgpu::DepthStencilState depthStencil{
+  wgpu::DepthStencilState depthStencil{
       .format = layout.depthStencilFormat,
       .depthWriteEnabled = writesDepth,
       .depthCompare = config.depthCompare ? to_compare_function(config.depthFunc) : wgpu::CompareFunction::Always,
@@ -431,6 +431,15 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
       .depthBiasSlopeScale = depthBiasSlopeScale,
       .depthBiasClamp = depthBiasClamp,
   };
+  if (layout.depthStencilFormat == wgpu::TextureFormat::Depth32FloatStencil8) {
+    // the warp's pinning: a drawn pixel takes the draw's class
+    depthStencil.stencilFront = {.compare = wgpu::CompareFunction::Always, .passOp = wgpu::StencilOperation::Replace};
+    depthStencil.stencilBack = depthStencil.stencilFront;
+    depthStencil.stencilReadMask = 0xFF;
+    // Draws that do not write depth (effects, 2D, what is transparent) leave bit 0, the followed machine's, alone: a
+    // glow's quad over the machine does not unpin it. timewarp.cpp says what the bits are.
+    depthStencil.stencilWriteMask = writesDepth ? 0xFF : 0x06;
+  }
   const auto blendState = to_blend_state(config.blendMode, config.blendFacSrc, config.blendFacDst, config.blendOp,
                                          config.dstAlpha, options.dstAlphaMode == DstAlphaMode::DualSource);
   std::array<wgpu::ColorTargetState, gfx::MaxColorAttachments> colorTargets{};

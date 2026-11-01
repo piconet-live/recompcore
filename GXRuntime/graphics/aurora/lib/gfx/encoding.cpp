@@ -171,6 +171,9 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
         apply_scissor(pass, currentScissor, passInfo.colorAttachments[SceneColorAttachmentIndex].size);
       }
     } break;
+    case CommandType::SetStencilRef:
+      pass.SetStencilReference(cmd.data.setStencilRef);
+      break;
     case CommandType::DebugMarker: {
 #if defined(AURORA_GFX_DEBUG_GROUPS)
       pass.InsertDebugMarker(wgpu::StringView(frame.debugMarkers[cmd.data.debugMarkerIndex]));
@@ -234,6 +237,12 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
         .stencilStoreOp = passInfo.hasStencil ? passInfo.stencilStoreOp : wgpu::StoreOp::Undefined,
         .stencilClearValue = passInfo.stencilClearValue,
     };
+    if (passInfo.depthStencilFormat == wgpu::TextureFormat::Depth32FloatStencil8) {
+      // the warp's pinning: the stencil lives and clears with the depth
+      depthStencilAttachment.stencilLoadOp = depthStencilAttachment.depthLoadOp;
+      depthStencilAttachment.stencilStoreOp = wgpu::StoreOp::Store;
+      depthStencilAttachment.stencilClearValue = 0;
+    }
     depthStencilAttachmentPtr = &depthStencilAttachment;
   }
   const auto label = passInfo.label.empty() ? fmt::format("Render pass {}", passIndex)

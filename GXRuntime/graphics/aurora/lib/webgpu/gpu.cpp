@@ -41,6 +41,15 @@ GraphicsConfig g_graphicsConfig;
 TextureWithSampler g_frameBuffer;
 TextureWithSampler g_frameBufferResolved;
 TextureWithSampler g_depthBuffer;
+wgpu::TextureView g_depthOnlyView;
+wgpu::TextureView g_stencilOnlyView;
+// AURORA_TIMEWARP's pinning marks the machine's and HUD's pixels in a stencil beside the depth (with the warp off,
+// the format and everything after it stay as they were)
+static bool timewarp_pin_wanted() {
+  const char* on = std::getenv("AURORA_TIMEWARP");
+  const char* pin = std::getenv("AURORA_TIMEWARP_PIN");
+  return on != nullptr && on[0] == '1' && (pin == nullptr || pin[0] != '0');
+}
 TextureWithSampler g_normalBuffer;
 
 // EFB -> XFB copy pipeline
@@ -944,6 +953,9 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     g_adapter.GetFeatures(&supportedFeatures);
     for (size_t i = 0; i < supportedFeatures.featureCount; ++i) {
       const auto feature = supportedFeatures.features[i];
+      if (feature == wgpu::FeatureName::Depth32FloatStencil8 && timewarp_pin_wanted()) {
+        requiredFeatures.push_back(feature);
+      }
       if (feature == wgpu::FeatureName::CoreFeaturesAndLimits || feature == wgpu::FeatureName::TextureCompressionBC ||
           feature == wgpu::FeatureName::TextureCompressionASTC ||
           feature == wgpu::FeatureName::TextureComponentSwizzle || feature == wgpu::FeatureName::DualSourceBlending) {
@@ -1090,7 +1102,9 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
               .height = size.native_fb_height,
               .presentMode = presentMode,
           },
-      .depthFormat = wgpu::TextureFormat::Depth32Float,
+      .depthFormat = timewarp_pin_wanted() && g_device.HasFeature(wgpu::FeatureName::Depth32FloatStencil8)
+                         ? wgpu::TextureFormat::Depth32FloatStencil8
+                         : wgpu::TextureFormat::Depth32Float,
       .msaaSamples = g_config.msaa,
       .textureAnisotropy = g_config.maxTextureAnisotropy,
   };
@@ -1118,6 +1132,8 @@ void shutdown() {
   g_presentOverride = {};
   g_frameBufferResolved = {};
   g_depthBuffer = {};
+  g_depthOnlyView = {};
+  g_stencilOnlyView = {};
   g_normalBuffer = {};
   g_graphicsConfig.normalBuffer = false;
   g_queue = {};
@@ -1159,6 +1175,14 @@ static void resize_swapchain_internal(uint32_t width, uint32_t height, uint32_t 
   g_presentOverride = {};
   g_frameBufferResolved = create_render_texture(width, height, false);
   g_depthBuffer = create_depth_texture(width, height);
+  g_depthOnlyView = {};
+  g_stencilOnlyView = {};
+  if (g_graphicsConfig.depthFormat == wgpu::TextureFormat::Depth32FloatStencil8) {
+    const wgpu::TextureViewDescriptor depthOnly{.dimension = wgpu::TextureViewDimension::e2D, .aspect = wgpu::TextureAspect::DepthOnly};
+    const wgpu::TextureViewDescriptor stencilOnly{.dimension = wgpu::TextureViewDimension::e2D, .aspect = wgpu::TextureAspect::StencilOnly};
+    g_depthOnlyView = g_depthBuffer.texture.CreateView(&depthOnly);
+    g_stencilOnlyView = g_depthBuffer.texture.CreateView(&stencilOnly);
+  }
   if (g_graphicsConfig.normalBuffer) {
     g_normalBuffer = create_normal_texture(width, height);
   }

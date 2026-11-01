@@ -109,7 +109,7 @@ void set_efb_targets(RenderPass& pass) {
       webgpu::g_graphicsConfig.msaaSamples > 1 ? webgpu::g_frameBufferResolved.texture : webgpu::g_frameBuffer.texture;
   pass.copySourceView =
       webgpu::g_graphicsConfig.msaaSamples > 1 ? webgpu::g_frameBufferResolved.view : webgpu::g_frameBuffer.view;
-  pass.copySourceDepthView = webgpu::g_depthBuffer.view;
+  pass.copySourceDepthView = webgpu::g_depthOnlyView ? webgpu::g_depthOnlyView : webgpu::g_depthBuffer.view;
   if (webgpu::g_graphicsConfig.normalBuffer) {
     pass.copySourceNormalTexture = webgpu::g_normalBuffer.texture;
   }
@@ -835,6 +835,21 @@ gx::DrawData* get_last_draw_command() {
     return nullptr;
   }
   return &inline_payload<gx::DrawData>(last.data.draw.payload.data());
+}
+
+static u32 s_stencilRef = 0;
+static uint32_t s_stencilRefPass = UINT32_MAX;
+
+void set_stencil_ref(u32 ref) noexcept {
+  if (g_recorder.currentRenderPass == UINT32_MAX)
+    return;
+  // (a new pass starts at 0)
+  const u32 inPass = s_stencilRefPass == g_recorder.currentRenderPass ? s_stencilRef : 0;
+  if (inPass != ref) {
+    push_command(CommandType::SetStencilRef, Command::Data{.setStencilRef = ref});
+  }
+  s_stencilRef = ref;
+  s_stencilRefPass = g_recorder.currentRenderPass;
 }
 
 Vec2<uint32_t> get_render_target_size() noexcept {

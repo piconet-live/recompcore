@@ -884,6 +884,9 @@ static void handle_draw(u8 cmd, ByteReader& reader) noexcept {
   const u16 vtxCount = reader.read<u16>();
   if (gfx::timewarp::g_on) {
     gfx::timewarp::note_draw(cmd, vtxCount, reader.data() + reader.offset(), reader.remaining());
+    if (gfx::timewarp::g_pin) {
+      gfx::set_stencil_ref(gfx::timewarp::draw_class());
+    }
   }
   draw_prim(prim, fmt, vtxCount, reader);
 }

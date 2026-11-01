@@ -119,11 +119,16 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config, const RenderT
       .targetCount = layout.colorAttachmentCount,
       .targets = colorTargets.data(),
   };
-  const wgpu::DepthStencilState depthStencil{
+  wgpu::DepthStencilState depthStencil{
       .format = layout.depthStencilFormat,
       .depthWriteEnabled = config.clearDepth,
       .depthCompare = wgpu::CompareFunction::Always,
   };
+  if (layout.depthStencilFormat == wgpu::TextureFormat::Depth32FloatStencil8) {
+    depthStencil.stencilFront = {.compare = wgpu::CompareFunction::Always, .passOp = wgpu::StencilOperation::Zero};
+    depthStencil.stencilBack = depthStencil.stencilFront;
+    depthStencil.stencilWriteMask = 0xFF;
+  }
   const auto label = fmt::format("EFB Clear Pipeline (color {}, alpha {}, depth {})", config.clearColor,
                                  config.clearAlpha, config.clearDepth);
   const wgpu::RenderPipelineDescriptor pipelineDescriptor{

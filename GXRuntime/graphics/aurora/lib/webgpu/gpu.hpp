@@ -50,6 +50,8 @@ extern GraphicsConfig g_graphicsConfig;
 extern TextureWithSampler g_frameBuffer;
 extern TextureWithSampler g_frameBufferResolved;
 extern TextureWithSampler g_depthBuffer;
+extern wgpu::TextureView g_depthOnlyView;    // with a stencil beside the depth (the warp's pinning), else empty
+extern wgpu::TextureView g_stencilOnlyView;
 extern TextureWithSampler g_normalBuffer;
 extern wgpu::RenderPipeline g_CopyPipeline;
 extern wgpu::RenderPipeline g_CopyPremultipliedAlphaPipeline;
