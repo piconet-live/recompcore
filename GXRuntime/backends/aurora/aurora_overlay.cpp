@@ -327,12 +327,157 @@ webgpu::PresentHook::Draw capture() {
   };
 }
 
+// ---- the colour filter: AURORA_COLOURBLIND=deuteranopia|protanopia|tritanopia ------------------------------------------
+// The whole window, the overlay included, in a last pass. It corrects, not simulates: what the deficiency loses is moved
+// to what it keeps (Fidaner's daltonization, on Machado, Oliveira and Fernandes 2009's matrices at severity 1, in linear light).
+struct Mat3 {
+  float m[3][3];
+};
+Mat3 mul(const Mat3& a, const Mat3& b) {
+  Mat3 r{};
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j)
+      for (int k = 0; k < 3; ++k)
+        r.m[i][j] += a.m[i][k] * b.m[k][j];
+  return r;
+}
+constexpr Mat3 PROTAN = {{{0.152286f, 1.052583f, -0.204868f}, {0.114503f, 0.786281f, 0.099216f}, {-0.003882f, -0.048116f, 1.051998f}}};
+constexpr Mat3 DEUTAN = {{{0.367322f, 0.860646f, -0.227968f}, {0.280085f, 0.672501f, 0.047413f}, {-0.011820f, 0.042940f, 0.968881f}}};
+constexpr Mat3 TRITAN = {{{1.255528f, -0.076749f, -0.178779f}, {-0.078411f, 0.930809f, 0.147602f}, {0.004733f, 0.691367f, 0.303900f}}};
+// What was lost in red moves to green and blue; what was lost in blue, to red and green.
+constexpr Mat3 SHIFT_RED = {{{0, 0, 0}, {0.7f, 1, 0}, {0.7f, 0, 1}}};
+constexpr Mat3 SHIFT_BLUE = {{{1, 0, 0.7f}, {0, 1, 0.7f}, {0, 0, 0}}};
+
+// corrected = rgb + shift * (rgb - simulated)
+Mat3 correction(const Mat3& simulated, const Mat3& shift) {
+  Mat3 lost{};
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j)
+      lost.m[i][j] = (i == j ? 1.0f : 0.0f) - simulated.m[i][j];
+  Mat3 r = mul(shift, lost);
+  for (int i = 0; i < 3; ++i)
+    r.m[i][i] += 1;
+  return r;
+}
+
+bool s_filter_on = false;
+Mat3 s_filter{};
+
+void read_filter_switch() {
+  const char* v = std::getenv("AURORA_COLOURBLIND");
+  if (v == nullptr || v[0] == 0 || std::strcmp(v, "off") == 0)
+    return;
+  if (std::strcmp(v, "deuteranopia") == 0)
+    s_filter = correction(DEUTAN, SHIFT_RED);
+  else if (std::strcmp(v, "protanopia") == 0)
+    s_filter = correction(PROTAN, SHIFT_RED);
+  else if (std::strcmp(v, "tritanopia") == 0)
+    s_filter = correction(TRITAN, SHIFT_BLUE);
+  else {
+    std::fprintf(stderr, "[aurora-present] AURORA_COLOURBLIND=%s is none of deuteranopia, protanopia, tritanopia, off: off\n", v);
+    return;
+  }
+  s_filter_on = true;
+  std::fprintf(stderr, "[aurora-present] colour filter: %s\n", v);
+}
+
+wgpu::Texture s_filter_texture;
+wgpu::RenderPipeline s_filter_pipeline;
+wgpu::BindGroupLayout s_filter_layout;
+wgpu::TextureView s_filter_view;
+wgpu::BindGroup s_filter_bind;
+
+void make_filter_pipeline() {
+  if (s_filter_pipeline)
+    return;
+  const auto row = [](int i) {
+    char text[80];
+    std::snprintf(text, sizeof text, "vec3f(%.6f, %.6f, %.6f)", s_filter.m[i][0], s_filter.m[i][1], s_filter.m[i][2]);
+    return std::string(text);
+  };
+  // (the rows go in as the columns of a transposed matrix: dot products by row)
+  const std::string code = R"(
+@group(0) @binding(0) var from: texture_2d<f32>;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  return vec4f(f32(i & 1u) * 4.0 - 1.0, f32(i & 2u) * 2.0 - 1.0, 0.0, 1.0);
+}
+fn to_linear(c: vec3f) -> vec3f { return select(pow((c + 0.055) / 1.055, vec3f(2.4)), c / 12.92, c <= vec3f(0.04045)); }
+fn to_srgb(c: vec3f) -> vec3f { return select(1.055 * pow(c, vec3f(1.0 / 2.4)) - 0.055, c * 12.92, c <= vec3f(0.0031308)); }
+@fragment fn fs(@builtin(position) at: vec4f) -> @location(0) vec4f {
+  let c = to_linear(textureLoad(from, vec2i(at.xy), 0).rgb);
+  let r = clamp(vec3f(dot()" + row(0) + R"(, c), dot()" + row(1) + R"(, c), dot()" + row(2) + R"(, c)), vec3f(0.0), vec3f(1.0));
+  return vec4f(to_srgb(r), 1.0);
+}
+)";
+  wgpu::ShaderSourceWGSL source{};
+  source.code = code.c_str();
+  const wgpu::ShaderModuleDescriptor module_desc{.nextInChain = &source, .label = "colour filter"};
+  const auto module = webgpu::g_device.CreateShaderModule(&module_desc);
+  const wgpu::BindGroupLayoutEntry entry{
+      .binding = 0,
+      .visibility = wgpu::ShaderStage::Fragment,
+      .texture = wgpu::TextureBindingLayout{.sampleType = wgpu::TextureSampleType::UnfilterableFloat,
+                                            .viewDimension = wgpu::TextureViewDimension::e2D}};
+  const wgpu::BindGroupLayoutDescriptor layout_desc{.entryCount = 1, .entries = &entry};
+  s_filter_layout = webgpu::g_device.CreateBindGroupLayout(&layout_desc);
+  const wgpu::PipelineLayoutDescriptor pipeline_layout{.bindGroupLayoutCount = 1, .bindGroupLayouts = &s_filter_layout};
+  const auto layout = webgpu::g_device.CreatePipelineLayout(&pipeline_layout);
+  const wgpu::ColorTargetState target{.format = webgpu::g_graphicsConfig.surfaceConfiguration.format,
+                                      .writeMask = wgpu::ColorWriteMask::All};
+  const wgpu::FragmentState fragment{.module = module, .entryPoint = "fs", .targetCount = 1, .targets = &target};
+  const wgpu::RenderPipelineDescriptor pipeline{
+      .label = "colour filter",
+      .layout = layout,
+      .vertex = wgpu::VertexState{.module = module, .entryPoint = "vs"},
+      .primitive = wgpu::PrimitiveState{.topology = wgpu::PrimitiveTopology::TriangleList},
+      .multisample = wgpu::MultisampleState{.count = 1, .mask = UINT32_MAX},
+      .fragment = &fragment,
+  };
+  s_filter_pipeline = webgpu::g_device.CreateRenderPipeline(&pipeline);
+}
+
+wgpu::TextureView filter_target(uint32_t width, uint32_t height) {
+  if (!s_filter_on)
+    return {};
+  make_filter_pipeline();
+  if (!s_filter_texture || s_filter_texture.GetWidth() != width || s_filter_texture.GetHeight() != height) {
+    const wgpu::TextureDescriptor desc{
+        .label = "colour filter's picture",
+        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
+        .dimension = wgpu::TextureDimension::e2D,
+        .size = {width, height, 1},
+        .format = webgpu::g_graphicsConfig.surfaceConfiguration.format,
+        .mipLevelCount = 1,
+        .sampleCount = 1,
+    };
+    s_filter_texture = webgpu::g_device.CreateTexture(&desc);
+    s_filter_view = s_filter_texture.CreateView();
+    const wgpu::BindGroupEntry entry{.binding = 0, .textureView = s_filter_view};
+    const wgpu::BindGroupDescriptor bind{.layout = s_filter_layout, .entryCount = 1, .entries = &entry};
+    s_filter_bind = webgpu::g_device.CreateBindGroup(&bind);
+  }
+  return s_filter_view;
+}
+
+void filter_pass(const wgpu::CommandEncoder& encoder, const wgpu::TextureView&, const wgpu::TextureView& surface) {
+  const wgpu::RenderPassColorAttachment attachment{
+      .view = surface, .loadOp = wgpu::LoadOp::Clear, .storeOp = wgpu::StoreOp::Store};
+  const wgpu::RenderPassDescriptor desc{.label = "colour filter", .colorAttachmentCount = 1, .colorAttachments = &attachment};
+  const auto pass = encoder.BeginRenderPass(&desc);
+  pass.SetPipeline(s_filter_pipeline);
+  pass.SetBindGroup(0, s_filter_bind, 0, nullptr);
+  pass.Draw(3);
+  pass.End();
+}
 }  // namespace
 
 void aurora_overlay_start(const uint8_t* ram) {
   s_ram = ram;
+  read_filter_switch();
   webgpu::PresentHook hook;
   hook.capture = capture;
+  hook.finalTarget = filter_target;
+  hook.finalPass = filter_pass;
   webgpu::set_present_hook(hook);
 }
 
