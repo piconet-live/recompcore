@@ -15,6 +15,7 @@
 extern "C" volatile int g_auroraDrawDump;  // command_processor.cpp (AURORA_DUMP_COPY)
 
 namespace aurora::gx::fifo {
+extern bool g_drawingOff;  // command_processor.cpp
 namespace {
 constexpr Module Log{"aurora::gx::fifo"};
 
@@ -404,6 +405,10 @@ void bp_copy_dst_base(u8, u32 value) noexcept { g_gxState.texCopyDestPhysical = 
 
 // EFB copy trigger (0x52)
 void bp_efb_copy(u8, u32 value) noexcept {
+  // A frame that is not drawn (Patch 25) copies nothing: a texture copied earlier stays as it was, and the buffer is not cleared.
+  if (g_drawingOff) {
+    return;
+  }
   const bool clear = reg_get(value, 1, 11) != 0;
   if (reg_get(value, 1, 14) != 0) {
     copy_xfb(value);

@@ -31,6 +31,10 @@
 #endif
 
 namespace aurora::webgpu {
+void force_device_loss_for_test() noexcept {  // aurora_present.cpp, AURORA_TEST_DEVICE_LOST
+  g_device.ForceLoss(wgpu::DeviceLostReason::Unknown, "a test's device loss");
+}
+
 static Module Log("aurora::gpu");
 
 wgpu::Device g_device;

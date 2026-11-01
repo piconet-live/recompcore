@@ -35,6 +35,7 @@ ports do not need it); **local** = tools and diagnostics for GXRuntime's harness
 | 21 | A byte that is no command never stops Aurora: one byte and on, as Dolphin's decoder (0xC0 and up were taken for draws); the first ones logged with the last commands read | upstream | gxr/r3 |
 | 22 | Indirect texturing as the hardware: a negative coordinate wraps up into 0..size (WGSL `%` kept the sign: course 9's whole surface speckled, 26 to 47.5 dB); the indirect sample rounded to its 8-bit value before the format's shift | upstream | gxr/r3 |
 | 24 | Embedded: the surface can be the host's window (`aurora::webgpu::set_host_window`), the SDL window stays hidden | local (until PresentTarget, upstream 12943d1) | new |
+| 25 | Frames decoded for their state only (`fifo::set_drawing_off`): no draw, no copy, no clear, for a presenter that has fallen behind and catches up | local | new |
 | 23 | Draw dump of one frame (`AURORA_DUMP_COPY`, `AURORA_DUMP_TEX`): TEV, samplers, texture formats, indirect stages, matrices | local | gxr/r3 |
 
 ## Not carried, and why
