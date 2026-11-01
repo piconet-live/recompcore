@@ -43,6 +43,9 @@ extern "C" volatile int g_auroraDrawDump;  // command_processor.cpp (AURORA_DUMP
 namespace aurora::webgpu {
 void set_host_window(void* window) noexcept;  // dawn/BackendBinding.cpp
 }
+namespace aurora::window {
+void set_frame_buffer_size(int width, int height) noexcept;  // window.cpp
+}
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -410,7 +413,12 @@ void run() {
     mode.efbHeight = 528;
     mode.xfbHeight = 528;
     VIConfigure(&mode);
-    if (!native_size)
+    // AURORA_NATIVE: the game's display copy is 448 of these 528 lines (40 to 488), and the present letterboxes by
+    // the copy's size: the frame buffer is taller than the window by 528/448, so that the copy is the window's pixels.
+    if (native_size)
+      aurora::window::set_frame_buffer_size(static_cast<int>(s->width),
+                                            static_cast<int>(s->height * 528u / 448u));
+    else
       VISetFrameBufferScale(static_cast<float>(s->scale));
     AuroraSetViewportPolicy(AURORA_VIEWPORT_STRETCH);
   } else {
