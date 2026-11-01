@@ -25,7 +25,7 @@ struct Job {
   Frame frame;
   std::vector<LiveTexture> textures;
   float proj[16], viewport[4];
-  float road, light, glow;
+  float road, light, glow, calm, wet;
   double captureMs, rulesMs;
   std::uint64_t copy = 0;
   std::uint32_t mergedLights = 0, lightPicks = 0;

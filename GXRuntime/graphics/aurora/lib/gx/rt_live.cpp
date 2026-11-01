@@ -58,6 +58,7 @@ struct Params {
   u32 skyFirst, glowCount;
   float glowGain;
   u32 glowShow;
+  float wet;
 };
 
 constexpr u32 Frames = 3, SlotDescriptors = 12, MaxTextures = 8192;
@@ -617,7 +618,8 @@ void run_rays(Job& job) {
   }();
   p.lightRange = range;
   p.lightShadow = shadow;
-  p.bodyCalm = 1.f;
+  p.bodyCalm = job.calm;
+  p.wet = job.wet;
   p.skyFirst = fr.skyFirstVertex;
   p.glowCount = glowCount;
   p.glowGain = job.glow;

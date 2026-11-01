@@ -42,6 +42,7 @@ struct Params {
   uint glowCount;
   float glowGain;
   uint glowShow;
+  float wet;
 };
 struct Light { float3 pos; float3 colour; float reach; };
 struct GlowLight { float3 pos; float area; float3 colour; float radius; };
@@ -291,7 +292,7 @@ void main(uint3 id : SV_DispatchThreadID) {
       float pale = smoothstep(0.45, 0.85, base) * P.bodyCalm;
       float strength;
       if (k > 0) strength = k * (1 - 0.65 * pale) + (1 - k) * fres * (1 - 0.8 * pale);
-      else strength = (N.y > 0.2 && d.cls == 0) ? P.roadShine * pow(1 - cosv, 3) * (1 - 0.6 * smoothstep(0.1, 0.5, base)) * ((d.highlight & 1) != 0 ? 1.0 : 0.75) : 0;
+      else strength = (N.y > 0.2 && d.cls == 0) ? P.roadShine * (P.wet + (1 - P.wet) * pow(1 - cosv, 3)) * (1 - 0.6 * smoothstep(0.1, 0.5, base)) * ((d.highlight & 1) != 0 ? 1.0 : 0.75) : 0;
       // where the raster is far brighter than this surface, a glow covers it: neither reflection nor light shows through the flame
       float bare = 1 - smoothstep(0.15, 0.45, lum(raster) - base);
       if (P.lightGain > 0 && (d.highlight & 4) == 0) light += engine_light(h.pos, N) * P.lightGain * bare;
