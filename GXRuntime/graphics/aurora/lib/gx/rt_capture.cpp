@@ -53,6 +53,7 @@ bool s_rayed = false;
 double s_captureMs = 0;
 float s_road = 0.9f, s_light = 1.f;
 u32 s_liveFirstNew = 0;
+u64 s_copyNow = 0;
 std::vector<DrawRec> s_draws;
 std::vector<Vertex> s_verts;
 struct Tex {
@@ -137,6 +138,8 @@ struct TexSnap {
   GXTlutObj_ tlut;
   bool palette, tlutOk;
 };
+constexpr u32 MostTexAvg = 8192;
+float s_texAvg[MostTexAvg][4];  // a texture's mean colour, for a draw's brightness; written before its index is known to anyone
 using TexKey = std::tuple<const void*, u32, u32, u32, const void*>;
 std::mutex s_texLock;
 u32 add_texture(const TexSnap& snap) {
@@ -176,6 +179,15 @@ u32 add_texture(const TexSnap& snap) {
   const u32 index = g_live ? s_liveTextures++ : static_cast<u32>(s_texs.size());
   Tex t{w, h, static_cast<u32>(obj.wrap_s()), static_cast<u32>(obj.wrap_t()), index, {}};
   t.rgba.assign(conv.data.data(), conv.data.data() + static_cast<size_t>(w) * h * 4u);
+  if (index < MostTexAvg) {
+    u64 sum[4]{};
+    for (size_t i = 0; i < t.rgba.size(); i += 4)
+      for (int c = 0; c < 4; ++c)
+        sum[c] += t.rgba[i + c];
+    const double n = 255.0 * w * h;
+    for (int c = 0; c < 4; ++c)
+      s_texAvg[index][c] = static_cast<float>(sum[c] / n);
+  }
   s_texs.push_back(std::move(t));
   s_texIndex[key] = index;
   return index;
@@ -522,6 +534,49 @@ void translate(const Packet& st, DrawRec& d, Vertex* outVerts) noexcept {
     break;
   }
   d.vertices = static_cast<u32>(out - outVerts);
+  // an additive draw's light, as its first stage and first vertex say
+  if (d.projType == 0 && d.blendMode == 1 && d.blendDst == 1 && d.stages > 0) {
+    float mn[3] = {1e30f, 1e30f, 1e30f}, mx[3] = {-1e30f, -1e30f, -1e30f};
+    for (u32 i = 0; i < vtxCount; ++i)
+      for (int a = 0; a < 3; ++a)
+        mn[a] = std::min(mn[a], strip[i].pos[a]), mx[a] = std::max(mx[a], strip[i].pos[a]);
+    const bool line = prim == GX_LINES || prim == GX_LINESTRIP;
+    for (int a = 0; a < 3; ++a) {
+      d.lightPos[a] = line ? strip[0].pos[a] : (mn[a] + mx[a]) / 2;
+      d.lightExtent = std::max(d.lightExtent, mx[a] - mn[a]);
+    }
+    const StageRec& s0 = d.stage[0];
+    float tex[4] = {1.f, 1.f, 1.f, 1.f};
+    if (s0.tex != UINT32_MAX && s0.map != GX_TEXMAP_NULL && s0.tex < MostTexAvg)
+      std::memcpy(tex, s_texAvg[s0.tex], sizeof tex);
+    const float* ras = strip[0].ras;
+    const auto arg = [&](u32 code, int c) -> float {
+      switch (code) {
+      case 8:
+        return tex[c];
+      case 9:
+        return tex[3];
+      case 10:
+        return ras[c];
+      case 11:
+        return ras[3];
+      case 12:
+        return 1.f;
+      case 14:
+        return s0.k[c];
+      default:
+        return 0.f;
+      }
+    };
+    float most = 0.f;
+    for (int c = 0; c < 3; ++c) {
+      const float a = arg(s0.ca, c), b = arg(s0.cb, c), k = arg(s0.cc, c), e = arg(s0.cd, c);
+      d.lightColour[c] = std::clamp(e + (1 - k) * a + k * b, 0.f, 1.f);
+      most = std::max(most, d.lightColour[c]);
+    }
+    const float alpha = d.blendSrc == 4 ? tex[3] * (d.hasColor ? ras[3] : s0.k[3]) : 1.f;
+    d.lightBright = most * alpha;
+  }
 }
 
 #if defined(AURORA_RT_LIVE)
@@ -543,9 +598,85 @@ std::unique_ptr<live::Job> s_jobOwned;
 std::unique_ptr<Chunk> s_chunk;
 u32 s_epoch = 0, s_baseDraw = 0, s_baseVert = 0, s_nextDraw = 0, s_nextVert = 0;
 
+// A light's middle hops as the draws in it change from frame to frame: half a step towards where it was, when it was near
+void smooth_lights(Frame& f) {
+  static std::mutex lock;
+  static std::vector<EngineLight> last;
+  std::lock_guard l{lock};
+  for (EngineLight& n : f.lights) {
+    const EngineLight* best = nullptr;
+    float bestD = 6.f * 6.f;
+    for (const EngineLight& o : last) {
+      const float dx = o.pos[0] - n.pos[0], dy = o.pos[1] - n.pos[1], dz = o.pos[2] - n.pos[2], dd = dx * dx + dy * dy + dz * dz;
+      if (dd < bestD)
+        bestD = dd, best = &o;
+    }
+    if (best != nullptr)
+      for (int a = 0; a < 3; ++a)
+        n.pos[a] = (n.pos[a] + best->pos[a]) / 2;
+  }
+  last = f.lights;
+}
+
+FILE* s_lightLog = nullptr;
+bool s_lateCheck = false;
+struct LateRec {
+  const live::Job* job;
+  u32 draw, verts;
+  bool additive, indexed;
+  std::vector<Vertex> v;
+};
+std::mutex s_lateLock;
+std::vector<LateRec> s_late;  // the stream's own reading of each draw, to compare with the workers'
+u64 s_lateDraws[2]{}, s_lateMoved[2]{};
+double s_lateMost[2]{};
+
+void log_lights(const live::Job& j, const Frame& f) {
+  std::fprintf(s_lightLog, "F,%llu,%g,%g,%g,%g,%g,%g,%g,%g\n", static_cast<unsigned long long>(j.copy), j.proj[0], j.proj[5], j.proj[2], j.proj[6], j.viewport[0],
+               j.viewport[1], j.viewport[2], j.viewport[3]);
+  for (const auto& p : f.merged)
+    std::fprintf(s_lightLog, "M,%g,%g,%g,%g,%g,%g,%g\n", p.pos[0], p.pos[1], p.pos[2], p.colour[0], p.colour[1], p.colour[2], p.weight);
+  for (u32 i = 0; i < j.drawCount; ++i) {
+    const DrawRec& d = j.draws[j.baseDraw + i];
+    if (d.lightExtent > 0.f)
+      std::fprintf(s_lightLog, "C,%u,%u,%g,%g,%g,%g,%g,%g,%g,%g,%u,%u,%u,%u\n", static_cast<u32>(d.prim), d.vtxCount, d.lightPos[0], d.lightPos[1], d.lightPos[2], d.lightColour[0], d.lightColour[1],
+                   d.lightColour[2], d.lightExtent, d.lightBright, d.stage[0].tex, d.stage[0].ca, d.stage[0].cc, d.blendSrc);
+  }
+}
+
+// How far the workers' later reading of guest memory strays from what the stream saw
+void late_compare(const live::Job& j) {
+  std::lock_guard lock{s_lateLock};
+  for (const LateRec& r : s_late) {
+    if (r.job != &j || r.draw < j.baseDraw)
+      continue;
+    const DrawRec& d = j.draws[r.draw];
+    double most = 0;
+    for (u32 v = 0; v < r.verts; ++v) {
+      const Vertex& a = j.verts[d.firstVertex + j.baseVert + v];
+      const Vertex& b = r.v[v];
+      most = std::max<double>(most, std::hypot(a.pos[0] - b.pos[0], a.pos[1] - b.pos[1], a.pos[2] - b.pos[2]));
+    }
+    const int k = r.additive ? 1 : 0;
+    s_lateDraws[k] += 1;
+    s_lateMoved[k] += most > 1e-4 ? 1 : 0;
+    s_lateMost[k] = std::max(s_lateMost[k], most);
+  }
+  s_late.erase(std::remove_if(s_late.begin(), s_late.end(), [&](const LateRec& r) { return r.job == &j; }), s_late.end());
+  static u32 n = 0;
+  if (++n % 300 == 0)
+    std::fprintf(stderr, "[rt] late read: draws moved by reading later: others %llu of %llu (most %.3f), additive %llu of %llu (most %.3f)\n",
+                 static_cast<unsigned long long>(s_lateMoved[0]), static_cast<unsigned long long>(s_lateDraws[0]), s_lateMost[0],
+                 static_cast<unsigned long long>(s_lateMoved[1]), static_cast<unsigned long long>(s_lateDraws[1]), s_lateMost[1]);
+}
+
 void run_rules(live::Job& j) {
   const auto t0 = std::chrono::steady_clock::now();
-  build_frame(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, Tuning{}, j.frame);
+  Tuning tuning;
+  if (const char* v = std::getenv("AURORA_RT_LIGHT_FULL"))
+    tuning.lightFull = static_cast<float>(std::atof(v));
+  build_frame(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, tuning, j.frame);
+  smooth_lights(j.frame);
   j.drawable = j.frame.main != nullptr && !j.frame.verts.empty();
   j.textures.clear();
   if (j.drawable) {
@@ -560,6 +691,11 @@ void run_rules(live::Job& j) {
     std::memcpy(j.viewport, j.frame.main->viewport, sizeof j.viewport);
   }
   j.rulesMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  j.mergedLights = static_cast<u32>(j.frame.merged.size()), j.lightPicks = static_cast<u32>(j.frame.picks.size());
+  if (s_lightLog != nullptr && j.drawable)
+    log_lights(j, j.frame);
+  if (s_lateCheck)
+    late_compare(j);
   j.done.set_value();
 }
 
@@ -619,8 +755,17 @@ void start_workers() {
   static const bool started = [] {
     const char* v = std::getenv("AURORA_RT_WORKERS");
     const int n = v != nullptr ? std::atoi(v) : 2;
+    if (const char* path = std::getenv("AURORA_RT_LIGHTLOG")) {
+      s_lightLog = std::fopen(path, "wb");
+      if (s_lightLog != nullptr)
+        std::setvbuf(s_lightLog, nullptr, _IOFBF, 1 << 20);
+    }
+    s_lateCheck = std::getenv("AURORA_RT_LATECHECK") != nullptr;
     for (int i = 0; i < std::max(n, 1); ++i)
-      std::thread(worker).detach();
+      std::thread([] {
+        live::name_thread();
+        worker();
+      }).detach();
     return true;
   }();
   (void)started;
@@ -720,9 +865,11 @@ static void make_packet(u8* room, const size_t size, const u32 stages, const u32
 }
 
 void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertices, size_t rawBytes) noexcept {
-  if (prim == GX_LINES || prim == GX_LINESTRIP || prim == GX_POINTS || vtxCount < 3)
-    return;
   auto& st = g_gxState;
+  // lines only for what they light: sparks are additive lines and strips, and no ray ever hits a line
+  const bool line = prim == GX_LINES || prim == GX_LINESTRIP;
+  if (prim == GX_POINTS || (!line && vtxCount < 3) || (line && (vtxCount < 2 || st.blendMode != 1 || st.blendFacDst != 1 || !g_live)))
+    return;
   if (g_live && st.projType != GX_PERSPECTIVE)
     return;
   const auto liveStart = g_live ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -744,6 +891,13 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
     }
     make_packet(room, size, stages, mtxCount, lit, prim, fmt, vtxCount, vertices, static_cast<u32>(rawBytes), s_nextDraw, s_nextVert,
                 s_nextDraw - s_baseDraw, s_nextVert - s_baseVert, s_epoch);
+    if (s_lateCheck && tv > 0) {
+      LateRec r{s_job, s_nextDraw, tv, st.blendMode == 1 && st.blendFacDst == 1, st.vtxDesc[GX_VA_POS] != GX_DIRECT, std::vector<Vertex>(tv)};
+      DrawRec tmp;
+      translate(*reinterpret_cast<const Packet*>(room), tmp, r.v.data());
+      std::lock_guard lock{s_lateLock};
+      s_late.push_back(std::move(r));
+    }
     s_nextDraw += 1, s_nextVert += tv;
     s_captureMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - liveStart).count();
     return;
@@ -790,6 +944,7 @@ static void send_rays() noexcept {
   job->baseDraw = s_baseDraw, job->baseVert = s_baseVert, job->drawCount = draws;
   job->road = s_road, job->light = s_light;
   job->captureMs = s_captureMs;
+  job->copy = s_copyNow;
   s_captureMs = 0;
   // the guard the job began with: if the workers are already through, one of them runs the rules
   live::Job* j = job.get();
@@ -825,6 +980,9 @@ void efb_cleared() noexcept {
 }
 
 void begin_copy(std::uint64_t copy) noexcept {
+#if defined(AURORA_RT_LIVE)
+  s_copyNow = copy;
+#endif
   if (s_atCopy != 0 && copy == s_atCopy) {
     g_capturing = true;
     s_atCopy = 0;

@@ -1,4 +1,5 @@
 #pragma once
+#include <cmath>
 #include <memory>
 #include <new>
 #include <utility>
@@ -15,63 +16,51 @@
 namespace aurora::gx::rt {
 struct EngineLight {
   float pos[3];
-  float colour[3];  // the flame's own K colour
+  float colour[3];  // the draw's own colour, by its strength
+  float reach;      // 1 for a machine's flame, less for a small dim one
 };
 
-// Engine lights: a machine's flame is drawn as a plume, additive quads without depth writes, one stage, one texture, each
-// a step behind the last with its K colour fading. The first of such a run sits at the nozzle and holds the flame's colour,
-// so a custom flame colour carries through. Nothing here looks at where the flame points. Other additive draws (signs,
-// beams, sparks, decals) have no fading run and cast no light. `from`/`to`: the draws of the main view.
-inline std::vector<EngineLight> engine_lights(const DrawRec* draws, std::uint32_t count, const Vertex* verts,
-                                              bool (*in_view)(const DrawRec&)) {
-  constexpr std::uint32_t MinRun = 4, Look = 3;  // quads in a run; draws looked ahead for the next (degenerate twins between)
-  constexpr float MaxStep = 3.f, MinBright = 0.25f;
-  const auto bright = [](const DrawRec& d) { return std::max({d.stage[0].k[0], d.stage[0].k[1], d.stage[0].k[2]}); };
-  const auto plume = [&](const DrawRec& d) {
-    return in_view(d) && d.vertices > 0 && d.blendMode == 1 && d.blendDst == 1 && !d.depthUpdate && d.stages == 1;
-  };
-  const auto centre = [&](const DrawRec& d, float* c) {
-    float mn[3] = {1e30f, 1e30f, 1e30f}, mx[3] = {-1e30f, -1e30f, -1e30f};
-    for (std::uint32_t v = 0; v < d.vertices; ++v)
-      for (int a = 0; a < 3; ++a) {
-        mn[a] = std::min(mn[a], verts[d.firstVertex + v].pos[a]);
-        mx[a] = std::max(mx[a], verts[d.firstVertex + v].pos[a]);
-      }
-    float size = 0;
-    for (int a = 0; a < 3; ++a) {
-      c[a] = (mn[a] + mx[a]) / 2;
-      size = std::max(size, mx[a] - mn[a]);
-    }
-    return size;
-  };
-  std::vector<EngineLight> out;
+// The one rule for lights: anything additive, small and bright in the main view casts light. No labels: a flame, a spark or a
+// mine's blast are the same to it. Colour from the draw, strength its brightness by its size; draws within MergeR become one.
+struct LightPick {
+  float pos[3], colour[3], weight, extent, bright;
+};
+inline void light_picks(const DrawRec* draws, std::uint32_t count, bool (*in_view)(const DrawRec&), std::vector<LightPick>& out, float maxSize, float minBright) {
+  out.clear();
   for (std::uint32_t i = 0; i < count; ++i) {
-    const DrawRec& head = draws[i];
-    float at[3];
-    if (!plume(head) || bright(head) < MinBright || centre(head, at) <= 0.f)
+    const DrawRec& d = draws[i];
+    if (d.lightExtent <= 0.f || d.lightExtent >= maxSize || d.lightBright <= minBright || !d.colorUpdate || !in_view(d))
       continue;
-    std::uint32_t run = 1, last = i;
-    float was[3] = {at[0], at[1], at[2]}, level = bright(head);
-    for (std::uint32_t j = i + 1; j < count && j <= last + Look; ++j) {
-      const DrawRec& d = draws[j];
-      float c[3];
-      if (!plume(d) || centre(d, c) <= 0.f)
-        continue;
-      if (d.stage[0].tex != head.stage[0].tex || bright(d) >= level)
-        break;
-      if (std::hypot(c[0] - was[0], c[1] - was[1], c[2] - was[2]) > MaxStep)
-        break;
-      level = bright(d);
-      was[0] = c[0], was[1] = c[1], was[2] = c[2];
-      last = j;
-      ++run;
-    }
-    if (run < MinRun)
-      continue;
-    out.push_back({{at[0], at[1], at[2]}, {head.stage[0].k[0], head.stage[0].k[1], head.stage[0].k[2]}});
-    i = last;
+    out.push_back({{d.lightPos[0], d.lightPos[1], d.lightPos[2]},
+                   {d.lightColour[0], d.lightColour[1], d.lightColour[2]},
+                   d.lightBright * std::max(d.lightExtent, 0.5f), d.lightExtent, d.lightBright});
   }
-  return out;
+}
+inline void merge_lights(std::vector<LightPick>& picks, float mergeR, std::vector<LightPick>& out) {
+  std::sort(picks.begin(), picks.end(), [](const LightPick& a, const LightPick& b) { return a.weight > b.weight; });
+  out.clear();
+  for (const LightPick& p : picks) {
+    bool merged = false;
+    for (LightPick& q : out) {
+      const float dx = q.pos[0] / q.weight - p.pos[0], dy = q.pos[1] / q.weight - p.pos[1], dz = q.pos[2] / q.weight - p.pos[2];
+      if (dx * dx + dy * dy + dz * dz < mergeR * mergeR) {
+        for (int a = 0; a < 3; ++a)
+          q.pos[a] += p.pos[a] * p.weight, q.colour[a] += p.colour[a] * p.weight;
+        q.weight += p.weight;
+        merged = true;
+        break;
+      }
+    }
+    if (!merged) {
+      LightPick q = p;
+      for (int a = 0; a < 3; ++a)
+        q.pos[a] *= p.weight, q.colour[a] *= p.weight;
+      out.push_back(q);
+    }
+  }
+  for (LightPick& q : out)
+    for (int a = 0; a < 3; ++a)
+      q.pos[a] /= q.weight, q.colour[a] /= q.weight;
 }
 
 // A machine: a draw right beside an engine light. Only machines earn the boosted reflection; nothing else is told apart.
@@ -102,12 +91,15 @@ struct GpuDraw {
 struct Tuning {
   float machineGain = 2.f, machineCap = 0.45f, sceneryCap = 0.25f;
   std::uint32_t maxLights = 16;
+  float lightMaxSize = 40.f, lightMinBright = 0.07f, lightMerge = 8.f, lightFull = 2.f, machineLight = 0.3f;
 };
 struct Frame {
   std::vector<Vertex> verts;        // scene triangles first, then the sky's
   std::uint32_t skyFirstVertex = 0; // the sky's first vertex
   std::vector<GpuDraw> draws;
   std::vector<StageRec> stages;
+  std::vector<LightPick> picks, merged;
+  std::vector<EngineLight> machineLights;
   std::vector<EngineLight> lights;
   const DrawRec* main = nullptr;
   std::uint32_t machineDraws = 0, reflective = 0;
@@ -144,16 +136,29 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
   }
   static thread_local std::array<int, 2> s_best;
   s_best = best;
-  out.lights = engine_lights(draws, count, verts, [](const DrawRec& d) {
+  const auto inMain = [](const DrawRec& d) {
     return d.projType == 0 && std::array<int, 2>{static_cast<int>(d.proj[0] * 1000), static_cast<int>(d.proj[5] * 1000)} == s_best;
+  };
+  light_picks(draws, count, inMain, out.picks, t.lightMaxSize, t.lightMinBright);
+  merge_lights(out.picks, t.lightMerge, out.merged);
+  // the nearest few, with their strengths: colour by strength, reach by the root of it, so a spark lights close by and a flame further
+  std::sort(out.merged.begin(), out.merged.end(), [](const LightPick& a, const LightPick& b) {
+    return a.pos[0] * a.pos[0] + a.pos[1] * a.pos[1] + a.pos[2] * a.pos[2] < b.pos[0] * b.pos[0] + b.pos[1] * b.pos[1] + b.pos[2] * b.pos[2];
   });
-  // the nearest few: a packed grid must stay affordable (the camera is the origin)
-  if (out.lights.size() > t.maxLights) {
-    const auto dist = [](const EngineLight& l) { return l.pos[0] * l.pos[0] + l.pos[1] * l.pos[1] + l.pos[2] * l.pos[2]; };
-    std::nth_element(out.lights.begin(), out.lights.begin() + t.maxLights, out.lights.end(),
-                     [&](const EngineLight& a, const EngineLight& b) { return dist(a) < dist(b); });
-    out.lights.resize(t.maxLights);
+  out.lights.clear();
+  for (const LightPick& q : out.merged) {
+    if (out.lights.size() == t.maxLights)
+      break;
+    const float k = q.weight / t.lightFull;
+    const float strength = std::min(k, 1.5f);
+    out.lights.push_back({{q.pos[0], q.pos[1], q.pos[2]}, {q.colour[0] * strength, q.colour[1] * strength, q.colour[2] * strength},
+                          std::clamp(std::sqrt(k), 0.25f, 1.25f)});
   }
+  // only a strong light marks a machine: a spark against a wall does not turn the wall to chrome
+  out.machineLights.clear();
+  for (const EngineLight& l : out.lights)
+    if (l.reach * l.reach >= t.machineLight)
+      out.machineLights.push_back(l);
   out.draws.resize(count);
   std::vector<float> extent(count, 0.f);
   float largest = 0.f;
@@ -197,7 +202,7 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
     const bool inView = d.projType == 0 && key(d) == best && d.vertices > 0;
     if (strength > 0 && inView) {
       ++out.reflective;
-      if (beside_engine_light(d, verts, out.lights)) {
+      if (beside_engine_light(d, verts, out.machineLights)) {
         strength = std::max(strength, std::min(strength * t.machineGain, t.machineCap));
         ++out.machineDraws;
       } else {

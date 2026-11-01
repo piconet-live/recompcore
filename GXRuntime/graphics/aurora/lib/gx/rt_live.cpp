@@ -108,6 +108,7 @@ struct State {
   bool outputOpen = false;
 
   double msTrace = 0, msGpu = 0, msComposeWait = 0, msBuild = 0, msRules = 0, msTranslate = 0;
+  double picks = 0, merged = 0;
   u64 tris = 0, lightsSeen = 0, lightsMost = 0, reports = 0;
   u32 count = 0;
 } g;
@@ -493,7 +494,7 @@ void run_rays(Job& job) {
     upload_texture(s, t);
   auto& fr = job.frame;
   if (fr.lights.empty())
-    fr.lights.push_back({{0, 0, 1e6f}, {0, 0, 0}});
+    fr.lights.push_back({{0, 0, 1e6f}, {0, 0, 0}, 1.f});
   if (fr.stages.empty())
     fr.stages.push_back({});
   stage(s, s.verts, fr.verts.data(), fr.verts.size() * sizeof(Vertex));
@@ -590,7 +591,13 @@ void run_rays(Job& job) {
   p.conserve = 0.7f;
   p.lightGain = job.light;
   p.lightCount = static_cast<u32>(fr.lights.size());
-  p.lightRange = 4.f;
+  static const float range = [] {
+    const char* v = std::getenv("AURORA_RT_LIGHT_RANGE");
+    return v != nullptr ? static_cast<float>(std::atof(v)) : 4.f;
+  }();
+  static const u32 shadow = std::getenv("AURORA_RT_LIGHT_SHADOW") != nullptr ? 1 : 0;
+  p.lightRange = range;
+  p.lightShadow = shadow;
   p.bodyCalm = 1.f;
   p.skyFirst = fr.skyFirstVertex;
   cl->SetComputeRootSignature(g.root.Get());
@@ -623,6 +630,7 @@ void run_rays(Job& job) {
   g.msComposeWait += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   g.msBuild += job.captureMs;
   g.msRules += job.rulesMs;
+  g.picks += job.lightPicks, g.merged += job.mergedLights;
   g.msTranslate += job.translateUs.load() / 1000.0;
   g.tris += fr.verts.size() / 3;
   g.lightsSeen += fr.lights.size();
@@ -633,10 +641,10 @@ void run_rays(Job& job) {
   }();
   if (++g.count == every) {
     const double n = g.count;
-    std::fprintf(stderr, "[rt] per frame, %u frames at %ux%u: GPU build %.2f ms and rays+cleanup %.2f ms (all %.2f); CPU in the stream %.2f ms, translation beside it %.2f ms, rules %.2f ms, worker %.2f ms; %.0f triangles, lights %.1f (most %llu)\n",
+    std::fprintf(stderr, "[rt] per frame, %u frames at %ux%u: GPU build %.2f ms and rays+cleanup %.2f ms (all %.2f); CPU in the stream %.2f ms, translation beside it %.2f ms, rules %.2f ms, worker %.2f ms; %.0f triangles, lights %.1f (most %llu), picks %.1f, merged %.1f\n",
                  g.count, g.w, g.h, (g.msGpu - g.msTrace) / n, g.msTrace / n, g.msGpu / n, g.msBuild / n, g.msTranslate / n, g.msRules / n, g.msComposeWait / n, double(g.tris) / n, double(g.lightsSeen) / n,
-                 static_cast<unsigned long long>(g.lightsMost));
-    g.count = 0, g.msGpu = g.msTrace = g.msBuild = g.msRules = g.msTranslate = g.msComposeWait = 0, g.tris = 0, g.lightsSeen = 0, g.lightsMost = 0;
+                 static_cast<unsigned long long>(g.lightsMost), g.picks / n, g.merged / n);
+    g.count = 0, g.msGpu = g.msTrace = g.msBuild = g.msRules = g.msTranslate = g.msComposeWait = 0, g.tris = 0, g.lightsSeen = 0, g.lightsMost = 0, g.picks = g.merged = 0;
   }
 }
 
@@ -792,4 +800,5 @@ void after_frame_submit() {
   }
 }
 bool failed() noexcept { return g.failed; }
+void name_thread() noexcept { SetThreadDescription(GetCurrentThread(), L"Aurora RT"); }
 } // namespace aurora::gx::rt::live

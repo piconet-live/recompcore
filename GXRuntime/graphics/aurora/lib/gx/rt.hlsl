@@ -41,7 +41,7 @@ struct Params {
   uint skyFirst;
   uint _pad;
 };
-struct Light { float3 pos; float3 colour; };
+struct Light { float3 pos; float3 colour; float reach; };
 ConstantBuffer<Params> P : register(b0);
 RaytracingAccelerationStructure Scene : register(t0);
 StructuredBuffer<Vertex> Verts : register(t1);
@@ -195,8 +195,8 @@ float lum(float3 c) { return dot(c, float3(0.3, 0.59, 0.11)); }
 // Engine lights: plain omni, distance falloff, no direction. Multiplies what the pixel already shows, so it needs no material.
 float3 engine_light(float3 pos, float3 N) {
   float3 sum = 0;
-  float r = P.lightRange;
   for (uint i = 0; i < P.lightCount; ++i) {
+    float r = P.lightRange * Lights[i].reach;
     float3 d = Lights[i].pos - pos;
     float dd = dot(d, d);
     if (dd > 9 * r * r) continue;

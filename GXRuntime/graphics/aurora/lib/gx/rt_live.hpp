@@ -27,6 +27,8 @@ struct Job {
   float proj[16], viewport[4];
   float road, light;
   double captureMs, rulesMs;
+  std::uint64_t copy = 0;
+  std::uint32_t mergedLights = 0, lightPicks = 0;
   bool drawable;
 };
 std::unique_ptr<Job> take_job();
@@ -34,4 +36,6 @@ bool submit_job(std::unique_ptr<Job> job);
 void before_frame_submit();
 void after_frame_submit();
 bool failed() noexcept;
+// The name Aurora's fault handler knows its own threads by
+void name_thread() noexcept;
 } // namespace aurora::gx::rt::live

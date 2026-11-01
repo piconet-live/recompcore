@@ -30,6 +30,8 @@ struct DrawRec {
   std::uint32_t fogType;
   float fog[3];       // a, b, c
   float fogColour[4];
+  // An additive draw's light, as the draw itself says: where (a line's first vertex, else the middle), how big, colour, brightness
+  float lightPos[3], lightExtent, lightColour[3], lightBright;
   StageRec stage[16];
 };
 } // namespace aurora::gx::rt
