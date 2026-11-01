@@ -1,4 +1,5 @@
 #include "rt_capture.hpp"
+#include "rt_format.hpp"
 
 #include "recomp.hpp"
 #include "../gfx/texture_convert.hpp"
@@ -31,33 +32,6 @@ bool skip_draw() noexcept {
 }
 
 namespace {
-constexpr u32 MaxUv = 4;
-struct Vertex {
-  float pos[3];
-  float nrm[3];
-  float ras[4];  // colour channel 0 as the hardware computes it: lights in view space, material, ambient
-  float uv[MaxUv][2];  // after the texture generators
-  u32 draw;
-};
-struct StageRec {
-  u32 tc, map, tex;  // map -1: none; tex: index of the captured texture, or -1
-  u32 ca, cb, cc, cd, cop, cbias, cscale, cclamp, creg;
-  u32 aa, ab, ac, ad, aop, abias, ascale, aclamp, areg;
-  u32 kc, ka, swapTex;
-  u32 reflection;
-  float k[4];  // the stage's K colour and alpha selection resolved
-};
-struct DrawRec {
-  float proj[16];
-  float viewport[6];
-  u32 projType, stages, firstVertex, vertices;
-  u32 blendMode, blendSrc, blendDst, depthUpdate, depthCompare, cull, colorUpdate;
-  u32 prim, vtxCount, hasNormal, hasColor, lit;
-  float regs[4][4];
-  float swap[4][4];  // for each swap table, the channel routed to red, green, blue, alpha
-  StageRec stage[16];
-};
-
 std::string s_path;
 u64 s_at = 0;
 u64 s_frame = 0;

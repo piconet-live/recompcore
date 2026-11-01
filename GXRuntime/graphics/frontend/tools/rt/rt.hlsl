@@ -11,7 +11,7 @@ struct Draw {
   uint stages;
   uint cls;       // 0 solid, 1 translucent, 2 additive, 3 ignored
   float strength; // the draw's own reflection strength
-  uint _p;
+  uint highlight; // the draw has a stage looked up by the normal: the game's own shine
   float4 regs[4];
   float swap[4][4];
   Stage stage[16];
@@ -30,12 +30,19 @@ struct Params {
   uint frame;
   uint textures;
   float conserve;
+  float lightGain;
+  uint lightCount;
+  float lightRange;
+  uint lightShadow;
+  float bodyCalm;
 };
+struct Light { float3 pos; float3 colour; };
 ConstantBuffer<Params> P : register(b0);
 RaytracingAccelerationStructure Scene : register(t0);
 StructuredBuffer<Vertex> Verts : register(t1);
 StructuredBuffer<Draw> Draws : register(t2);
 Texture2D<float4> Raster : register(t3);
+StructuredBuffer<Light> Lights : register(t4);
 RWTexture2D<float4> Out : register(u0);
 Texture2D<float4> Tex[] : register(t0, space1);
 SamplerState Linear : register(s0);
@@ -125,7 +132,8 @@ float3 trace_reflection(float3 org, float3 dir, float maxLodScale) {
     if (d.cls == 3) continue;
     float lod = clamp(log2(max(t, 1.0) * maxLodScale), 0.0, 8.0);
     float4 c = shade(h, lod);
-    if (d.cls == 2) { sum += through * c.rgb * saturate(c.a); continue; }
+    // a glow right beside the surface is the machine's own flame, a camera-facing sprite: seen from its own bodywork it is a flat sheet
+    if (d.cls == 2) { if (t > 8) sum += through * c.rgb * saturate(c.a); continue; }
     if (d.cls == 1) {
       float a = saturate(c.a);
       sum += through * c.rgb * a;
@@ -138,10 +146,37 @@ float3 trace_reflection(float3 org, float3 dir, float maxLodScale) {
   }
   return sum;
 }
+float lum(float3 c) { return dot(c, float3(0.3, 0.59, 0.11)); }
+// Engine lights: plain omni, distance falloff, no direction. Multiplies what the pixel already shows, so it needs no material.
+float3 engine_light(float3 pos, float3 N) {
+  float3 sum = 0;
+  float r = P.lightRange;
+  for (uint i = 0; i < P.lightCount; ++i) {
+    float3 d = Lights[i].pos - pos;
+    float dd = dot(d, d);
+    if (dd > 9 * r * r) continue;
+    float dist = sqrt(dd);
+    float3 L = d / max(dist, 0.001);
+    float wrap = saturate(dot(N, L) * 0.75 + 0.25);
+    float fall = 1 / (1 + dd / (r * r * 0.25));
+    fall *= saturate(1 - dist / (3 * r));
+    float vis = 1;
+    if (P.lightShadow != 0 && fall * wrap > 0.02) {
+      RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
+      RayDesc ray; ray.Origin = pos + N * 0.03; ray.Direction = L; ray.TMin = 0.02; ray.TMax = max(dist - 0.6, 0.03);
+      q.TraceRayInline(Scene, RAY_FLAG_NONE, 0xFF, ray);
+      q.Proceed();
+      if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) vis = 0.25;
+    }
+    sum += Lights[i].colour * fall * wrap * vis;
+  }
+  return sum;
+}
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
   float3 raster = Raster[id.xy].rgb;
   float3 sum = 0;
+  float3 light = 0;
   float3 dbg = 0;
   uint seed = id.x * 1973u + id.y * 9277u + P.frame * 26699u + 1u;
   for (uint n = 0; n < P.spp; ++n) {
@@ -173,16 +208,31 @@ void main(uint3 id : SV_DispatchThreadID) {
       float k = d.strength > 0 ? max(d.strength, min(d.strength * P.gain, 0.45)) : 0;
       float cosv = saturate(-dot(N, v));
       float fres = pow(1 - cosv, 5);
-      float strength = k > 0 ? k + (1 - k) * fres : (N.y > 0.2 && d.cls == 0 ? P.roadShine * pow(1 - cosv, 3) : 0);
+      // the surface's own colour: pale paint shows a reflection as dirt, so less of it, softer; dark road shines more than pale road
+      float3 baseCol = (k > 0 || (N.y > 0.2 && d.cls == 0)) ? shade(h, 0).rgb : 0.xxx;
+      float base = lum(baseCol);
+      float pale = smoothstep(0.45, 0.85, base) * P.bodyCalm;
+      float strength;
+      if (k > 0) strength = k * (1 - 0.65 * pale) + (1 - k) * fres * (1 - 0.8 * pale);
+      else strength = (N.y > 0.2 && d.cls == 0) ? P.roadShine * pow(1 - cosv, 3) * (1 - 0.6 * smoothstep(0.1, 0.5, base)) * (d.highlight != 0 ? 1.0 : 0.75) : 0;
+      if (P.lightGain > 0) light += engine_light(h.pos, N) * P.lightGain;
       if (P.mode == 2) { dbg += strength.xxx; break; }
       if (strength > 0.001) {
         float3 R = reflect(v, N);
-        if (P.rough > 0) {
+        float rough = P.rough + (k > 0 ? 0.09 * pale : 0.012);
+        if (rough > 0) {
           float3 j = float3(rnd(seed), rnd(seed), rnd(seed)) * 2 - 1;
-          R = normalize(R + j * P.rough);
+          R = normalize(R + j * rough);
           if (dot(R, N) < 0) R = reflect(v, N);
         }
-        term = strength * (trace_reflection(h.pos + N * 0.03, R, 8.0 / max(P.size.y, 1) * 512.0 / 4.0) - raster * P.conserve);
+        float3 seen = trace_reflection(h.pos + N * 0.03, R, 8.0 / max(P.size.y, 1) * 512.0 / 4.0);
+        // on road a broad dim surface tints without showing anything: only what stands out of it counts (the neon)
+        if (k <= 0) seen *= smoothstep(0.04, 0.5, max(seen.r, max(seen.g, seen.b)));
+        // dim only the surface itself, never a flame or glow the raster drew over it
+        float3 under = min(raster, baseCol * 1.2);
+        term = strength * (seen - under * P.conserve * (k > 0 ? 1 - 0.6 * pale : 0.5));
+        // where the raster is far brighter than this surface, a glow covers it: a reflection would show through the flame
+        term *= 1 - smoothstep(0.15, 0.45, lum(raster) - base);
       }
       break;
     }
@@ -190,5 +240,6 @@ void main(uint3 id : SV_DispatchThreadID) {
   }
   if (P.mode >= 2) { Out[id.xy] = float4(dbg / P.spp, 1); return; }
   float3 refl = sum / P.spp;
-  Out[id.xy] = float4(P.mode == 1 ? refl : raster + refl, 1);
+  float3 lit = raster * light / P.spp;
+  Out[id.xy] = float4(P.mode == 1 ? refl + lit : raster + refl + lit, 1);
 }

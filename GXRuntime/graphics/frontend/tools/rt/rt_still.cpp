@@ -21,26 +21,12 @@
 using Microsoft::WRL::ComPtr;
 using u32 = uint32_t; using u8 = uint8_t;
 
-struct Vertex { float pos[3], nrm[3], ras[4], uv[4][2]; u32 draw; };
-struct StageRec {
-  u32 tc, map, tex;
-  u32 ca, cb, cc, cd, cop, cbias, cscale, cclamp, creg;
-  u32 aa, ab, ac, ad, aop, abias, ascale, aclamp, areg;
-  u32 kc, ka, swapTex, reflection;
-  float k[4];
-};
-struct DrawRec {
-  float proj[16], viewport[6];
-  u32 projType, stages, firstVertex, vertices;
-  u32 blendMode, blendSrc, blendDst, depthUpdate, depthCompare, cull, colorUpdate;
-  u32 prim, vtxCount, hasNormal, hasColor, lit;
-  float regs[4][4], swap[4][4];
-  StageRec stage[16];
-};
-struct DrawGpu { u32 stages, cls; float strength; u32 p; float regs[4][4]; float swap[4][4]; StageRec stage[16]; };
+#include "rt_rules.hpp"
+using namespace aurora::gx::rt;
+struct DrawGpu { u32 stages, cls; float strength; u32 highlight; float regs[4][4]; float swap[4][4]; StageRec stage[16]; };
 struct Params {
   float size[2], rectXY[2], rectWH[2], vpXY[2], vpWH[2], pScale[2], pOffset[2];
-  float pad0[2]; float miss[3]; u32 spp; u32 mode; float gain, roadShine, rough; u32 frame, textures; float conserve; float pad;
+  float pad0[2]; float miss[3]; u32 spp; u32 mode; float gain, roadShine, rough; u32 frame, textures; float conserve; float lightGain; u32 lightCount; float lightRange; u32 lightShadow; float bodyCalm;
 };
 struct Tex { u32 w, h, wrapS, wrapT; std::vector<u8> rgba; };
 
@@ -94,6 +80,7 @@ int main(int argc, char** argv) {
       strength = std::max(strength, k);
     }
     g.strength = strength;
+    for (u32 s = 0; s < g.stages; ++s) if (d.stage[s].reflection == 2) g.highlight = 1;
     // the blend the draw asks for: GX factors ZERO 0, ONE 1, SRCCLR 2, INVSRCCLR 3, SRCALPHA 4, INVSRCALPHA 5
     const bool additive = d.blendMode == 1 && d.blendDst == 1;
     const bool darkens = d.blendMode == 1 && (d.blendDst == 2 || d.blendSrc == 0 || d.blendSrc == 2);
@@ -112,6 +99,10 @@ int main(int argc, char** argv) {
     kept.insert(kept.end(), verts + d.firstVertex, verts + d.firstVertex + d.vertices);
   }
   if (!mainDraw) { std::fprintf(stderr, "no perspective view\n"); return 2; }
+  static std::pair<int,int> s_best; s_best = best;
+  auto lights = engine_lights(draws, nDraws, verts, [](const DrawRec& d) { return d.projType == 0 && std::make_pair((int)(d.proj[0] * 1000), (int)(d.proj[5] * 1000)) == s_best; });
+  std::printf("engine lights %zu:", lights.size()); for (auto& l : lights) std::printf(" (%.1f %.1f %.1f; %.2f %.2f %.2f)", l.pos[0], l.pos[1], l.pos[2], l.colour[0], l.colour[1], l.colour[2]); std::puts("");
+  if (lights.empty()) lights.push_back({{0,0,1e6f},{0,0,0}});
   float maxz = -1e30f, minz = 1e30f; u32 behind = 0;
   for (auto& v : kept) { maxz = std::max(maxz, v.pos[2]); minz = std::min(minz, v.pos[2]); if (v.pos[2] > 0) ++behind; }
   std::printf("kept %zu triangles: solid %u translucent %u additive %u ignored %u; reflective %u; textures %u; behind the camera %.1f%%; z %.0f .. %.0f\n",
@@ -148,6 +139,7 @@ int main(int argc, char** argv) {
 
   auto vb = upload(kept.data(), kept.size() * sizeof(Vertex));
   auto db = upload(gpu.data(), gpu.size() * sizeof(DrawGpu));
+  auto lb = upload(lights.data(), lights.size() * sizeof(EngineLight));
 
   setvbuf(stdout,nullptr,_IONBF,0);
   std::fputs("[A] ",stdout); std::fflush(stdout);
@@ -232,8 +224,8 @@ int main(int argc, char** argv) {
 
   std::fputs("[E] ",stdout); std::fflush(stdout);
   // Root: constants, then t0-t3/u0 by a table, the texture array by a table
-  D3D12_DESCRIPTOR_RANGE1 r1[2] = {}; r1[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r1[0].NumDescriptors = 4; r1[0].OffsetInDescriptorsFromTableStart = 0; r1[0].Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
-  r1[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; r1[1].NumDescriptors = 1; r1[1].OffsetInDescriptorsFromTableStart = 4; r1[1].Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
+  D3D12_DESCRIPTOR_RANGE1 r1[2] = {}; r1[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r1[0].NumDescriptors = 5; r1[0].OffsetInDescriptorsFromTableStart = 0; r1[0].Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
+  r1[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; r1[1].NumDescriptors = 1; r1[1].OffsetInDescriptorsFromTableStart = 5; r1[1].Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
   D3D12_DESCRIPTOR_RANGE1 r2{}; r2.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r2.NumDescriptors = UINT_MAX; r2.RegisterSpace = 1; r2.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
   D3D12_ROOT_PARAMETER1 rp[3] = {}; rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; rp[0].Constants.Num32BitValues = sizeof(Params) / 4; 
   rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; rp[1].DescriptorTable.NumDescriptorRanges = 2; rp[1].DescriptorTable.pDescriptorRanges = r1;
@@ -250,13 +242,16 @@ int main(int argc, char** argv) {
   sv = {}; sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; sv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER; sv.Buffer.NumElements = (UINT)kept.size(); sv.Buffer.StructureByteStride = sizeof(Vertex); dev->CreateShaderResourceView(vb.Get(), &sv, cpuh(1));
   sv.Buffer.NumElements = (UINT)gpu.size(); sv.Buffer.StructureByteStride = sizeof(DrawGpu); dev->CreateShaderResourceView(db.Get(), &sv, cpuh(2));
   sv = {}; sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; sv.Format = DXGI_FORMAT_R8G8B8A8_UNORM; sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels = 1; dev->CreateShaderResourceView(rast.Get(), &sv, cpuh(3));
-  D3D12_UNORDERED_ACCESS_VIEW_DESC uv{}; uv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D; dev->CreateUnorderedAccessView(out.Get(), nullptr, &uv, cpuh(4));
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uv{}; uv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D; dev->CreateUnorderedAccessView(out.Get(), nullptr, &uv, cpuh(5));
+  sv = {}; sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; sv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER; sv.Buffer.NumElements = (UINT)lights.size(); sv.Buffer.StructureByteStride = sizeof(EngineLight); dev->CreateShaderResourceView(lb.Get(), &sv, cpuh(4));
 
   std::fputs("[F] ",stdout); std::fflush(stdout);
   Params par{}; par.size[0] = (float)W; par.size[1] = (float)H; par.rectXY[0] = rect[0]; par.rectXY[1] = rect[1]; par.rectWH[0] = rect[2]; par.rectWH[1] = rect[3];
   par.vpXY[0] = mainDraw->viewport[0]; par.vpXY[1] = mainDraw->viewport[1]; par.vpWH[0] = mainDraw->viewport[2]; par.vpWH[1] = mainDraw->viewport[3];
   par.pScale[0] = mainDraw->proj[0]; par.pScale[1] = mainDraw->proj[5]; par.pOffset[0] = mainDraw->proj[2]; par.pOffset[1] = mainDraw->proj[6];
   std::memcpy(par.miss, miss, sizeof miss); par.spp = spp; par.mode = mode; par.gain = gain; par.roadShine = road; par.rough = rough; par.textures = nTex; par.conserve = std::getenv("RT_CONSERVE") ? (float)atof(std::getenv("RT_CONSERVE")) : 0.7f;
+  auto envf = [](const char* n, float v) { const char* e = std::getenv(n); return e ? (float)atof(e) : v; };
+  par.lightGain = envf("RT_LIGHT", 0.f); par.lightCount = (u32)lights.size(); par.lightRange = envf("RT_LIGHT_RANGE", 4.f); par.lightShadow = (u32)envf("RT_LIGHT_SHADOW", 0.f); par.bodyCalm = envf("RT_BODY_CALM", 1.f);
   ID3D12DescriptorHeap* hs[] = {heap.Get()}; cl->SetDescriptorHeaps(1, hs); cl->SetComputeRootSignature(root.Get()); cl->SetPipelineState(pso.Get());
   cl->SetComputeRoot32BitConstants(0, sizeof(Params) / 4, &par, 0); cl->SetComputeRootDescriptorTable(1, gpuh(0)); cl->SetComputeRootDescriptorTable(2, gpuh(8));
   ComPtr<ID3D12QueryHeap> qh; D3D12_QUERY_HEAP_DESC qhd{}; qhd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP; qhd.Count = 2; HR(dev->CreateQueryHeap(&qhd, IID_PPV_ARGS(&qh)));
