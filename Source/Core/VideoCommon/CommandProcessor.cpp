@@ -602,6 +602,18 @@ void CommandProcessorManager::SetCpControlRegister()
                        m_fifo.CPBase.load(std::memory_order_relaxed), pi.m_fifo_cpu_write_pointer);
     if (m_cp_ctrl_reg.GPReadEnable)
     {
+      // A list handed over must start where the one before it in the same buffer ended: else the GP reads old bytes again
+      static u32 s_list_end[2] = {};
+      static u32 s_stale = 0;
+      const u32 base = m_fifo.CPBase.load(std::memory_order_relaxed);
+      const u32 read = m_fifo.CPReadPointer.load(std::memory_order_relaxed);
+      const u32 which = base == 0x0155b000 ? 0 : 1;
+      if (s_list_end[which] != 0 && read != s_list_end[which] && ++s_stale <= 40)
+      {
+        std::fprintf(stderr, "fzgx test: stale hand-over %u: base %08x read %08x, the last list here ended %08x (%d bytes)\n",
+                     s_stale, base, read, s_list_end[which], static_cast<int>(s_list_end[which] - read));
+      }
+      s_list_end[which] = m_fifo.CPWritePointer.load(std::memory_order_relaxed);
       FzgxFifoTest::g_list_on_us.store(FzgxFifoTest::NowMicros(), std::memory_order_relaxed);
       FzgxFifoTest::g_new_list.store(true);
     }
