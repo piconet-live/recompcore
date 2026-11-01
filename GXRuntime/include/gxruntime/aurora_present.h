@@ -29,7 +29,7 @@
 extern "C" {
 #endif
 
-#define AURORA_PRESENT_ABI 2
+#define AURORA_PRESENT_ABI 3
 
 typedef struct AuroraPresentConfig {
   uint32_t abi;            // AURORA_PRESENT_ABI
@@ -43,6 +43,8 @@ typedef struct AuroraPresentConfig {
   uint32_t width, height;  // the hidden window's size (Aurora's EFB is the game's own 640x528 whatever it is)
   uint32_t most_behind;    // frames Aurora may be behind before it stops for the run (0: 4; and 256 MB at most)
   uint32_t scale;          // the render scale: the game's 640x528 EFB drawn at this many times its size (0: 1)
+  void* window;            // the host's window, when the emulator draws nothing: Aurora presents straight into it and
+                           // no picture comes back (Windows: its HWND; NULL: the hidden window and the readback)
 } AuroraPresentConfig;
 
 typedef struct AuroraPresentPicture {

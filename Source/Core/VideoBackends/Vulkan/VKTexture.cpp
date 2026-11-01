@@ -397,9 +397,11 @@ void VKTexture::Load(u32 level, u32 width, u32 height, u32 row_length, const u8*
   std::unique_ptr<StagingBuffer> temp_buffer;
   VkBuffer upload_buffer;
   VkDeviceSize upload_buffer_offset;
+  const unsigned long long fzgx_upload = FzgxProbe::PaceClock();
 
   // Does this texture data fit within the streaming buffer?
-  if (upload_size <= STAGING_TEXTURE_UPLOAD_THRESHOLD)
+  if (upload_size <= STAGING_TEXTURE_UPLOAD_THRESHOLD ||
+      (GetVkCleanupTest() == VkCleanupTest::Stream && upload_size <= 32 * 1024 * 1024))
   {
     StreamBuffer* stream_buffer = g_object_cache->GetTextureUploadBuffer();
     if (!stream_buffer->ReserveMemory(upload_size, upload_alignment))
@@ -435,6 +437,8 @@ void VKTexture::Load(u32 level, u32 width, u32 height, u32 row_length, const u8*
     temp_buffer->Write(0, buffer, upload_size, true);
     temp_buffer->Unmap();
   }
+  if (upload_size > STAGING_TEXTURE_UPLOAD_THRESHOLD)
+    FzgxProbe::PaceSpan("vk big upload: buffer and copy", fzgx_upload, 500);
 
   // Copy from the streaming buffer to the actual image.
   VkBufferImageCopy image_copy = {

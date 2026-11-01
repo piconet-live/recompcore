@@ -42,6 +42,11 @@ struct Settings
 // The host, before the video thread draws: loads the library (Aurora itself starts at the GPU thread's first burst,
 // once the guest's RAM is there). Configure({}) at the end stops it.
 void Configure(const Settings& settings);
+// The Null video backend, at its start: the emulator will draw nothing, so Aurora presents straight into this window
+// (a window system's handle; none in a headless run) and no picture comes back.
+void SetVideoOffWindow(void* window);
+// The frame rate is Aurora's presents' (a video-off run with Aurora on), not the emulator's swaps.
+bool CountsFrames();
 // The summary for the host's log (empty when it was never on).
 std::string Report();
 bool On();

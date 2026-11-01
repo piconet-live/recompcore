@@ -840,7 +840,10 @@ bool VulkanContext::CreateDevice(VkSurfaceKHR surface, bool enable_validation_la
 bool VulkanContext::CreateAllocator(u32 vk_api_version)
 {
   VmaAllocatorCreateInfo allocator_info = {};
-  allocator_info.flags = VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT;
+  // (AURORA_TEST_VK_CLEANUP=thread frees buffers off this thread: VMA must lock for itself then)
+  allocator_info.flags = GetVkCleanupTest() == VkCleanupTest::Thread ?
+                             0 :
+                             VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT;
   allocator_info.physicalDevice = m_physical_device;
   allocator_info.device = m_device;
   allocator_info.preferredLargeHeapBlockSize = 64 << 20;

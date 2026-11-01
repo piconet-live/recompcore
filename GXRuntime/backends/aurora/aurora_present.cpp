@@ -40,6 +40,10 @@
 
 extern "C" volatile int g_auroraDrawDump;  // command_processor.cpp (AURORA_DUMP_COPY)
 
+namespace aurora::webgpu {
+void set_host_window(void* window) noexcept;  // dawn/BackendBinding.cpp
+}
+
 namespace {
 using Clock = std::chrono::steady_clock;
 
@@ -191,6 +195,7 @@ struct State {
   std::string data_dir, shot_prefix, log_path;
   std::vector<std::uint64_t> shots;
   std::uint32_t width = 640, height = 528, most_behind = 4, scale = 1;
+  void* window = nullptr;
   std::atomic<bool> fatal{false};  // a fatal error of Aurora's: its thread is parked, never joined, Aurora never shut down
   // the bytes waiting at most (a frame is 1 KB in menus, 100-300 KB in a race): the bound on what falling behind costs
   static constexpr std::size_t most_bytes_behind = 256u << 20;
@@ -346,6 +351,7 @@ void install_fault_stop() {}
 #endif
 
 void run() {
+  aurora::webgpu::set_host_window(s->window);
   install_mtx_check();
   install_fault_stop();
   aurora_backend_set_fatal_handler(on_fatal);
@@ -419,7 +425,7 @@ void run() {
     const char* v = std::getenv(name);
     return v != nullptr && v[0] == '1';
   };
-  const bool no_readback = env_on("AURORA_NO_READBACK");
+  const bool no_readback = env_on("AURORA_NO_READBACK") || s->window != nullptr;
   const bool discard = env_on("AURORA_DISCARD");
 
   FILE* log = s->log_path.empty() ? nullptr : std::fopen(s->log_path.c_str(), "w");
@@ -578,6 +584,7 @@ int aurora_present_start(const AuroraPresentConfig* config) {
     s->height = config->height;
   if (config->most_behind)
     s->most_behind = config->most_behind;
+  s->window = config->window;
   s->scale = std::clamp<std::uint32_t>(config->scale, 1u, 8u);
   if (const char* v = std::getenv("AURORA_MOST_BEHIND"); v != nullptr && std::atoi(v) > 0)  // (tests)
     s->most_behind = static_cast<std::uint32_t>(std::atoi(v));
@@ -610,7 +617,9 @@ void aurora_present_frame(uint64_t copy) {
     // for the run, and the emulator shows its own pictures again. The bound is tight (4 frames waiting): further
     // behind, the guest's RAM it reads may already hold a later frame's lists and vertices (garbage commands)
     // (while Aurora itself starts, half a second, the frames of the boot wait: 1800 of them at most)
-    const std::size_t most = s->up ? s->most_behind : 1800u;
+    // In the host window there is no picture of the emulator's to go back to: a stop would freeze the window with the
+    // race going on (course 36 under load, 1214 frames in), so only the byte bound stops it there.
+    const std::size_t most = (s->up && s->window == nullptr) ? s->most_behind : 1800u;
     if (s->queue.size() >= most || s->bytes_waiting + f.bytes.size() > State::most_bytes_behind) {
       stop_for_run(s->queue.size() >= most ? "too many frames behind" : "too many bytes behind");
       s->queue.clear();

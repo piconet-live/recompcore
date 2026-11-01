@@ -3,6 +3,8 @@
 
 #include "VideoBackends/Vulkan/CommandBufferManager.h"
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include "Core/FzgxProbe.h"
 
 #include <array>
@@ -17,6 +19,19 @@
 
 namespace Vulkan
 {
+VkCleanupTest GetVkCleanupTest()
+{
+  static const VkCleanupTest mode = [] {
+    const char* v = std::getenv("AURORA_TEST_VK_CLEANUP");
+    if (v && std::strcmp(v, "thread") == 0)
+      return VkCleanupTest::Thread;
+    if (v && std::strcmp(v, "stream") == 0)
+      return VkCleanupTest::Stream;
+    return VkCleanupTest::Off;
+  }();
+  return mode;
+}
+
 CommandBufferManager::CommandBufferManager(bool use_threaded_submission)
     : m_use_threaded_submission(use_threaded_submission)
 {
@@ -32,10 +47,22 @@ CommandBufferManager::~CommandBufferManager()
   }
 
   DestroyCommandBuffers();
+
+  // (after the pending objects above: they may hand buffers to it; the allocator outlives this object)
+  m_buffer_free_thread.Shutdown();
 }
 
 bool CommandBufferManager::Initialize(size_t swapchain_image_count)
 {
+  if (GetVkCleanupTest() == VkCleanupTest::Thread)
+  {
+    m_buffer_free_thread.Reset("Vulkan buffer free", [](PendingBufferFree item) {
+      const unsigned long long fzgx_start = FzgxProbe::PaceClock();
+      vmaDestroyBuffer(g_vulkan_context->GetMemoryAllocator(), item.buffer, item.alloc);
+      FzgxProbe::PaceSpan("vmaDestroyBuffer on its own thread", fzgx_start, 500);
+    });
+  }
+
   if (!CreateCommandBuffers(swapchain_image_count))
     return false;
 
@@ -543,7 +570,12 @@ void CommandBufferManager::DeferBufferDestruction(VkBuffer buffer, VmaAllocation
 {
   CmdBufferResources& cmd_buffer_resources = GetCurrentCmdBufferResources();
   cmd_buffer_resources.cleanup_resources.push_back(
-      [buffer, alloc] {
+      [this, buffer, alloc] {
+        if (m_buffer_free_thread.IsRunning())
+        {
+          m_buffer_free_thread.EmplaceItem(PendingBufferFree{buffer, alloc});
+          return;
+        }
         const unsigned long long fzgx_start = FzgxProbe::PaceClock();
         vmaDestroyBuffer(g_vulkan_context->GetMemoryAllocator(), buffer, alloc);
         FzgxProbe::PaceSpan("vmaDestroyBuffer", fzgx_start, 500);

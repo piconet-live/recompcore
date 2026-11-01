@@ -16,6 +16,7 @@
 #include "VideoBackends/Null/PerfQuery.h"
 #include "VideoBackends/Null/TextureCache.h"
 
+#include "VideoCommon/AuroraPresent.h"
 #include "VideoCommon/VideoCommon.h"
 #include "VideoCommon/VideoConfig.h"
 
@@ -71,6 +72,7 @@ void VideoBackend::InitBackendInfo(const WindowSystemInfo& wsi)
 
 bool VideoBackend::Initialize(const WindowSystemInfo& wsi)
 {
+  VideoCommon::AuroraPresent::SetVideoOffWindow(wsi.render_surface);
   return InitializeShared(std::make_unique<NullGfx>(), std::make_unique<VertexManager>(),
                           std::make_unique<PerfQuery>(), std::make_unique<NullBoundingBox>(),
                           std::make_unique<NullEFBInterface>(), std::make_unique<TextureCache>());

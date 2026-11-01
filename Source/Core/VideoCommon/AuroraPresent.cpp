@@ -25,6 +25,7 @@
 #include "VideoCommon/FrameRedrawFrame.h"
 #include "VideoCommon/FzgxFifoTest.h"
 #include "VideoCommon/FramebufferManager.h"
+#include "VideoCommon/PerformanceMetrics.h"
 #include "VideoCommon/TextureConfig.h"
 
 #ifdef _WIN32
@@ -35,7 +36,7 @@ namespace VideoCommon::AuroraPresent
 {
 namespace
 {
-// gxruntime/aurora_present.h, as the library exports it (ABI 2)
+// gxruntime/aurora_present.h, as the library exports it (ABI 3)
 struct LibConfig
 {
   u32 abi;
@@ -49,6 +50,7 @@ struct LibConfig
   u32 width, height;
   u32 most_behind;
   u32 scale;
+  void* window;
 };
 struct LibPicture
 {
@@ -65,7 +67,20 @@ struct LibStats
   u32 fatal;
   u32 scale;
 };
-constexpr u32 LIB_ABI = 2;
+constexpr u32 LIB_ABI = 3;
+void* s_video_off_window = nullptr;  // SetVideoOffWindow
+u64 s_presents_counted = 0;
+// The hand-off's time on the thread that decodes (the report's last figure): the bursts kept, the calls swapped for
+// their lists, the frame given to the library
+u64 s_handoff_ns = 0;
+struct HandoffTimer
+{
+  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+  ~HandoffTimer()
+  {
+    s_handoff_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+  }
+};
 
 struct Library
 {
@@ -172,6 +187,19 @@ void Start()
   c.log_path = s_settings.log_path.empty() ? nullptr : s_settings.log_path.c_str();
   c.width = 640;
   c.height = 528;
+  if (s_video_off_window)
+  {
+    // Dolphin draws nothing: Aurora presents into the window, at its size when Aurora starts
+    c.window = s_video_off_window;
+#ifdef _WIN32
+    RECT client{};
+    if (GetClientRect(static_cast<HWND>(s_video_off_window), &client) && client.right > 0 && client.bottom > 0)
+    {
+      c.width = static_cast<u32>(client.right);
+      c.height = static_cast<u32>(client.bottom);
+    }
+#endif
+  }
   // the same internal resolution as the emulator's own, unless the host asks for another
   c.scale = s_settings.scale ? s_settings.scale :
                                (g_framebuffer_manager ? g_framebuffer_manager->GetEFBScale() : 1);
@@ -223,6 +251,8 @@ void StopAll()
   if (s_started)
   {
     s_report = MakeReport();
+    s_report += fmt::format("; hand-off on the decoding thread {:.0f} ms over {} copies ({:.3f} ms a copy)",
+                            s_handoff_ns / 1e6, s_copies, s_copies ? s_handoff_ns / 1e6 / s_copies : 0.0);
     s_lib.stop();
     s_started = false;
   }
@@ -291,6 +321,7 @@ void OnBurstRead(const u8* bytes, u32 size)
     if (!s_started)
       return;
   }
+  HandoffTimer timer;
   s_pending.insert(s_pending.end(), bytes, bytes + size);
   s_fed_end = bytes + size;
 }
@@ -348,6 +379,7 @@ void OnCommandEnd(const u8* data, u32 size)
   g_pending = false;
   if (!s_started)
     return;
+  HandoffTimer timer;
   const u8* end = data + size;
   // where the command is among the bytes handed in: `tail` bytes after it (the next commands' first)
   size_t tail = 0;
@@ -406,6 +438,16 @@ void OnCommandEnd(const u8* data, u32 size)
   if (frame)
     s_lib.write(s_pending.data(), static_cast<u32>(frame));
   s_lib.frame(s_cut_copy);
+  // Dolphin presents nothing and draws no statistics then: its frame rate counts Aurora's presents
+  if (s_video_off_window)
+  {
+    LibStats st{};
+    s_lib.stats(&st);
+    auto& metrics = Core::System::GetInstance().GetPerfMetrics();
+    for (; s_presents_counted < st.frames_drawn; ++s_presents_counted)
+      metrics.CountFrame();
+    metrics.UpdateCounters();
+  }
   s_pending.erase(s_pending.begin(), s_pending.begin() + frame);
 }
 
@@ -454,9 +496,21 @@ const AbstractTexture* Picture(MathUtil::Rectangle<int>* rect)
   return s_texture.get();
 }
 
+bool CountsFrames()
+{
+  return s_video_off_window && On();
+}
+
+void SetVideoOffWindow(void* window)
+{
+  s_video_off_window = window;
+  s_presents_counted = 0;
+}
+
 void Shutdown()
 {
   StopAll();
+  s_video_off_window = nullptr;
   s_texture.reset();
 }
 }  // namespace VideoCommon::AuroraPresent

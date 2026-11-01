@@ -48,6 +48,8 @@ public:
 
   // ImGui Functions
   void DrawImGuiStats(const float backbuffer_scale);
+  // What DrawImGuiStats does to the rates first, for a run that draws no statistics (AuroraPresent, video off)
+  void UpdateCounters();
 
 private:
   PerformanceTracker m_fps_counter{"render_times.txt"};

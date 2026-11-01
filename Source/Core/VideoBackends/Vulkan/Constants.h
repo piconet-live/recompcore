@@ -93,4 +93,15 @@ constexpr u32 TEXTURE_UPLOAD_BUFFER_SIZE = 32 * 1024 * 1024;
 // large anyway, so it's only really an issue for HD texture packs, and memory is not
 // a limiting factor in these scenarios anyway.
 constexpr u32 STAGING_TEXTURE_UPLOAD_THRESHOLD = 1024 * 1024 * 4;
+
+// Test switch AURORA_TEST_VK_CLEANUP (stage 12), read once. Unset: as upstream.
+//   thread: buffers are freed on their own thread, off the frame path (VMA then keeps its own locks)
+//   stream: big texture uploads (Aurora's picture) go through a 64 MiB upload stream buffer, so no buffer is made or freed
+enum class VkCleanupTest
+{
+  Off,
+  Thread,
+  Stream
+};
+VkCleanupTest GetVkCleanupTest();
 }  // namespace Vulkan

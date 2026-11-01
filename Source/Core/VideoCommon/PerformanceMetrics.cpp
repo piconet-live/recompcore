@@ -123,10 +123,15 @@ void PerformanceMetrics::SetLatestFramePresentationOffset(DT offset)
   m_frame_presentation_offset.store(offset, std::memory_order_relaxed);
 }
 
-void PerformanceMetrics::DrawImGuiStats(const float backbuffer_scale)
+void PerformanceMetrics::UpdateCounters()
 {
   m_vps_counter.UpdateStats();
   m_fps_counter.UpdateStats();
+}
+
+void PerformanceMetrics::DrawImGuiStats(const float backbuffer_scale)
+{
+  UpdateCounters();
 
   const bool movable_overlays = Config::Get(Config::GFX_MOVABLE_PERFORMANCE_METRICS);
   const int movable_flag = movable_overlays ? ImGuiWindowFlags_None : ImGuiWindowFlags_NoMove;

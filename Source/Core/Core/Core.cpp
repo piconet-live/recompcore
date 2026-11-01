@@ -86,6 +86,7 @@
 #include "InputCommon/GCAdapter.h"
 
 #include "VideoCommon/AsyncRequests.h"
+#include "VideoCommon/AuroraPresent.h"
 #include "VideoCommon/Fifo.h"
 #include "VideoCommon/FrameDumper.h"
 #include "VideoCommon/OnScreenDisplay.h"
@@ -772,7 +773,9 @@ void RunOnCPUThread(Core::System& system, Common::MoveOnlyFunction<void()> funct
 void Callback_FramePresented(const PresentInfo& present_info)
 {
   auto& perf_metrics = Core::System::GetInstance().GetPerfMetrics();
-  perf_metrics.CountFrame();
+  // (with the video off the emulator's swaps show nothing: AuroraPresent counts Aurora's presents)
+  if (!VideoCommon::AuroraPresent::CountsFrames())
+    perf_metrics.CountFrame();
 
   const auto presentation_offset =
       present_info.actual_present_time - present_info.intended_present_time;

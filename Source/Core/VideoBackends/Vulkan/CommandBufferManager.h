@@ -153,6 +153,14 @@ private:
     u32 command_buffer_index;
   };
   Common::WorkQueueThreadSP<PendingCommandBufferSubmit> m_submit_thread;
+
+  // AURORA_TEST_VK_CLEANUP=thread (Constants.h)
+  struct PendingBufferFree
+  {
+    VkBuffer buffer;
+    VmaAllocation alloc;
+  };
+  Common::WorkQueueThreadSP<PendingBufferFree> m_buffer_free_thread;
   std::vector<VkSemaphore> m_present_semaphores = {};
   Common::Flag m_last_present_failed;
   VkResult m_last_present_result = VK_SUCCESS;

@@ -9,6 +9,11 @@
 #endif
 
 namespace aurora::webgpu {
+namespace {
+void* g_hostWindow = nullptr;
+}
+void set_host_window(void* window) noexcept { g_hostWindow = window; }
+
 namespace utils {
 
 std::shared_ptr<wgpu::ChainedStruct> SetupWindowAndGetSurfaceDescriptorCocoa(SDL_Window* window);
@@ -27,6 +32,9 @@ std::shared_ptr<wgpu::ChainedStruct> SetupWindowAndGetSurfaceDescriptor(SDL_Wind
   std::shared_ptr<wgpu::SurfaceSourceWindowsHWND> desc = std::make_shared<wgpu::SurfaceSourceWindowsHWND>();
   desc->hwnd = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
   desc->hinstance = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_INSTANCE_POINTER, nullptr);
+  if (g_hostWindow != nullptr) {
+    desc->hwnd = g_hostWindow;  // embedded: the surface is the host's window, the SDL window stays hidden and unused
+  }
   return std::move(desc);
 #elif defined(SDL_PLATFORM_LINUX)
   const char* driver = SDL_GetCurrentVideoDriver();
