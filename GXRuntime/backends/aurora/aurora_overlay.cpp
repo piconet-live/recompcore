@@ -21,6 +21,7 @@
 #include <webgpu/webgpu_cpp.h>
 
 #include <algorithm>
+#include <cmath>
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -59,6 +60,7 @@ std::vector<TextureOp> s_ops;
 
 const uint8_t* s_ram = nullptr;
 std::atomic<int32_t> s_rect[4];
+std::atomic<uint32_t> s_rect_surface[2];  // the surface s_rect is in
 std::atomic<bool> s_has_rect{false};
 
 // ---- the render worker's ------------------------------------------------------------------------------------------
@@ -325,6 +327,8 @@ webgpu::PresentHook::Draw capture() {
     s_rect[1].store(static_cast<int32_t>(picture.top), std::memory_order_relaxed);
     s_rect[2].store(static_cast<int32_t>(picture.width), std::memory_order_relaxed);
     s_rect[3].store(static_cast<int32_t>(picture.height), std::memory_order_relaxed);
+    s_rect_surface[0].store(surface_w, std::memory_order_relaxed);
+    s_rect_surface[1].store(surface_h, std::memory_order_relaxed);
     s_has_rect.store(true, std::memory_order_release);
     if (frame)
       draw_frame(*frame, copies, pass, surface_w, surface_h);
@@ -538,11 +542,16 @@ void aurora_present_overlay_frame(const AuroraOverlayFrame* frame) {
   s_frame = std::move(f);
 }
 
-int aurora_present_picture_rect(int32_t out[4]) {
+int aurora_present_picture_in_window(uint32_t window_width, uint32_t window_height, int32_t out[4]) {
   if (!s_has_rect.load(std::memory_order_acquire))
     return 0;
-  for (int i = 0; i < 4; ++i)
-    out[i] = s_rect[i].load(std::memory_order_relaxed);
+  // (the overlay is in the window's pixels; while a window is dragged the surface is a size behind it, stretched to it)
+  const float sx = static_cast<float>(window_width) / static_cast<float>(std::max<uint32_t>(s_rect_surface[0].load(std::memory_order_relaxed), 1u));
+  const float sy = static_cast<float>(window_height) / static_cast<float>(std::max<uint32_t>(s_rect_surface[1].load(std::memory_order_relaxed), 1u));
+  out[0] = static_cast<int32_t>(std::lround(static_cast<float>(s_rect[0].load(std::memory_order_relaxed)) * sx));
+  out[1] = static_cast<int32_t>(std::lround(static_cast<float>(s_rect[1].load(std::memory_order_relaxed)) * sy));
+  out[2] = static_cast<int32_t>(std::lround(static_cast<float>(s_rect[2].load(std::memory_order_relaxed)) * sx));
+  out[3] = static_cast<int32_t>(std::lround(static_cast<float>(s_rect[3].load(std::memory_order_relaxed)) * sy));
   return 1;
 }
 }

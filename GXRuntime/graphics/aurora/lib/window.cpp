@@ -1,3 +1,5 @@
+#include <chrono>
+#include <cstdio>
 #include "window.hpp"
 
 #ifdef AURORA_ENABLE_GX
@@ -46,7 +48,9 @@ constexpr Module Log{"aurora::window"};
 SDL_Window* g_window;
 SDL_Renderer* g_renderer;
 float g_frameBufferScale = 0.f;
-int g_frameBufferFixedWidth = 0;   // set_frame_buffer_size
+// set_host_size: drawing into a host's window, whose size only the host knows (the SDL window stays hidden and unused)
+int g_hostWidth = 0, g_hostHeight = 0;
+int g_frameBufferFixedWidth = 0;
 int g_frameBufferFixedHeight = 0;
 bool g_frameBufferAspectFit = false;
 AuroraWindowSize g_windowSize;
@@ -127,7 +131,13 @@ void resize_swapchain() noexcept {
     SDL_SetRenderScale(g_renderer, size.scale, size.scale);
   }
 #ifdef AURORA_ENABLE_GX
+  const auto began = std::chrono::steady_clock::now();
   webgpu::resize_swapchain(size.fb_width, size.fb_height, size.native_fb_width, size.native_fb_height);
+  if (g_hostWidth > 0) {
+    const std::chrono::duration<double, std::milli> took = std::chrono::steady_clock::now() - began;
+    std::fprintf(stderr, "[aurora-present] window %ux%u, frame buffer %ux%u, %.1f ms to remake them\n", size.native_fb_width,
+                 size.native_fb_height, size.fb_width, size.fb_height, took.count());
+  }
 #endif
 }
 
@@ -495,6 +505,11 @@ AuroraWindowSize get_window_size() {
   AURORA_ASSERT(SDL_GetWindowSizeInPixels(g_window, &native_fb_w, &native_fb_h), "Failed to get window size in pixels: {}",
          SDL_GetError());
 
+  if (g_hostWidth > 0 && g_hostHeight > 0) {
+    native_fb_w = width = g_hostWidth;
+    native_fb_h = height = g_hostHeight;
+  }
+
   int fb_w = native_fb_w;
   int fb_h = native_fb_h;
   if (g_frameBufferScale > 0.f) {
@@ -628,10 +643,13 @@ void set_frame_buffer_scale(float scale) {
   request_frame_buffer_resize();
 }
 
-// The content frame buffer's size, whatever the window's (aurora_present's AURORA_NATIVE)
-void set_frame_buffer_size(int width, int height) noexcept {
-  g_frameBufferFixedWidth = width;
-  g_frameBufferFixedHeight = height;
+// The host's window and the content frame buffer in it (aurora_present's follow_window). Taken up at the next
+// poll_events, between two frames.
+void set_host_size(int width, int height, int frame_buffer_width, int frame_buffer_height) noexcept {
+  g_hostWidth = width;
+  g_hostHeight = height;
+  g_frameBufferFixedWidth = frame_buffer_width;
+  g_frameBufferFixedHeight = frame_buffer_height;
   request_frame_buffer_resize();
 }
 

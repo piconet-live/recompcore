@@ -20,6 +20,8 @@
 
 #include "Common/Logging/Log.h"
 #include "Common/StringUtil.h"
+#include "Core/Config/GraphicsSettings.h"
+#include "VideoCommon/VideoConfig.h"
 #include "Core/HW/Memmap.h"
 #include "Core/System.h"
 #include "VideoCommon/AbstractGfx.h"
@@ -120,7 +122,8 @@ struct Library
   void (*overlay_texture)(u64, u32, u32, u32, u32, u32, u32, const u8*, u32) = nullptr;
   void (*overlay_forget)(u64) = nullptr;
   void (*overlay_frame)(const void*) = nullptr;
-  int (*picture_rect)(s32*) = nullptr;
+  int (*picture_in_window)(u32, u32, s32*) = nullptr;
+  void (*picture_shape)(float) = nullptr;
 };
 
 Settings s_settings;
@@ -188,7 +191,8 @@ bool Load(const std::string& path)
       !Bind(&s_lib.overlay_texture, "aurora_present_overlay_texture") ||
       !Bind(&s_lib.overlay_forget, "aurora_present_overlay_forget") ||
       !Bind(&s_lib.overlay_frame, "aurora_present_overlay_frame") ||
-      !Bind(&s_lib.picture_rect, "aurora_present_picture_rect"))
+      !Bind(&s_lib.picture_in_window, "aurora_present_picture_in_window") ||
+      !Bind(&s_lib.picture_shape, "aurora_present_picture_shape"))
   {
     s_load_problem = fmt::format("{} lacks an aurora_present function", path);
     s_lib = {};
@@ -267,10 +271,10 @@ std::string MakeReport()
   std::string lag;
   for (size_t i = 0; i < s_lag.size(); ++i)
     lag += fmt::format("{}{}", i ? " " : "", s_lag[i]);
-  return fmt::format("aurora: scale {}, {} draws left out (buffers full){}; {} frames in ({} KB), {} drawn, {} pictures, {} shown; presents {}: {} with Aurora's "
+  return fmt::format("aurora: picture size {}, {} draws left out (buffers full){}; {} frames in ({} KB), {} drawn, {} pictures, {} shown; presents {}: {} with Aurora's "
                      "picture, {} the emulator's own; picture behind by 0..9+ copies: {}; most frames waiting {}; "
                      "Aurora's thread a frame (medians): feed {:.2f} ms, present {:.2f} ms, readback {:.2f} ms{}{}{}{}",
-                     st.scale, st.overflow_drops, st.fatal ? ", STOPPED BY A FATAL ERROR" : "", st.frames_in, st.bytes_in / 1024, st.frames_drawn, st.pictures, s_pictures_taken, s_presents,
+                     st.scale != 0 ? fmt::format("{} times the game's", st.scale) : std::string("the window's pixels"), st.overflow_drops, st.fatal ? ", STOPPED BY A FATAL ERROR" : "", st.frames_in, st.bytes_in / 1024, st.frames_drawn, st.pictures, s_pictures_taken, s_presents,
                      s_presents - s_presents_own, s_presents_own, lag, st.most_behind, st.feed_ms_median,
                      st.present_ms_median, st.readback_ms_median, st.stopped ? "; STOPPED (fell behind or failed)" : "",
                      st.failed ? "; Aurora could not start" : "",
@@ -473,6 +477,17 @@ void OnCommandEnd(const u8* data, u32 size)
   if (frame)
     s_lib.write(s_pending.data(), static_cast<u32>(frame));
   s_lib.frame(s_cut_copy);
+  // the picture's shape, as the emulator's own video would show it (the host sets it from the game's screen option)
+  if (s_video_off_window)
+  {
+    const AspectMode mode = Config::Get(Config::GFX_ASPECT_RATIO);
+    static AspectMode s_shape_sent = AspectMode::Custom;
+    if (mode != s_shape_sent)
+    {
+      s_shape_sent = mode;
+      s_lib.picture_shape(mode == AspectMode::ForceStandard ? 4.0f / 3.0f : mode == AspectMode::Stretch ? 0.0f : 16.0f / 9.0f);
+    }
+  }
   // Dolphin presents nothing and draws no statistics then: its frame rate counts Aurora's presents
   if (s_video_off_window)
   {
@@ -555,7 +570,9 @@ bool VideoOffSize(u32* width, u32* height)
 bool PictureInWindow(MathUtil::Rectangle<int>* rect)
 {
   s32 r[4];
-  if (!s_started || !s_lib.picture_rect || !s_lib.picture_rect(r) || r[2] <= 0 || r[3] <= 0)
+  u32 width = 0, height = 0;
+  if (!s_started || !s_lib.picture_in_window || !VideoOffSize(&width, &height) || !s_lib.picture_in_window(width, height, r) ||
+      r[2] <= 0 || r[3] <= 0)
     return false;
   *rect = MathUtil::Rectangle<int>(r[0], r[1], r[0] + r[2], r[1] + r[3]);
   return true;

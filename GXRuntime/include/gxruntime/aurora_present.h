@@ -105,7 +105,10 @@ AURORA_PRESENT_API void aurora_present_overlay_forget(uint64_t id);
 // The newest frame replaces the one before. Copied. Each present draws the newest it has.
 AURORA_PRESENT_API void aurora_present_overlay_frame(const AuroraOverlayFrame* frame);
 // Where the last present laid the game's picture in the window, in pixels: left, top, width, height. 0: no present yet.
-AURORA_PRESENT_API int aurora_present_picture_rect(int32_t out[4]);
+AURORA_PRESENT_API int aurora_present_picture_in_window(uint32_t window_width, uint32_t window_height, int32_t out[4]);
+// The picture's shape, width over height (the game's screen option), kept whatever the window's: with a window of
+// another shape the bars are black. 0: it fills the window.
+AURORA_PRESENT_API void aurora_present_picture_shape(float width_over_height);
 
 // Starts Aurora's thread. Returns 1, or 0 when the ABI differs (nothing started). Aurora's own start (the window,
 // Dawn) happens on its thread; a failure there shows in the stats.

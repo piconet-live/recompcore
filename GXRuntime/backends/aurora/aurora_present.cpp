@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <exception>
 #include <condition_variable>
@@ -49,7 +50,7 @@ namespace aurora::gx::fifo {
 void set_drawing_off(bool off) noexcept;  // gx/command_processor.cpp
 }
 namespace aurora::window {
-void set_frame_buffer_size(int width, int height) noexcept;  // window.cpp
+void set_host_size(int width, int height, int frame_buffer_width, int frame_buffer_height) noexcept;  // window.cpp
 }
 namespace aurora::gfx::timewarp {  // gfx/timewarp.cpp
 void start();
@@ -417,6 +418,70 @@ void install_fault_stop() {
 void install_fault_stop() {}
 #endif
 
+// ---- the picture follows the host's window -----------------------------------------------------------------------
+// The picture's shape, width over height (aurora_present_picture_shape: the game's screen option); 0 fills the window.
+std::atomic<float> s_picture_shape{16.0f / 9.0f};
+
+// Not remade oftener than this while a window is being dragged: it costs a wait for the GPU and new targets. In between
+// the swap chain's old pictures are stretched to the window by the system.
+constexpr auto FOLLOW_AT_MOST_EVERY = std::chrono::milliseconds(100);
+// The smallest frame buffer's picture lines: the window may be smaller, the game's copies and its 2D stay whole.
+constexpr int FOLLOW_LEAST_LINES = 90;
+
+struct FollowedWindow {
+  int width = 0, height = 0;
+  float shape = 0;
+  bool on = false;
+  std::uint32_t lines_each = 0;  // 2, 3, 4: this many picture lines for each of the game's; 0: the window's own pixels
+  std::chrono::steady_clock::time_point last{};
+};
+FollowedWindow s_followed;
+
+// Every frame, between frames, on Aurora's thread. The system's question takes no message and never waits for the host.
+void follow_window(std::uint64_t copy) {
+#ifdef _WIN32
+  if (!s_followed.on)
+    return;
+  RECT client{};
+  // (minimised, or going: the last size stays)
+  if (!GetClientRect(static_cast<HWND>(s->window), &client) || client.right <= 0 || client.bottom <= 0)
+    return;
+  const int width = client.right, height = client.bottom;
+  const float shape = s_picture_shape.load(std::memory_order_relaxed);
+  if (width == s_followed.width && height == s_followed.height && shape == s_followed.shape)
+    return;
+  const auto now = std::chrono::steady_clock::now();
+  if (now - s_followed.last < FOLLOW_AT_MOST_EVERY)
+    return;
+  s_followed.width = width;
+  s_followed.height = height;
+  s_followed.shape = shape;
+  s_followed.last = now;
+  std::fprintf(stderr, "[aurora-present] at copy %llu the window is %dx%d\n", static_cast<unsigned long long>(copy), width, height);
+  // The largest picture of the game's shape in the window
+  int picture_width = width, picture_height = height;
+  if (shape > 0) {
+    if (static_cast<float>(width) / static_cast<float>(height) > shape)
+      picture_width = std::max(1, static_cast<int>(std::lround(static_cast<float>(height) * shape)));
+    else
+      picture_height = std::max(1, static_cast<int>(std::lround(static_cast<float>(width) / shape)));
+  }
+  if (s_followed.lines_each != 0) {
+    const float wide = static_cast<float>(picture_width) / static_cast<float>(picture_height);
+    picture_height = static_cast<int>(448u * s_followed.lines_each);
+    picture_width = static_cast<int>(std::lround(static_cast<float>(picture_height) * wide));
+  } else if (picture_height < FOLLOW_LEAST_LINES) {
+    const float wide = static_cast<float>(picture_width) / static_cast<float>(picture_height);
+    picture_height = FOLLOW_LEAST_LINES;
+    picture_width = static_cast<int>(std::lround(static_cast<float>(picture_height) * wide));
+  }
+  // The game's display copy is 448 of the frame buffer's 528 lines (40 to 488), and the present letterboxes by the copy's
+  // size: the frame buffer is taller than the picture by 528/448, so that the copy is the picture's pixels.
+  aurora::window::set_host_size(width, height, picture_width,
+                                static_cast<int>(std::lround(static_cast<double>(picture_height) * 528.0 / 448.0)));
+#endif
+}
+
 void run() {
   aurora::webgpu::set_host_window(s->window);
   install_mtx_check();
@@ -424,7 +489,7 @@ void run() {
   aurora_backend_set_fatal_handler(on_fatal);
   aurora_backend_set_guest_address_resolver(ram_resolver, nullptr);
   // Owner's picture switches, read once. AURORA_MSAA=<samples>; AURORA_ANISO=<max>, with texture.cpp's AURORA_ANISO_GX=0;
-  // AURORA_NATIVE=1: the content frame buffer is the window's own pixels, no whole-number scale.
+  // AURORA_NATIVE=1: into the host's window, the content frame buffer is the window's own pixels (follow_window).
   const auto env_number = [](const char* name) -> unsigned {
     const char* v = std::getenv(name);
     return v != nullptr ? static_cast<unsigned>(std::strtoul(v, nullptr, 10)) : 0u;
@@ -468,22 +533,21 @@ void run() {
   const char* blocking = std::getenv("AURORA_DRAWS_BLOCKING");
   AuroraSetDrawsBlocking(blocking != nullptr && blocking[0] == '1');
   GXFlush();
-  if (s->scale > 1 || native_size) {
+  if (s->window != nullptr || s->scale > 1) {
     // The render scale, as Aurora's own games ask for it: the game's EFB (640x528) is the logical frame buffer, and
-    // viewports, scissors and copies map from it to a content frame buffer this many times its size. The (hidden)
-    // window keeps its size.
+    // viewports, scissors and copies map from it to a larger content frame buffer. The (hidden) SDL window keeps its size.
     static GXRenderModeObj mode = GXNtsc480IntDf;
     mode.fbWidth = 640;
     mode.efbHeight = 528;
     mode.xfbHeight = 528;
     VIConfigure(&mode);
-    // AURORA_NATIVE: the game's display copy is 448 of these 528 lines (40 to 488), and the present letterboxes by
-    // the copy's size: the frame buffer is taller than the window by 528/448, so that the copy is the window's pixels.
-    if (native_size)
-      aurora::window::set_frame_buffer_size(static_cast<int>(s->width),
-                                            static_cast<int>(s->height * 528u / 448u));
-    else
+    if (s->window != nullptr) {
+      s_followed.on = true;
+      s_followed.lines_each = native_size ? 0 : s->scale;
+      follow_window(0);
+    } else {
       VISetFrameBufferScale(static_cast<float>(s->scale));
+    }
     AuroraSetViewportPolicy(AURORA_VIEWPORT_STRETCH);
   } else {
     AuroraSetViewportPolicy(AURORA_VIEWPORT_NATIVE);  // the game's own viewport, unscaled
@@ -560,6 +624,7 @@ void run() {
         s->up = true;
     }
     const auto start = Clock::now();
+    follow_window(f.copy);
     if (discard) {
       std::lock_guard g{s->lock};
       ++s->stats.frames_drawn;
@@ -688,6 +753,10 @@ void run() {
 
 extern "C" {
 
+void aurora_present_picture_shape(float width_over_height) {
+  s_picture_shape.store(width_over_height, std::memory_order_relaxed);
+}
+
 int aurora_present_start(const AuroraPresentConfig* config) {
   if (s != nullptr || config == nullptr || config->abi != AURORA_PRESENT_ABI || config->ram == nullptr)
     return 0;
@@ -788,7 +857,7 @@ void aurora_present_stats(AuroraPresentStats* out) {
   out->readback_ms_median = median(s->readback_ms);
   out->overflow_drops = aurora_overflow_drops();
   out->fatal = s->fatal ? 1 : 0;
-  out->scale = s->scale;
+  out->scale = s_followed.on && s_followed.lines_each == 0 ? 0 : s->scale;
 }
 
 void aurora_present_stop(void) {
