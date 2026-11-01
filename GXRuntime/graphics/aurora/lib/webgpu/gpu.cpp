@@ -343,6 +343,12 @@ void set_resampler(AuroraSampler sampler) noexcept {
 
 AuroraSampler get_resampler() noexcept { return g_Resampler; }
 
+namespace {
+PresentHook g_presentHook;
+}
+void set_present_hook(const PresentHook& hook) noexcept { g_presentHook = hook; }
+const PresentHook& present_hook() noexcept { return g_presentHook; }
+
 Viewport calculate_present_viewport(uint32_t surface_width, uint32_t surface_height, uint32_t content_width,
                                     uint32_t content_height) noexcept {
   if (surface_width == 0 || surface_height == 0 || content_width == 0 || content_height == 0) {

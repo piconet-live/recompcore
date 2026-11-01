@@ -23,6 +23,8 @@
 #include "VideoCommon/TextureCacheBase.h"
 
 class AbstractTexture;
+struct ImDrawData;
+struct ImTextureData;
 
 namespace VideoCommon::AuroraPresent
 {
@@ -47,6 +49,20 @@ void Configure(const Settings& settings);
 void SetVideoOffWindow(void* window);
 // The frame rate is Aurora's presents' (a video-off run with Aurora on), not the emulator's swaps.
 bool CountsFrames();
+// The overlay of a video-off run (OnScreenUI's ImGui with nothing of the emulator's to draw on): the window's pixels now,
+// false when it has none
+bool VideoOffSize(u32* width, u32* height);
+// Where Aurora's last present laid the game's picture in the window (false: no present yet).
+bool PictureInWindow(MathUtil::Rectangle<int>* rect);
+// An ImGui texture's change: `status` is what it was before the emulator's own update (OnScreenUI::Finalize), `id` its id then.
+void OverlayTexture(ImTextureData* tex, int status, u64 id);
+// The null backend's sampler, set by an ImGui list's callback while OverlayFrame walks the lists
+void OverlaySampler(bool smooth);
+// The frame's lists, handed to Aurora. Callbacks run here, as in OnScreenUI::DrawImGui.
+void OverlayFrame(const ImDrawData* data, u32 width, u32 height);
+// The ImGui id of a copy of the game's to the guest's RAM at this physical address: a head of the top 6, say. A frame
+// that uses one before the game has made it draws nothing there.
+u64 OverlayCopyTexture(u32 physical);
 // The summary for the host's log (empty when it was never on).
 std::string Report();
 bool On();

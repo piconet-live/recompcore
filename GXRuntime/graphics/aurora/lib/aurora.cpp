@@ -287,6 +287,10 @@ void end_frame() noexcept {
   gx::texture::end_frame();
   gfx::finish();
   auto imguiDrawData = imgui::freeze();
+  webgpu::PresentHook::Draw hookDraw;
+  if (webgpu::present_hook().capture != nullptr) {
+    hookDraw = webgpu::present_hook().capture();
+  }
 
   const auto& presentSource = webgpu::present_source();
   const auto viewport = webgpu::calculate_present_viewport(webgpu::g_graphicsConfig.surfaceConfiguration.width,
@@ -304,7 +308,7 @@ void end_frame() noexcept {
 #endif
 
   gfx::end_frame([rmlBindGroup = std::move(rmlBindGroup), rmlOverlay, viewportMain = viewport,
-                  imguiDrawData = std::move(imguiDrawData)](
+                  imguiDrawData = std::move(imguiDrawData), hookDraw = std::move(hookDraw)](
                      wgpu::CommandEncoder& encoder, std::vector<gfx::AfterSubmitCallback> afterSubmitCallbacks) {
     wgpu::Texture currentTexture;
     wgpu::TextureView currentView;
@@ -341,10 +345,17 @@ void end_frame() noexcept {
         const auto& resampledSource = webgpu::resample_present_source(encoder, viewport);
         presentBindGroup = webgpu::create_copy_bind_group(resampledSource);
       }
+      // A filter of the whole picture: the present and everything over it into its view, then its last pass
+      wgpu::TextureView filterView;
+      if (webgpu::present_hook().finalTarget != nullptr) {
+        filterView = webgpu::present_hook().finalTarget(webgpu::g_graphicsConfig.surfaceConfiguration.width,
+                                                        webgpu::g_graphicsConfig.surfaceConfiguration.height);
+      }
+      const wgpu::TextureView& drawView = filterView ? filterView : currentView;
       {
         const std::array attachments{
             wgpu::RenderPassColorAttachment{
-                .view = currentView,
+                .view = drawView,
                 .loadOp = wgpu::LoadOp::Clear,
                 .storeOp = wgpu::StoreOp::Store,
             },
@@ -373,7 +384,7 @@ void end_frame() noexcept {
       {
         const std::array attachments{
             wgpu::RenderPassColorAttachment{
-                .view = currentView,
+                .view = drawView,
                 .loadOp = wgpu::LoadOp::Load,
                 .storeOp = wgpu::StoreOp::Store,
             },
@@ -388,7 +399,14 @@ void end_frame() noexcept {
         pass.SetViewport(0.f, 0.f, static_cast<float>(webgpu::g_graphicsConfig.surfaceConfiguration.width),
                          static_cast<float>(webgpu::g_graphicsConfig.surfaceConfiguration.height), 0.f, 1.f);
         imgui::render(pass, imguiDrawData);
+        if (hookDraw) {
+          hookDraw(pass, viewport, webgpu::g_graphicsConfig.surfaceConfiguration.width,
+                   webgpu::g_graphicsConfig.surfaceConfiguration.height);
+        }
         pass.End();
+      }
+      if (filterView) {
+        webgpu::present_hook().finalPass(encoder, filterView, currentView);
       }
     } else {
       Log.info("Skipping present; window not presentable");

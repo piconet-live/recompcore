@@ -67,6 +67,7 @@ public:
   void SetNextSwapEstimatedTime(u64 ticks, TimePoint host_time);
 
   void Present(PresentInfo* present_info = nullptr);
+  void PresentOverlayToAurora();
   void ClearLastXfbId() { m_last_xfb_id = std::numeric_limits<u64>::max(); }
 
   bool Initialize();

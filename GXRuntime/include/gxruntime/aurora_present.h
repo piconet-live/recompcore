@@ -29,7 +29,7 @@
 extern "C" {
 #endif
 
-#define AURORA_PRESENT_ABI 3
+#define AURORA_PRESENT_ABI 4
 
 typedef struct AuroraPresentConfig {
   uint32_t abi;            // AURORA_PRESENT_ABI
@@ -67,6 +67,45 @@ typedef struct AuroraPresentStats {
   uint32_t fatal;           // 1: a fatal error of Aurora's stopped it (the thread is parked; the game goes on)
   uint32_t scale;           // the render scale in use
 } AuroraPresentStats;
+
+// The host's overlay, with the emulator drawing nothing: its own drawing (Dear ImGui's lists, flattened; no ImGui type
+// crosses, the two sides' ImGui versions differ) over Aurora's picture, at the present, never into the picture.
+// Any one thread, never blocking on Aurora.
+typedef struct AuroraOverlayVertex {
+  float x, y, u, v;  // the window's pixels; the texture's 0 to 1
+  uint32_t rgba;     // bytes r, g, b, a
+} AuroraOverlayVertex;
+
+// A texture of the frame: an id given with aurora_present_overlay_texture, or a copy of the game's by address
+#define AURORA_OVERLAY_COPY_TEXTURE(physical) (0xA500000000000000ull | (uint64_t)(physical))
+
+typedef struct AuroraOverlayDraw {
+  uint64_t texture;
+  float clip[4];  // left, top, right, bottom, the window's pixels
+  uint32_t first_index, index_count;
+  int32_t base_vertex;
+  uint32_t linear;  // 1: smooth sampling; 0: nearest
+} AuroraOverlayDraw;
+
+typedef struct AuroraOverlayFrame {
+  uint32_t width, height;  // the window's pixels the frame was laid in
+  const AuroraOverlayVertex* vertices;
+  uint32_t vertex_count;
+  const uint16_t* indices;
+  uint32_t index_count;
+  const AuroraOverlayDraw* draws;
+  uint32_t draw_count;
+} AuroraOverlayFrame;
+
+// A texture made (its whole size given) or part of it written, RGBA8, straight alpha. Copied.
+AURORA_PRESENT_API void aurora_present_overlay_texture(uint64_t id, uint32_t width, uint32_t height, uint32_t x, uint32_t y,
+                                                       uint32_t part_width, uint32_t part_height, const uint8_t* rgba,
+                                                       uint32_t row_bytes);
+AURORA_PRESENT_API void aurora_present_overlay_forget(uint64_t id);
+// The newest frame replaces the one before. Copied. Each present draws the newest it has.
+AURORA_PRESENT_API void aurora_present_overlay_frame(const AuroraOverlayFrame* frame);
+// Where the last present laid the game's picture in the window, in pixels: left, top, width, height. 0: no present yet.
+AURORA_PRESENT_API int aurora_present_picture_rect(int32_t out[4]);
 
 // Starts Aurora's thread. Returns 1, or 0 when the ABI differs (nothing started). Aurora's own start (the window,
 // Dawn) happens on its thread; a failure there shows in the stats.
