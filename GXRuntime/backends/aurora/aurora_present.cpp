@@ -200,7 +200,7 @@ struct Frame {
 
 // The run ahead's pictures between two steps: each a fraction of a field after the true picture before it, or left out.
 constexpr double kFieldMs = 1000.0 * 1001.0 / 60000.0;
-constexpr double kLateMs = 2.0;  // past its time by more than this, a picture between is not drawn at all
+constexpr double kLateMs = 5.0;  // past its time by more than this, a picture between is not drawn at all
 
 void wait_until(Clock::time_point due) {
 #if defined(_WIN32)
@@ -239,7 +239,7 @@ struct State {
   static constexpr std::size_t most_bytes_behind_window = 1024u << 20;
   std::size_t bytes_waiting = 0;  // (under lock)
   float next_between = 0;         // the GPU thread's: aurora_present_frame_between's, for the next frame
-  std::uint64_t between_drawn = 0, between_late = 0, between_left_out = 0;  // Aurora's thread's
+  std::uint64_t between_drawn = 0, between_late = 0, between_left_out = 0, between_out_true_waits = 0;  // Aurora's thread's
   double between_late_ms = 0;
   Clock::time_point t0;
 
@@ -625,8 +625,10 @@ void run() {
     const bool too_late = between && !is_shot(f.copy) &&
                           (last_true == Clock::time_point{} || true_waits ||
                            ms(start - due) + feed_mean_ms > kLateMs);
-    if (too_late)
+    if (too_late) {
       ++s->between_left_out;
+      s->between_out_true_waits += true_waits ? 1 : 0;
+    }
     const bool not_drawn = (s->window != nullptr && waiting >= most_waiting_to_draw && !is_shot(f.copy)) || too_late;
     aurora::gx::fifo::set_drawing_off(not_drawn);
     for (std::size_t off = 0; off < f.bytes.size(); off += 32768) {
@@ -730,10 +732,11 @@ void run() {
   if (log)
     std::fclose(log);
   if (s->between_drawn != 0 || s->between_left_out != 0)
-    std::fprintf(stderr, "[aurora-present] pictures between two steps: %llu drawn (%llu of them late, %.2f ms on average), %llu left out\n",
+    std::fprintf(stderr, "[aurora-present] pictures between two steps: %llu drawn (%llu of them late, %.2f ms on average), %llu left out (%llu with a true one waiting)\n",
                  static_cast<unsigned long long>(s->between_drawn), static_cast<unsigned long long>(s->between_late),
                  s->between_late ? s->between_late_ms / static_cast<double>(s->between_late) : 0.0,
-                 static_cast<unsigned long long>(s->between_left_out));
+                 static_cast<unsigned long long>(s->between_left_out),
+                 static_cast<unsigned long long>(s->between_out_true_waits));
   if (s->frames_not_drawn != 0)
     std::fprintf(stderr, "[aurora-present] %llu frames not drawn, to catch up\n",
                  static_cast<unsigned long long>(s->frames_not_drawn));
