@@ -14,6 +14,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
@@ -43,6 +45,7 @@ using NewPipelineCallback = std::function<CompiledPipeline()>;
 struct PendingPipeline {
   PipelineRef hash;
   NewPipelineCallback create;
+  std::chrono::steady_clock::time_point queuedAt = std::chrono::steady_clock::now();
 };
 
 struct PipelineCacheWrite {
@@ -955,12 +958,43 @@ static void pipeline_cache_writer() {
   }
 }
 
+// The skip counter: draws left out of a frame because their pipeline is not compiled yet, one log line for each frame
+// that had any. Only the render thread's get_pipeline and frame end touch these, under g_pipelineMutex.
+static uint64_t g_frameDraws = 0;
+static uint64_t g_frameSkippedDraws = 0;
+static uint64_t g_totalSkippedDraws = 0;
+static uint64_t g_framesWithSkips = 0;
+static absl::flat_hash_set<PipelineRef> g_frameSkippedPipelines;
+
+static double ms_since_start() {
+  static const auto start = std::chrono::steady_clock::now();
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
+static void report_skipped_draws() {
+  std::lock_guard lock{g_pipelineMutex};
+  if (g_frameSkippedDraws != 0) {
+    g_totalSkippedDraws += g_frameSkippedDraws;
+    ++g_framesWithSkips;
+    std::fprintf(stderr,
+                 "[pipelines] frame %u at %.0f ms: skipped %llu of %llu draws, %zu pipelines missing, queued %zu; so far %llu draws in %llu frames\n",
+                 current_frame(), ms_since_start(), static_cast<unsigned long long>(g_frameSkippedDraws),
+                 static_cast<unsigned long long>(g_frameDraws), g_frameSkippedPipelines.size(),
+                 g_pipelineQueue.size(), static_cast<unsigned long long>(g_totalSkippedDraws),
+                 static_cast<unsigned long long>(g_framesWithSkips));
+    g_frameSkippedPipelines.clear();
+  }
+  g_frameDraws = 0;
+  g_frameSkippedDraws = 0;
+}
+
 static void pipeline_worker() {
 #ifdef TRACY_ENABLE
   tracy::SetThreadName("Pipeline compilation thread");
 #endif
 
   bool hasMore = false;
+  bool wantedByDraw = false;
   while (g_hasPipelineThread || g_pipelinesPerFrame < BuildPipelinesPerFrame) {
     PendingPipeline pending;
     {
@@ -977,12 +1011,21 @@ static void pipeline_worker() {
       if (g_pipelineThreadEnd) {
         break;
       }
+      wantedByDraw = !g_pipelineQueue.empty();
       auto& source = !g_pipelineQueue.empty() ? g_pipelineQueue : g_backgroundPipelineQueue;
       pending = std::move(source.front());
       source.pop_front();
     }
+    const bool wanted = wantedByDraw;
+    const auto compileStart = std::chrono::steady_clock::now();
     auto result = pending.create();
+    const auto compileEnd = std::chrono::steady_clock::now();
     const auto pipelineCount = result.pipeline_count();
+    std::fprintf(stderr, "[pipelines] compiled %s: %.1f ms, %.1f ms after it was queued, at %.0f ms%s\n",
+                 wanted ? "for a draw" : "ahead",
+                 std::chrono::duration<double, std::milli>(compileEnd - compileStart).count(),
+                 std::chrono::duration<double, std::milli>(compileEnd - pending.queuedAt).count(), ms_since_start(),
+                 result.main ? "" : ", FAILED");
     {
       std::lock_guard lock{g_pipelineMutex};
       g_pipelines.try_emplace(pending.hash, std::move(result));
@@ -1149,8 +1192,10 @@ void initialize_pipeline_cache() {
     g_pipelineThread = std::thread(pipeline_worker);
   }
 
+  ms_since_start();
   const size_t loadedCount = load_pipeline_cache();
   rebuild_pipeline_cache();
+  std::fprintf(stderr, "[pipelines] cache: %zu known at start, compiled ahead in the background\n", loadedCount);
   if (!g_pipelineCacheBroken && loadedCount > 0) {
     g_gpuCachePrunePending = true;
   }
@@ -1195,6 +1240,7 @@ void begin_pipeline_frame() {
 }
 
 void end_pipeline_frame() {
+  report_skipped_draws();
   if (!g_hasPipelineThread) {
     pipeline_worker();
   }
@@ -1202,8 +1248,11 @@ void end_pipeline_frame() {
 
 bool get_pipeline(PipelineRef ref, CompiledPipeline& pipeline) {
   std::lock_guard guard{g_pipelineMutex};
+  ++g_frameDraws;
   const auto it = g_pipelines.find(ref);
   if (it == g_pipelines.end() || !it->second.main) {
+    ++g_frameSkippedDraws;
+    g_frameSkippedPipelines.insert(ref);
     return false;
   }
   pipeline = it->second;
