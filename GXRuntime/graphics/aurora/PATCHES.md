@@ -37,7 +37,8 @@ ports do not need it); **local** = tools and diagnostics for GXRuntime's harness
 | 24 | Embedded: the surface can be the host's window (`aurora::webgpu::set_host_window`), the SDL window stays hidden | local (until PresentTarget, upstream 12943d1) | new |
 | 25 | Frames decoded for their state only (`fifo::set_drawing_off`): no draw, no copy, no clear, for a presenter that has fallen behind and catches up | local | new |
 | 23 | Draw dump of one frame (`AURORA_DUMP_COPY`, `AURORA_DUMP_TEX`): TEV, samplers, texture formats, indirect stages, matrices | local | gxr/r3 |
-| 24 | Present hook (`webgpu::PresentHook`): an embedding program's drawing over the present, and a last pass of the whole picture | local | gxr/overlay |
+| 26 | Present hook (`webgpu::PresentHook`): an embedding program's drawing over the present, and a last pass of the whole picture | local | gxr/overlay |
+| 27 | Timewarp (`gfx/timewarp.cpp`, `AURORA_TIMEWARP`): pictures between the true frames; the host's overlay (`set_after_warp`) and the present hook's filter on them too; no warps after a frame not drawn | local | gxr/r4 |
 
 ## Not carried, and why
 

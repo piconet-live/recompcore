@@ -56,6 +56,7 @@ void start();
 void stop();
 void true_frame_coming() noexcept;
 void true_frame_done();
+void frame_not_drawn() noexcept;
 }
 
 namespace {
@@ -596,6 +597,7 @@ void run() {
     }
     if (not_drawn) {
       ++s->frames_not_drawn;
+      aurora::gfx::timewarp::frame_not_drawn();
       continue;
     }
     const auto fed = Clock::now();

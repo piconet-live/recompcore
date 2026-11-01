@@ -35,4 +35,6 @@ void capture(const wgpu::CommandEncoder& encoder, const wgpu::Texture& colorText
 // Aurora's own thread, around aurora_backend_present: the true frame is on its way (warps give way), then it is out.
 void true_frame_coming() noexcept;
 void true_frame_done();
+// Aurora's own thread, for a frame decoded and not drawn (Patch 25)
+void frame_not_drawn() noexcept;
 } // namespace aurora::gfx::timewarp

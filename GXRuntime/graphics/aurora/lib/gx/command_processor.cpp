@@ -894,7 +894,7 @@ static void handle_draw(u8 cmd, ByteReader& reader) noexcept {
   const auto fmt = static_cast<GXVtxFmt>(cmd & CP_VAT_MASK);
   const auto prim = static_cast<GXPrimitive>(cmd & CP_OPCODE_MASK);
   const u16 vtxCount = reader.read<u16>();
-  if (gfx::timewarp::g_on) {
+  if (gfx::timewarp::g_on && !g_drawingOff) {
     gfx::timewarp::note_draw(cmd, vtxCount, reader.data() + reader.offset(), reader.remaining());
     if (gfx::timewarp::g_pin) {
       gfx::set_stencil_ref(gfx::timewarp::draw_class());

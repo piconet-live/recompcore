@@ -639,15 +639,24 @@ void warp_job(int64_t due) {
   const bool timed = s_queries && ++count % 120 == 0 && s_queryState.load(std::memory_order_acquire) == 0;
   const auto encoder = g_device.CreateCommandEncoder();
   const auto surfaceView = surfaceTexture.CreateView();
-  draw_warp(encoder, surfaceView, present, f, timed);
+  // A filter of the whole picture, as the true frame's present: the warp and the overlay into its view, then its last pass
+  wgpu::TextureView filterView;
+  if (webgpu::present_hook().finalTarget != nullptr) {
+    filterView = webgpu::present_hook().finalTarget(config.width, config.height);
+  }
+  const wgpu::TextureView& drawView = filterView ? filterView : surfaceView;
+  draw_warp(encoder, drawView, present, f, timed);
   if (s_afterWarp) {
     const std::array attachments{wgpu::RenderPassColorAttachment{
-        .view = surfaceView, .loadOp = wgpu::LoadOp::Load, .storeOp = wgpu::StoreOp::Store}};
+        .view = drawView, .loadOp = wgpu::LoadOp::Load, .storeOp = wgpu::StoreOp::Store}};
     const wgpu::RenderPassDescriptor overDesc{
         .label = "After warp", .colorAttachmentCount = attachments.size(), .colorAttachments = attachments.data()};
     const auto over = encoder.BeginRenderPass(&overDesc);
     s_afterWarp(over, present, config.width, config.height);
     over.End();
+  }
+  if (filterView) {
+    webgpu::present_hook().finalPass(encoder, filterView, surfaceView);
   }
   if (timed) {
     encoder.ResolveQuerySet(s_queries, 0, 4, s_queryResolve, 0);
@@ -1162,6 +1171,18 @@ void capture(const wgpu::CommandEncoder& encoder, const wgpu::Texture& colorText
 }
 
 void true_frame_coming() noexcept {}
+
+void frame_not_drawn() noexcept {
+  if (!g_on)
+    return;
+  // No draw of this frame was noted (handle_draw), so no worker reads these now. The next drawn frame has no frame before
+  // it to compare with: like a cut, no warps from it, rather than a move of several steps guessed as one.
+  s_before.clear();
+  s_beforeFirst.clear();
+  s_beforeNext.clear();
+  s_worldMove = 0.0;
+  s_haveMachine = false;
+}
 
 void true_frame_done() {
   if (!g_on)

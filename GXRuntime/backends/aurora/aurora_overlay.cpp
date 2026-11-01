@@ -14,6 +14,7 @@
 
 #include "gfx/render_worker.hpp"
 #include "gfx/texture.hpp"
+#include "gfx/timewarp.hpp"
 #include "gx/gx.hpp"
 #include "webgpu/gpu.hpp"
 
@@ -285,6 +286,9 @@ void draw_frame(const Frame& f, const Copies& copies, const wgpu::RenderPassEnco
   pass.SetScissorRect(0, 0, surface_w, surface_h);
 }
 
+// The render worker's: the last true frame's drawing, again over each warped picture until the next true frame
+webgpu::PresentHook::Draw s_last_draw;
+
 // ---- Aurora's thread at a frame's end ------------------------------------------------------------------------------
 webgpu::PresentHook::Draw capture() {
   std::shared_ptr<const Frame> frame;
@@ -314,9 +318,9 @@ webgpu::PresentHook::Draw capture() {
         copies.emplace_back(d.texture, it->second.handle);
     }
   }
-  return [frame = std::move(frame), copies = std::move(copies)](const wgpu::RenderPassEncoder& pass,
-                                                                 const webgpu::Viewport& picture, uint32_t surface_w,
-                                                                 uint32_t surface_h) {
+  webgpu::PresentHook::Draw draw = [frame = std::move(frame), copies = std::move(copies)](const wgpu::RenderPassEncoder& pass,
+                                                                                          const webgpu::Viewport& picture, uint32_t surface_w,
+                                                                                          uint32_t surface_h) {
     s_rect[0].store(static_cast<int32_t>(picture.left), std::memory_order_relaxed);
     s_rect[1].store(static_cast<int32_t>(picture.top), std::memory_order_relaxed);
     s_rect[2].store(static_cast<int32_t>(picture.width), std::memory_order_relaxed);
@@ -324,6 +328,13 @@ webgpu::PresentHook::Draw capture() {
     s_has_rect.store(true, std::memory_order_release);
     if (frame)
       draw_frame(*frame, copies, pass, surface_w, surface_h);
+  };
+  if (!gfx::timewarp::g_on)
+    return draw;
+  return [draw = std::move(draw)](const wgpu::RenderPassEncoder& pass, const webgpu::Viewport& picture, uint32_t surface_w,
+                                  uint32_t surface_h) {
+    s_last_draw = draw;
+    draw(pass, picture, surface_w, surface_h);
   };
 }
 
@@ -479,6 +490,11 @@ void aurora_overlay_start(const uint8_t* ram) {
   hook.finalTarget = filter_target;
   hook.finalPass = filter_pass;
   webgpu::set_present_hook(hook);
+  gfx::timewarp::set_after_warp([](const wgpu::RenderPassEncoder& pass, const webgpu::Viewport& picture, uint32_t surface_w,
+                                   uint32_t surface_h) {
+    if (s_last_draw)
+      s_last_draw(pass, picture, surface_w, surface_h);
+  });
 }
 
 extern "C" {
