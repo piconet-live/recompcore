@@ -3,6 +3,7 @@
 // around the frame's submit.
 #include "rt_rules.hpp"
 
+#include <atomic>
 #include <future>
 #include <memory>
 #include <vector>
@@ -13,8 +14,13 @@ struct LiveTexture {
   std::vector<std::uint8_t> rgba;
 };
 struct Job {
-  DrawList draws;
-  std::vector<Vertex> verts;
+  // filled by the translation workers, each draw in the slot its packet names; these are the only frame buffers, recycled
+  std::unique_ptr<DrawRec[]> draws;
+  std::unique_ptr<Vertex[]> verts;
+  std::uint32_t baseDraw = 0, baseVert = 0, drawCount = 0;
+  std::atomic<std::uint32_t> pending{0}, epoch{0};
+  std::atomic<std::uint64_t> translateUs{0};
+  std::promise<void> done;
   std::future<void> rules;
   Frame frame;
   std::vector<LiveTexture> textures;

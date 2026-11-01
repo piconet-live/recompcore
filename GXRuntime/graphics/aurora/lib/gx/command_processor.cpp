@@ -886,12 +886,12 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
     lastDraw->vtxCount += vtxCount;
     lastDraw->indexCount += numIndices;
     gfx::detail::increment_merged_draw_count();
-    if (rt::g_capturing) UNLIKELY { rt::capture_draw(prim, fmt, vtxCount, vertexData.data()); }
+    if (rt::g_capturing) UNLIKELY { rt::capture_draw(prim, fmt, vtxCount, vertexData.data(), vertexData.size()); }
     return;
   }
 
   handle_draw_unmerged(prim, fmt, vtxCount, vertRange);
-  if (rt::g_capturing) UNLIKELY { rt::capture_draw(prim, fmt, vtxCount, vertexData.data()); }
+  if (rt::g_capturing) UNLIKELY { rt::capture_draw(prim, fmt, vtxCount, vertexData.data(), vertexData.size()); }
 }
 
 static void handle_draw(u8 cmd, ByteReader& reader) noexcept {

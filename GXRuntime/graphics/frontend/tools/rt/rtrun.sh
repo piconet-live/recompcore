@@ -10,7 +10,7 @@ wl=SDL_JOYSTICK_HIDAPI_GAMECUBE:DOL_AURORA_DATA_DIR:AURORA_ANISO_GX:AURORA_RT:AU
 if [ -n "${CAP:-1}" ] && [ "${CAP:-1}" != 0 ]; then export AURORA_RT_CAPTURE="$W\\runs\\$n\\capture.bin" AURORA_RT_CAPTURE_COPY=$first; wl=$wl:AURORA_RT_CAPTURE:AURORA_RT_CAPTURE_COPY; fi
 for kv in ${XENV:-}; do export "$kv"; wl=$wl:${kv%%=*}; done
 export WSLENV=$wl
-cd $H/run
+cd $H/${RUNDIR:-run}
 timeout --signal=KILL $((secs+15)) ./moderngekko-run.exe --game 'D:\FZero\aurora-mi19\port\game-mi18b' --module 'D:\FZero\aurora-mi19\work\mod-cg-mi18b\gGFZE01_recomp.dll' --user-dir "$W\\port\\rt-user" --no-mods --mute --title "RT-$n--agent--closes-by-itself" --graphics Null --config "$W\\runs\\$n\\launch.json" --fzgx-log "$W\\runs\\$n\\runner.log" > $R/stdout.txt 2> $R/stderr.txt &
 sp=$!
 # wait for the end or the time limit: find the Windows PID by this run's own title once, stop only it

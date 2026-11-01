@@ -115,14 +115,6 @@ struct Frame {
 
 // The main view is the perspective projection with the most triangles. Sky: the largest see-through shells around the view,
 // by size against the largest in the frame, with no table of courses.
-// Records left uninitialised: a DrawRec is 2 KB, most of it stages the draw does not use
-template <class T> struct NoInit : std::allocator<T> {
-  template <class U> struct rebind { using other = NoInit<U>; };
-  template <class U> void construct(U* p) noexcept { ::new (static_cast<void*>(p)) U; }
-  template <class U, class... A> void construct(U* p, A&&... a) { ::new (static_cast<void*>(p)) U(std::forward<A>(a)...); }
-};
-using DrawList = std::vector<DrawRec, NoInit<DrawRec>>;
-
 inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex* verts, const Tuning& t, Frame& out) {
   out.verts.clear(), out.draws.clear(), out.stages.clear(), out.main = nullptr, out.machineDraws = out.reflective = 0, out.skyFirstVertex = 0;
   const auto key = [](const DrawRec& d) { return std::array<int, 2>{static_cast<int>(d.proj[0] * 1000), static_cast<int>(d.proj[5] * 1000)}; };

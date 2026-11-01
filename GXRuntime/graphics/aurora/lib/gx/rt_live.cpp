@@ -107,7 +107,7 @@ struct State {
   wgpu::CommandBuffer first;
   bool outputOpen = false;
 
-  double msTrace = 0, msGpu = 0, msComposeWait = 0, msBuild = 0, msRules = 0;
+  double msTrace = 0, msGpu = 0, msComposeWait = 0, msBuild = 0, msRules = 0, msTranslate = 0;
   u64 tris = 0, lightsSeen = 0, lightsMost = 0, reports = 0;
   u32 count = 0;
 } g;
@@ -623,6 +623,7 @@ void run_rays(Job& job) {
   g.msComposeWait += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   g.msBuild += job.captureMs;
   g.msRules += job.rulesMs;
+  g.msTranslate += job.translateUs.load() / 1000.0;
   g.tris += fr.verts.size() / 3;
   g.lightsSeen += fr.lights.size();
   g.lightsMost = std::max<u64>(g.lightsMost, fr.lights.size());
@@ -632,10 +633,10 @@ void run_rays(Job& job) {
   }();
   if (++g.count == every) {
     const double n = g.count;
-    std::fprintf(stderr, "[rt] per frame, %u frames at %ux%u: GPU build %.2f ms and rays+cleanup %.2f ms (all %.2f); CPU capture %.2f ms in the stream, rules %.2f ms beside it, worker %.2f ms; %.0f triangles, lights %.1f (most %llu)\n",
-                 g.count, g.w, g.h, (g.msGpu - g.msTrace) / n, g.msTrace / n, g.msGpu / n, g.msBuild / n, g.msRules / n, g.msComposeWait / n, double(g.tris) / n, double(g.lightsSeen) / n,
+    std::fprintf(stderr, "[rt] per frame, %u frames at %ux%u: GPU build %.2f ms and rays+cleanup %.2f ms (all %.2f); CPU in the stream %.2f ms, translation beside it %.2f ms, rules %.2f ms, worker %.2f ms; %.0f triangles, lights %.1f (most %llu)\n",
+                 g.count, g.w, g.h, (g.msGpu - g.msTrace) / n, g.msTrace / n, g.msGpu / n, g.msBuild / n, g.msTranslate / n, g.msRules / n, g.msComposeWait / n, double(g.tris) / n, double(g.lightsSeen) / n,
                  static_cast<unsigned long long>(g.lightsMost));
-    g.count = 0, g.msGpu = g.msTrace = g.msBuild = g.msRules = g.msComposeWait = 0, g.tris = 0, g.lightsSeen = 0, g.lightsMost = 0;
+    g.count = 0, g.msGpu = g.msTrace = g.msBuild = g.msRules = g.msTranslate = g.msComposeWait = 0, g.tris = 0, g.lightsSeen = 0, g.lightsMost = 0;
   }
 }
 
@@ -747,8 +748,11 @@ std::unique_ptr<Job> take_job() {
 }
 
 bool submit_job(std::unique_ptr<Job> job) {
-  if (g.failed)
+  if (g.failed) {
+    job->rules.wait();
+    give_back(std::move(job));
     return false;
+  }
   if (g.task == gfx::InvalidEncoderTask) {
     g.task = gfx::register_encoder_task_type({.label = "ray tracing", .callback = task});
     g.draw = gfx::register_draw_type({.label = "ray traced picture", .draw = draw});
@@ -758,18 +762,9 @@ bool submit_job(std::unique_ptr<Job> job) {
   // from inside the command stream: these calls must not drain it
   const gx::fifo::HoldDrain hold;
   gfx::ResolvedTargets targets;
-  job->rules = std::async(std::launch::async, [j = job.get()] {
-    const auto t0 = std::chrono::steady_clock::now();
-    build_frame(j->draws.data(), static_cast<u32>(j->draws.size()), j->verts.data(), Tuning{}, j->frame);
-    j->drawable = j->frame.main != nullptr && !j->frame.verts.empty();
-    if (j->drawable) {
-      std::memcpy(j->proj, j->frame.main->proj, sizeof j->proj);
-      std::memcpy(j->viewport, j->frame.main->viewport, sizeof j->viewport);
-    }
-    j->rulesMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-  });
   if (!gfx::resolve_pass({.color = true}, targets) || !targets.colorTexture) {
     job->rules.wait();
+    give_back(std::move(job));
     return false;
   }
   TaskPayload p{job.release(), targets.colorTexture.MoveToCHandle(), targets.width, targets.height, static_cast<u32>(targets.colorFormat)};

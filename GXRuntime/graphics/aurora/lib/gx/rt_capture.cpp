@@ -13,8 +13,14 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <new>
+#include <thread>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -47,10 +53,10 @@ bool s_rayed = false;
 double s_captureMs = 0;
 float s_road = 0.9f, s_light = 1.f;
 u32 s_liveFirstNew = 0;
-DrawList s_draws;
+std::vector<DrawRec> s_draws;
 std::vector<Vertex> s_verts;
 struct Tex {
-  u32 w, h, wrapS, wrapT;
+  u32 w, h, wrapS, wrapT, index;
   std::vector<u8> rgba;
 };
 std::vector<Tex> s_texs;
@@ -125,20 +131,31 @@ void k_select(u32 sel, const std::array<Vec4<float>, GX_MAX_KCOLOR>& k, float* o
     out[0] = out[1] = out[2] = out[3] = v;
   }
 }
-u32 add_texture(u32 slot) {
-  if (slot >= MaxTextures)
-    return UINT32_MAX;
-  auto obj = g_gxState.textures[slot].texObj;
+// What one stage's texture needs after the stream has moved on
+struct TexSnap {
+  GXTexObj_ obj;
+  GXTlutObj_ tlut;
+  bool palette, tlutOk;
+};
+using TexKey = std::tuple<const void*, u32, u32, u32, const void*>;
+std::mutex s_texLock;
+u32 add_texture(const TexSnap& snap) {
+  auto obj = snap.obj;
   if (!recomp::resolve_texture_data(obj) || obj.data == nullptr)
     return UINT32_MAX;
   const u32 w = obj.width(), h = obj.height(), fmt = obj.format();
-  GXTlutObj_ tlut{};
-  const bool palette = fmt == GX_TF_C4 || fmt == GX_TF_C8 || fmt == GX_TF_C14X2;
-  if (palette && !recomp::resolve_texture_tlut(slot, &tlut))
+  const GXTlutObj_& tlut = snap.tlut;
+  const bool palette = snap.palette;
+  if (palette && !snap.tlutOk)
     return UINT32_MAX;
-  const auto key = std::make_tuple(obj.data, w, h, fmt, palette ? tlut.data : nullptr);
-  if (const auto it = s_texIndex.find(key); it != s_texIndex.end())
+  const TexKey key = std::make_tuple(obj.data, w, h, fmt, palette ? tlut.data : nullptr);
+  // indices never change: each worker keeps its own memory of them and takes the lock only for one it has not seen
+  static thread_local std::map<TexKey, u32> s_seen;
+  if (const auto it = s_seen.find(key); it != s_seen.end())
     return it->second;
+  std::lock_guard lock{s_texLock};
+  if (const auto it = s_texIndex.find(key); it != s_texIndex.end())
+    return s_seen[key] = it->second;
   if (g_live && s_liveTextures >= 8000)
     return UINT32_MAX;
   const size_t bytes = GXGetTexBufferSize(static_cast<u16>(w), static_cast<u16>(h), fmt, GX_FALSE, 0);
@@ -155,10 +172,10 @@ u32 add_texture(u32 slot) {
     s_texIndex[key] = UINT32_MAX;
     return UINT32_MAX;
   }
-  Tex t{w, h, static_cast<u32>(obj.wrap_s()), static_cast<u32>(obj.wrap_t()), {}};
-  t.rgba.assign(conv.data.data(), conv.data.data() + static_cast<size_t>(w) * h * 4u);
-  // live: an index for good, the pixels leave with the next job
+  // live: an index for good, the pixels leave with the job that first needs them
   const u32 index = g_live ? s_liveTextures++ : static_cast<u32>(s_texs.size());
+  Tex t{w, h, static_cast<u32>(obj.wrap_s()), static_cast<u32>(obj.wrap_t()), index, {}};
+  t.rgba.assign(conv.data.data(), conv.data.data() + static_cast<size_t>(w) * h * 4u);
   s_texs.push_back(std::move(t));
   s_texIndex[key] = index;
   return index;
@@ -224,15 +241,65 @@ void neutralise(ShaderConfig& config) noexcept {
   }
 }
 
-void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertices) noexcept {
-  if (prim == GX_LINES || prim == GX_LINESTRIP || prim == GX_POINTS || vtxCount < 3)
-    return;
-  auto& st = g_gxState;
-  if (g_live && st.projType != GX_PERSPECTIVE)
-    return;
-  const auto liveStart = g_live ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-  const u32 drawIndex = static_cast<u32>(s_draws.size());
-  DrawRec& d = s_draws.emplace_back();
+// All a draw's translation reads, copied where the stream stands: the same names as GXState, the parts only this draw uses
+struct Packet {
+  u32 size;        // bytes to the next packet
+  u32 epoch;       // live: draws before the last EFB clear went to a texture, not the picture
+  u32 drawSlot, vertSlot, drawIndex, firstVertex;
+  GXPrimitive prim;
+  u16 vtxCount;
+  u32 rawOffset, stagesOffset, mtxOffset, mtxCount, lightsOffset;
+  decltype(GXState::proj) proj;
+  decltype(GXState::logicalViewport) logicalViewport;
+  decltype(GXState::projType) projType;
+  decltype(GXState::numTevStages) numTevStages;
+  decltype(GXState::blendMode) blendMode;
+  decltype(GXState::blendFacSrc) blendFacSrc;
+  decltype(GXState::blendFacDst) blendFacDst;
+  decltype(GXState::depthUpdate) depthUpdate;
+  decltype(GXState::depthCompare) depthCompare;
+  decltype(GXState::cullMode) cullMode;
+  decltype(GXState::colorUpdate) colorUpdate;
+  decltype(GXState::fog) fog;
+  decltype(GXState::colorRegs) colorRegs;
+  decltype(GXState::tevSwapTable) tevSwapTable;
+  decltype(GXState::kcolors) kcolors;
+  decltype(GXState::tcgs) tcgs;
+  decltype(GXState::colorChannelConfig) colorChannelConfig;
+  decltype(GXState::colorChannelState) colorChannelState;
+  decltype(GXState::vtxDesc) vtxDesc;
+  decltype(GXState::arrays) arrays;
+  decltype(GXState::numTexGens) numTexGens;
+  VtxFmt vf;
+  Mat3x4<float> texMtx[MaxUv], ptTexMtx[MaxUv];
+  u32 currentPnMtx;
+};
+
+u32 triangle_vertices(GXPrimitive prim, u32 n) {
+  switch (prim) {
+  case GX_TRIANGLES:
+    return n / 3 * 3;
+  case GX_TRIANGLESTRIP:
+  case GX_TRIANGLEFAN:
+    return (n - 2) * 3;
+  case GX_QUADS:
+    return n / 4 * 6;
+  default:
+    return 0;
+  }
+}
+
+// Anywhere, in any order: the packet says where its draw and triangles go
+void translate(const Packet& st, DrawRec& d, Vertex* outVerts) noexcept {
+  const auto* base = reinterpret_cast<const u8*>(&st);
+  const auto* tevStages = reinterpret_cast<const TevStage*>(base + st.stagesOffset);
+  const auto* texSnaps = reinterpret_cast<const TexSnap*>(tevStages + std::min<u32>(st.numTevStages, 16u));
+  const auto* pnMtx = reinterpret_cast<const PnMtx*>(base + st.mtxOffset);
+  const auto* lights = reinterpret_cast<const Light*>(base + st.lightsOffset);
+  const u8* vertices = base + st.rawOffset;
+  const GXPrimitive prim = st.prim;
+  const u16 vtxCount = st.vtxCount;
+  const u32 drawIndex = st.drawIndex;
   std::memset(static_cast<void*>(&d), 0, g_live ? offsetof(DrawRec, stage) : sizeof(DrawRec));
   std::memcpy(d.proj, &st.proj, sizeof d.proj);
   const auto& vp = st.logicalViewport;
@@ -254,10 +321,10 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
     d.swap[i][3] = st.tevSwapTable[i].alpha;
   }
   for (u32 i = 0; i < d.stages && i < 16; ++i) {
-    const auto& g = st.tevStages[i];
+    const auto& g = tevStages[i];
     auto& s = d.stage[i];
     s.tc = g.texCoordId, s.map = g.texMapId;
-    s.tex = g.texMapId != GX_TEXMAP_NULL ? add_texture(g.texMapId) : UINT32_MAX;
+    s.tex = g.texMapId != GX_TEXMAP_NULL ? add_texture(texSnaps[i]) : UINT32_MAX;
     s.ca = g.colorPass.a, s.cb = g.colorPass.b, s.cc = g.colorPass.c, s.cd = g.colorPass.d;
     s.cop = g.colorOp.op, s.cbias = g.colorOp.bias, s.cscale = g.colorOp.scale, s.cclamp = g.colorOp.clamp, s.creg = g.colorOp.outReg;
     s.aa = g.alphaPass.a, s.ab = g.alphaPass.b, s.ac = g.alphaPass.c, s.ad = g.alphaPass.d;
@@ -273,7 +340,7 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
   }
 
   // The layout of one vertex in the stream
-  const auto& vf = st.vtxFmts[fmt];
+  const auto& vf = st.vf;
   struct Field {
     GXAttrType type = GX_NONE;
     u32 offset = 0, size = 0;
@@ -314,7 +381,7 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
   // one rasterised colour to a vertex: the channel the draw's stages read
   u32 chan = 0;
   for (u32 i = 0; i < d.stages && i < 16; ++i)
-    if (st.tevStages[i].channelId == GX_COLOR1A1 || st.tevStages[i].channelId == GX_COLOR1 || st.tevStages[i].channelId == GX_ALPHA1) {
+    if (tevStages[i].channelId == GX_COLOR1A1 || tevStages[i].channelId == GX_COLOR1 || tevStages[i].channelId == GX_ALPHA1) {
       chan = 1;
       break;
     }
@@ -324,7 +391,7 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
     Vertex out{};
     out.draw = drawIndex;
     const u32 mi = fields[GX_VA_PNMTXIDX].type != GX_NONE ? v[fields[GX_VA_PNMTXIDX].offset] / 3u : st.currentPnMtx;
-    const auto& mtx = st.pnMtx[std::min<u32>(mi, MaxPnMtx - 1)];
+    const auto& mtx = st.mtxCount == 1 ? pnMtx[0] : pnMtx[std::min<u32>(mi, MaxPnMtx - 1)];
     float p[3]{};
     if (const u8* s = source(GX_VA_POS, v)) {
       const auto& a = vf.attrs[GX_VA_POS];
@@ -368,7 +435,7 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
         for (u32 l = 0; l < GX::MaxLights; ++l) {
           if (!cs.lightMask.test(l))
             continue;
-          const auto& light = st.lights[l];
+          const auto& light = lights[l];
           float lx = light.pos[0] - out.pos[0], ly = light.pos[1] - out.pos[1], lz = light.pos[2] - out.pos[2];
           const float ll = std::sqrt(lx * lx + ly * ly + lz * lz);
           if (ll > 0)
@@ -407,12 +474,12 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
       }
       float o[3] = {in[0], in[1], in[2]};
       if (g.mtx != GX_IDENTITY && g.mtx >= GX_TEXMTX0 && (g.mtx - GX_TEXMTX0) / 3 < MaxTexMtx) {
-        const auto& m = st.texMtxs[(g.mtx - GX_TEXMTX0) / 3];
+        const auto& m = st.texMtx[t];
         o[0] = dot4(m.m0, in[0], in[1], in[2], 1.f), o[1] = dot4(m.m1, in[0], in[1], in[2], 1.f);
         o[2] = g.type == GX_TG_MTX3x4 ? dot4(m.m2, in[0], in[1], in[2], 1.f) : 1.f;
       }
       if (g.postMtx != GX_PTIDENTITY && g.postMtx >= GX_PTTEXMTX0 && (g.postMtx - GX_PTTEXMTX0) / 3 < MaxPTTexMtx) {
-        const auto& m = st.ptTexMtxs[(g.postMtx - GX_PTTEXMTX0) / 3];
+        const auto& m = st.ptTexMtx[t];
         const float a = o[0], b = o[1], c = o[2];
         o[0] = dot4(m.m0, a, b, c, 1.f), o[1] = dot4(m.m1, a, b, c, 1.f), o[2] = dot4(m.m2, a, b, c, 1.f);
       }
@@ -422,15 +489,15 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
     return out;
   };
 
-  d.firstVertex = static_cast<u32>(s_verts.size());
+  d.firstVertex = st.firstVertex;
   static thread_local std::vector<Vertex> strip;
   strip.resize(vtxCount);
   for (u32 i = 0; i < vtxCount; ++i)
     strip[i] = read_vertex(vertices + i * stride);
+  Vertex* out = outVerts;
   const auto tri = [&](u32 a, u32 b, u32 c) {
-    const size_t at = s_verts.size();
-    s_verts.resize(at + 3);
-    s_verts[at] = strip[a], s_verts[at + 1] = strip[b], s_verts[at + 2] = strip[c];
+    out[0] = strip[a], out[1] = strip[b], out[2] = strip[c];
+    out += 3;
   };
   switch (prim) {
   case GX_TRIANGLES:
@@ -454,33 +521,285 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
   default:
     break;
   }
-  d.vertices = static_cast<u32>(s_verts.size()) - d.firstVertex;
-  if (g_live)
-    s_captureMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - liveStart).count();
+  d.vertices = static_cast<u32>(out - outVerts);
 }
 
 #if defined(AURORA_RT_LIVE)
+// Translation beside the stream: chunks of packets to a couple of workers, each draw into the slot the stream gave it
+constexpr size_t ChunkSize = 256 * 1024;
+constexpr u32 MostDraws = 32768, MostVerts = 1500000;
+struct Chunk {
+  live::Job* job = nullptr;
+  std::unique_ptr<u8[]> data;
+  size_t capacity = 0, used = 0;
+};
+std::mutex s_queueLock;
+std::condition_variable s_queueWake;
+std::deque<std::unique_ptr<Chunk>> s_queue;
+std::vector<std::unique_ptr<Chunk>> s_freeChunks;
+std::deque<live::Job*> s_rulesToRun;
+live::Job* s_job = nullptr;
+std::unique_ptr<live::Job> s_jobOwned;
+std::unique_ptr<Chunk> s_chunk;
+u32 s_epoch = 0, s_baseDraw = 0, s_baseVert = 0, s_nextDraw = 0, s_nextVert = 0;
+
+void run_rules(live::Job& j) {
+  const auto t0 = std::chrono::steady_clock::now();
+  build_frame(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, Tuning{}, j.frame);
+  j.drawable = j.frame.main != nullptr && !j.frame.verts.empty();
+  j.textures.clear();
+  if (j.drawable) {
+    // only a job that will run carries textures away: their indices are for good
+    {
+      std::lock_guard lock{s_texLock};
+      for (auto& t : s_texs)
+        j.textures.push_back({t.index, t.w, t.h, std::move(t.rgba)});
+      s_texs.clear();
+    }
+    std::memcpy(j.proj, j.frame.main->proj, sizeof j.proj);
+    std::memcpy(j.viewport, j.frame.main->viewport, sizeof j.viewport);
+  }
+  j.rulesMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  j.done.set_value();
+}
+
+void worker() {
+  for (;;) {
+    std::unique_ptr<Chunk> c;
+    live::Job* rules = nullptr;
+    {
+      std::unique_lock lock{s_queueLock};
+      s_queueWake.wait(lock, [] { return !s_queue.empty() || !s_rulesToRun.empty(); });
+      if (!s_rulesToRun.empty()) {
+        rules = s_rulesToRun.front();
+        s_rulesToRun.pop_front();
+      } else {
+        c = std::move(s_queue.front());
+        s_queue.pop_front();
+      }
+    }
+    if (rules != nullptr) {
+      run_rules(*rules);
+      continue;
+    }
+    live::Job& j = *c->job;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (size_t at = 0; at < c->used;) {
+      const auto& p = *reinterpret_cast<const Packet*>(c->data.get() + at);
+      if (p.epoch == j.epoch.load(std::memory_order_relaxed))
+        translate(p, j.draws[p.drawSlot], j.verts.get() + p.vertSlot);
+      at += p.size;
+    }
+    j.translateUs.fetch_add(static_cast<u64>(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count()),
+                            std::memory_order_relaxed);
+    c->used = 0;
+    if (c->capacity == ChunkSize) {
+      std::lock_guard lock{s_queueLock};
+      s_freeChunks.push_back(std::move(c));
+    }
+    if (j.pending.fetch_sub(1, std::memory_order_acq_rel) == 1)
+      run_rules(j);
+  }
+}
+
+void publish_chunk() {
+  if (!s_chunk)
+    return;
+  if (s_chunk->used == 0)
+    return;
+  s_job->pending.fetch_add(1, std::memory_order_relaxed);
+  {
+    std::lock_guard lock{s_queueLock};
+    s_queue.push_back(std::move(s_chunk));
+  }
+  s_queueWake.notify_one();
+}
+
+void start_workers() {
+  static const bool started = [] {
+    const char* v = std::getenv("AURORA_RT_WORKERS");
+    const int n = v != nullptr ? std::atoi(v) : 2;
+    for (int i = 0; i < std::max(n, 1); ++i)
+      std::thread(worker).detach();
+    return true;
+  }();
+  (void)started;
+}
+
+u8* packet_room(size_t need) {
+  if (!s_job) {
+    start_workers();
+    s_jobOwned = live::take_job();
+    s_job = s_jobOwned.get();
+    if (!s_job->draws) {
+      s_job->draws.reset(new DrawRec[MostDraws]);
+      s_job->verts.reset(new Vertex[MostVerts]);
+    }
+    s_job->pending.store(1, std::memory_order_relaxed);
+    s_job->epoch.store(0, std::memory_order_relaxed);
+    s_job->translateUs.store(0, std::memory_order_relaxed);
+    s_job->done = std::promise<void>();
+    s_job->rules = s_job->done.get_future();
+    s_epoch = s_baseDraw = s_baseVert = s_nextDraw = s_nextVert = 0;
+  }
+  if (s_chunk && s_chunk->used + need > s_chunk->capacity)
+    publish_chunk();
+  if (!s_chunk) {
+    if (need <= ChunkSize) {
+      std::lock_guard lock{s_queueLock};
+      if (!s_freeChunks.empty()) {
+        s_chunk = std::move(s_freeChunks.back());
+        s_freeChunks.pop_back();
+      }
+    }
+    if (!s_chunk) {
+      s_chunk = std::make_unique<Chunk>();
+      s_chunk->capacity = std::max(need, ChunkSize);
+      s_chunk->data.reset(new u8[s_chunk->capacity]);
+    }
+    s_chunk->job = s_job;
+    s_chunk->used = 0;
+  }
+  s_chunk->job = s_job;
+  u8* room = s_chunk->data.get() + s_chunk->used;
+  s_chunk->used += need;
+  return room;
+}
+#endif
+
+// The stream's part: copy what the draw reads, in order; the reading itself happens later
+static void make_packet(u8* room, const size_t size, const u32 stages, const u32 mtxCount, const bool lit, GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
+                        const u8* vertices, const u32 rawBytes, u32 drawSlot, u32 vertSlot, u32 drawIndex, u32 firstVertex, u32 epoch) noexcept {
+  auto& st = g_gxState;
+  auto& p = *new (room) Packet;
+  p.size = static_cast<u32>(size), p.epoch = epoch, p.drawSlot = drawSlot, p.vertSlot = vertSlot, p.drawIndex = drawIndex, p.firstVertex = firstVertex;
+  p.prim = prim, p.vtxCount = vtxCount;
+  p.proj = st.proj, p.logicalViewport = st.logicalViewport, p.projType = st.projType, p.numTevStages = st.numTevStages;
+  p.blendMode = st.blendMode, p.blendFacSrc = st.blendFacSrc, p.blendFacDst = st.blendFacDst, p.depthUpdate = st.depthUpdate;
+  p.depthCompare = st.depthCompare, p.cullMode = st.cullMode, p.colorUpdate = st.colorUpdate;
+  p.fog = st.fog, p.colorRegs = st.colorRegs, p.tevSwapTable = st.tevSwapTable, p.kcolors = st.kcolors, p.tcgs = st.tcgs;
+  p.colorChannelConfig = st.colorChannelConfig, p.colorChannelState = st.colorChannelState;
+  p.vtxDesc = st.vtxDesc, p.arrays = st.arrays, p.numTexGens = st.numTexGens, p.vf = st.vtxFmts[fmt], p.currentPnMtx = st.currentPnMtx;
+  for (u32 t = 0; t < MaxUv && t < st.numTexGens; ++t) {
+    const auto& g = st.tcgs[t];
+    if (g.mtx != GX_IDENTITY && g.mtx >= GX_TEXMTX0 && (g.mtx - GX_TEXMTX0) / 3 < MaxTexMtx)
+      p.texMtx[t] = st.texMtxs[(g.mtx - GX_TEXMTX0) / 3];
+    if (g.postMtx != GX_PTIDENTITY && g.postMtx >= GX_PTTEXMTX0 && (g.postMtx - GX_PTTEXMTX0) / 3 < MaxPTTexMtx)
+      p.ptTexMtx[t] = st.ptTexMtxs[(g.postMtx - GX_PTTEXMTX0) / 3];
+  }
+  size_t at = (sizeof(Packet) + 15) & ~size_t(15);
+  p.stagesOffset = static_cast<u32>(at);
+  auto* stage = reinterpret_cast<TevStage*>(room + at);
+  auto* snap = reinterpret_cast<TexSnap*>(stage + stages);
+  for (u32 i = 0; i < stages; ++i) {
+    new (stage + i) TevStage(st.tevStages[i]);
+    const u32 map = st.tevStages[i].texMapId;
+    auto* ts = new (snap + i) TexSnap;
+    ts->palette = false, ts->tlutOk = false;
+    if (map != GX_TEXMAP_NULL && map < MaxTextures) {
+      ts->obj = st.textures[map].texObj;
+      const u32 f = ts->obj.format();
+      ts->palette = f == GX_TF_C4 || f == GX_TF_C8 || f == GX_TF_C14X2;
+      if (ts->palette)
+        ts->tlutOk = recomp::resolve_texture_tlut(map, &ts->tlut);
+    }
+  }
+  at = reinterpret_cast<u8*>(snap + stages) - room;
+  p.mtxOffset = static_cast<u32>(at), p.mtxCount = mtxCount;
+  if (mtxCount == 1)
+    new (room + at) PnMtx(st.pnMtx[std::min<u32>(st.currentPnMtx, MaxPnMtx - 1)]);
+  else
+    std::memcpy(room + at, st.pnMtx.data(), sizeof(PnMtx) * MaxPnMtx);
+  at += sizeof(PnMtx) * mtxCount;
+  p.lightsOffset = static_cast<u32>(at);
+  if (lit)
+    std::memcpy(room + at, st.lights.data(), sizeof(Light) * GX::MaxLights);
+  at += lit ? sizeof(Light) * GX::MaxLights : 0;
+  p.rawOffset = static_cast<u32>(at);
+  std::memcpy(room + at, vertices, rawBytes);
+}
+
+void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertices, size_t rawBytes) noexcept {
+  if (prim == GX_LINES || prim == GX_LINESTRIP || prim == GX_POINTS || vtxCount < 3)
+    return;
+  auto& st = g_gxState;
+  if (g_live && st.projType != GX_PERSPECTIVE)
+    return;
+  const auto liveStart = g_live ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  const u32 stages = std::min<u32>(st.numTevStages, 16u);
+  const u32 mtxCount = st.vtxDesc[GX_VA_PNMTXIDX] != GX_NONE ? MaxPnMtx : 1;
+  bool lit = false;
+  for (const auto& c : st.colorChannelConfig)
+    lit = lit || c.lightingEnabled;
+  const size_t size = (((sizeof(Packet) + 15) & ~size_t(15)) + (sizeof(TevStage) + sizeof(TexSnap)) * stages + sizeof(PnMtx) * mtxCount +
+                       (lit ? sizeof(Light) * GX::MaxLights : 0) + rawBytes + 15) & ~size_t(15);
+  const u32 tv = triangle_vertices(prim, vtxCount);
+#if defined(AURORA_RT_LIVE)
+  if (g_live) {
+    u8* room = packet_room(size);
+    if (s_nextDraw >= MostDraws || s_nextVert + tv > MostVerts) {
+      // beyond the buffers: not traced, the frame goes on
+      s_chunk->used -= size;
+      return;
+    }
+    make_packet(room, size, stages, mtxCount, lit, prim, fmt, vtxCount, vertices, static_cast<u32>(rawBytes), s_nextDraw, s_nextVert,
+                s_nextDraw - s_baseDraw, s_nextVert - s_baseVert, s_epoch);
+    s_nextDraw += 1, s_nextVert += tv;
+    s_captureMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - liveStart).count();
+    return;
+  }
+#endif
+  // the still tool's capture file: all of it here, in order
+  static std::vector<u8> one;
+  one.resize(size);
+  const u32 drawIndex = static_cast<u32>(s_draws.size()), first = static_cast<u32>(s_verts.size());
+  make_packet(one.data(), size, stages, mtxCount, lit, prim, fmt, vtxCount, vertices, static_cast<u32>(rawBytes), drawIndex, first, drawIndex, first, 0);
+  s_draws.emplace_back();
+  s_verts.resize(first + tv);
+  translate(*reinterpret_cast<const Packet*>(one.data()), s_draws.back(), s_verts.data() + first);
+}
+
+#if defined(AURORA_RT_LIVE)
+// What was drawn so far went elsewhere: its packets are skipped, the slots after them used next. The buffers fill only if a
+// frame does this without ever reaching the rays; then wait for the workers and start again.
+static void forget_draws() noexcept {
+  if (!s_job)
+    return;
+  publish_chunk();
+  s_baseDraw = s_nextDraw, s_baseVert = s_nextVert;
+  s_job->epoch.store(++s_epoch, std::memory_order_relaxed);
+  s_captureMs = 0;
+  if (s_nextDraw > MostDraws / 2 || s_nextVert > MostVerts / 2) {
+    while (s_job->pending.load(std::memory_order_acquire) > 1)
+      std::this_thread::yield();
+    s_baseDraw = s_baseVert = s_nextDraw = s_nextVert = 0;
+  }
+}
+
 static void send_rays() noexcept {
   if (s_rayed)
     return;
   s_rayed = true;
   g_capturing = false;
-  if (s_draws.empty() || live::failed())
+  if (!s_job)
     return;
-  // the rules run beside the stream, on buffers handed over whole
-  auto job = live::take_job();
-  std::swap(job->draws, s_draws);
-  std::swap(job->verts, s_verts);
-  s_draws.clear();
-  s_verts.clear();
+  const u32 draws = s_nextDraw - s_baseDraw;
+  publish_chunk();
+  auto job = std::move(s_jobOwned);
+  s_job = nullptr;
+  job->baseDraw = s_baseDraw, job->baseVert = s_baseVert, job->drawCount = draws;
   job->road = s_road, job->light = s_light;
-  job->textures.clear();
-  for (u32 i = 0; i < s_texs.size(); ++i)
-    job->textures.push_back({s_liveFirstNew + i, s_texs[i].w, s_texs[i].h, std::move(s_texs[i].rgba)});
-  s_liveFirstNew += static_cast<u32>(s_texs.size());
-  s_texs.clear();
   job->captureMs = s_captureMs;
   s_captureMs = 0;
+  // the guard the job began with: if the workers are already through, one of them runs the rules
+  live::Job* j = job.get();
+  if (j->pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+    {
+      std::lock_guard lock{s_queueLock};
+      s_rulesToRun.push_back(j);
+    }
+    s_queueWake.notify_one();
+  }
   live::submit_job(std::move(job));
 }
 #endif
@@ -499,8 +818,9 @@ void before_draw() noexcept {
 void efb_cleared() noexcept {
   if (!g_live || s_rayed)
     return;
-  s_draws.clear();
-  s_verts.clear();
+#if defined(AURORA_RT_LIVE)
+  forget_draws();
+#endif
   s_seenPerspective = false;
 }
 
@@ -518,9 +838,7 @@ void frame_end() noexcept {
       send_rays();
     s_rayed = false;
     s_seenPerspective = false;
-    s_draws.clear();
-    s_verts.clear();
-    s_captureMs = 0;
+    forget_draws();
     g_capturing = !live::failed();
     return;
   }
