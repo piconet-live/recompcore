@@ -397,14 +397,14 @@ void make_filter_pipeline() {
   };
   // (the rows go in as the columns of a transposed matrix: dot products by row)
   const std::string code = R"(
-@group(0) @binding(0) var from: texture_2d<f32>;
+@group(0) @binding(0) var src: texture_2d<f32>;
 @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
   return vec4f(f32(i & 1u) * 4.0 - 1.0, f32(i & 2u) * 2.0 - 1.0, 0.0, 1.0);
 }
 fn to_linear(c: vec3f) -> vec3f { return select(pow((c + 0.055) / 1.055, vec3f(2.4)), c / 12.92, c <= vec3f(0.04045)); }
 fn to_srgb(c: vec3f) -> vec3f { return select(1.055 * pow(c, vec3f(1.0 / 2.4)) - 0.055, c * 12.92, c <= vec3f(0.0031308)); }
 @fragment fn fs(@builtin(position) at: vec4f) -> @location(0) vec4f {
-  let c = to_linear(textureLoad(from, vec2i(at.xy), 0).rgb);
+  let c = to_linear(textureLoad(src, vec2i(at.xy), 0).rgb);
   let r = clamp(vec3f(dot()" + row(0) + R"(, c), dot()" + row(1) + R"(, c), dot()" + row(2) + R"(, c)), vec3f(0.0), vec3f(1.0));
   return vec4f(to_srgb(r), 1.0);
 }
