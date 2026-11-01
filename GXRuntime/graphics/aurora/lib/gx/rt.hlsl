@@ -39,9 +39,12 @@ struct Params {
   float bodyCalm;
   float2 projZ;
   uint skyFirst;
-  uint _pad;
+  uint glowCount;
+  float glowGain;
+  uint glowShow;
 };
 struct Light { float3 pos; float3 colour; float reach; };
+struct GlowLight { float3 pos; float area; float3 colour; float radius; };
 // The acceleration structure's instances: solid surfaces, the sky's shells, and what light passes through (see-through, glows)
 static const uint MaskSolid = 1, MaskSky = 2, MaskSee = 4, MaskSeen = MaskSolid | MaskSee;
 ConstantBuffer<Params> P : register(b0);
@@ -54,6 +57,7 @@ StructuredBuffer<Stage> Stages : register(t5);
 RWTexture2D<float4> Out : register(u0);
 RWTexture2D<float4> Final : register(u1);
 Texture2D<float4> Term : register(t6);
+StructuredBuffer<GlowLight> Glows : register(t7);
 Texture2D<float4> Tex[] : register(t0, space1);
 SamplerState Linear : register(s0);
 
@@ -218,6 +222,29 @@ float3 engine_light(float3 pos, float3 N) {
   }
   return sum;
 }
+// Glowing surfaces: each a ball of the piece's area, seen from here as form factor. All of them add without noise; one ray, to the one that
+// gives this point the most, takes that one out when something stands in between. No random choice, so nothing sparkles between frames.
+float3 glow_light(float3 pos, float3 N) {
+  float3 sum = 0, topLight = 0, topDir = 0;
+  float top = 0, topMax = 0;
+  for (uint i = 0; i < P.glowCount; ++i) {
+    GlowLight g = Glows[i];
+    float3 d = g.pos - pos;
+    float dd = dot(d, d);
+    float cosv = saturate(dot(N, d) / sqrt(max(dd, 1e-4)) * 0.85 + 0.15);
+    if (cosv <= 0) continue;
+    float3 c = g.colour * cosv * g.area / (3.14159 * dd + g.area);
+    float w = dot(c, float3(0.3, 0.59, 0.11));
+    sum += c;
+    if (w > top) { top = w; topLight = c; topDir = d; topMax = sqrt(dd) - g.radius; }
+  }
+  if (top < 0.005 || topMax < 0.2) return sum;
+  RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
+  RayDesc ray; ray.Origin = pos + N * 0.03; ray.Direction = normalize(topDir); ray.TMin = 0.02; ray.TMax = topMax;
+  q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskSolid, ray);
+  q.Proceed();
+  return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? sum - topLight * 0.85 : sum;
+}
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
   float3 raster = Raster[id.xy].rgb;
@@ -259,15 +286,18 @@ void main(uint3 id : SV_DispatchThreadID) {
       float cosv = saturate(-dot(N, v));
       float fres = pow(1 - cosv, 5);
       // the surface's own colour: pale paint shows a reflection as dirt, so less of it, softer; dark road shines more than pale road
-      float3 baseCol = (k > 0 || (N.y > 0.2 && d.cls == 0) || P.lightGain > 0) ? shade(h, 0).rgb : 0.xxx;
+      float3 baseCol = (k > 0 || (N.y > 0.2 && d.cls == 0) || P.lightGain > 0 || P.glowGain > 0) ? shade(h, 0).rgb : 0.xxx;
       float base = lum(baseCol);
       float pale = smoothstep(0.45, 0.85, base) * P.bodyCalm;
       float strength;
       if (k > 0) strength = k * (1 - 0.65 * pale) + (1 - k) * fres * (1 - 0.8 * pale);
-      else strength = (N.y > 0.2 && d.cls == 0) ? P.roadShine * pow(1 - cosv, 3) * (1 - 0.6 * smoothstep(0.1, 0.5, base)) * (d.highlight != 0 ? 1.0 : 0.75) : 0;
+      else strength = (N.y > 0.2 && d.cls == 0) ? P.roadShine * pow(1 - cosv, 3) * (1 - 0.6 * smoothstep(0.1, 0.5, base)) * ((d.highlight & 1) != 0 ? 1.0 : 0.75) : 0;
       // where the raster is far brighter than this surface, a glow covers it: neither reflection nor light shows through the flame
       float bare = 1 - smoothstep(0.15, 0.45, lum(raster) - base);
-      if (P.lightGain > 0) light += engine_light(h.pos, N) * P.lightGain * bare;
+      if (P.lightGain > 0 && (d.highlight & 4) == 0) light += engine_light(h.pos, N) * P.lightGain * bare;
+      // a glowing surface isn't lit by its own light
+      if (P.glowGain > 0 && (d.highlight & 6) == 0) light += glow_light(h.pos, N) * P.glowGain * bare;
+      if (P.glowShow != 0 && (d.highlight & 2) != 0) { sum = float3(1, -1, 1); light = 0; break; }
       if (P.mode == 2) { dbg += strength.xxx; break; }
       if (strength > 0.001) {
         float3 R = reflect(v, N);

@@ -55,7 +55,9 @@ struct Params {
   u32 lightShadow;
   float bodyCalm;
   float projZ[2];
-  u32 skyFirst, pad2;
+  u32 skyFirst, glowCount;
+  float glowGain;
+  u32 glowShow;
 };
 
 constexpr u32 Frames = 3, SlotDescriptors = 12, MaxTextures = 8192;
@@ -68,7 +70,7 @@ struct Slot {
     ComPtr<ID3D12Resource> upload, gpu;
     u64 size = 0;
     void* map = nullptr;
-  } verts, draws, stages, lights;
+  } verts, draws, stages, lights, glows;
   ComPtr<ID3D12Resource> blas[3], tlas, scratch, instances;
   u64 blasSize[3]{}, tlasSize = 0, scratchSize = 0;
   std::vector<ComPtr<ID3D12Resource>> keep;
@@ -111,7 +113,7 @@ struct State {
   bool outputOpen = false;
 
   double msTrace = 0, msGpu = 0, msComposeWait = 0, msBuild = 0, msRules = 0, msTranslate = 0;
-  double picks = 0, merged = 0;
+  double picks = 0, merged = 0, glowsSeen = 0;
   double msGpuMost = 0;
   u64 tris = 0, lightsSeen = 0, lightsMost = 0, reports = 0;
   FILE* timeLog = nullptr;
@@ -233,11 +235,11 @@ void init_device() {
 
   D3D12_DESCRIPTOR_RANGE1 r1[2]{};
   r1[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-  r1[0].NumDescriptors = 7;
+  r1[0].NumDescriptors = 8;
   r1[0].Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
   r1[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
   r1[1].NumDescriptors = 2;
-  r1[1].OffsetInDescriptorsFromTableStart = 7;
+  r1[1].OffsetInDescriptorsFromTableStart = 8;
   r1[1].Flags = r1[0].Flags;
   D3D12_DESCRIPTOR_RANGE1 r2{};
   r2.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -504,6 +506,10 @@ void run_rays(Job& job) {
   stage(s, s.draws, fr.draws.data(), fr.draws.size() * sizeof(GpuDraw));
   stage(s, s.stages, fr.stages.data(), fr.stages.size() * sizeof(StageRec));
   stage(s, s.lights, fr.lights.data(), fr.lights.size() * sizeof(EngineLight));
+  if (fr.glows.empty())
+    fr.glows.push_back({});
+  const u32 glowCount = job.glow > 0 ? static_cast<u32>(fr.glows.size()) : 0;
+  stage(s, s.glows, fr.glows.data(), fr.glows.size() * sizeof(GlowLight));
   if (g.failed)
     return;
   // solid, see-through and glows, sky: a structure each, so a shadow ray can leave out what light passes through
@@ -567,6 +573,7 @@ void run_rays(Job& job) {
   srv_buffer(s.draws.gpu.Get(), static_cast<u32>(fr.draws.size()), sizeof(GpuDraw), base + 2);
   srv_buffer(s.lights.gpu.Get(), static_cast<u32>(fr.lights.size()), sizeof(EngineLight), base + 4);
   srv_buffer(s.stages.gpu.Get(), static_cast<u32>(fr.stages.size()), sizeof(StageRec), base + 5);
+  srv_buffer(s.glows.gpu.Get(), static_cast<u32>(fr.glows.size()), sizeof(GlowLight), base + 7);
   sv = {};
   sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
   sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -578,9 +585,9 @@ void run_rays(Job& job) {
   D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
   uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
   uv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-  g.dev->CreateUnorderedAccessView(g.termRes.Get(), nullptr, &uv, cpuh(base + 7));
+  g.dev->CreateUnorderedAccessView(g.termRes.Get(), nullptr, &uv, cpuh(base + 8));
   uv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-  g.dev->CreateUnorderedAccessView(g.outputRes.Get(), nullptr, &uv, cpuh(base + 8));
+  g.dev->CreateUnorderedAccessView(g.outputRes.Get(), nullptr, &uv, cpuh(base + 9));
 
   Params p{};
   p.size[0] = static_cast<float>(g.w), p.size[1] = static_cast<float>(g.h);
@@ -612,6 +619,10 @@ void run_rays(Job& job) {
   p.lightShadow = shadow;
   p.bodyCalm = 1.f;
   p.skyFirst = fr.skyFirstVertex;
+  p.glowCount = glowCount;
+  p.glowGain = job.glow;
+  static const u32 glowShow = std::getenv("AURORA_RT_GLOW_SHOW") != nullptr ? 1 : 0;
+  p.glowShow = glowShow;
   cl->SetComputeRootSignature(g.root.Get());
   cl->SetComputeRoot32BitConstants(0, sizeof(Params) / 4, &p, 0);
   cl->SetComputeRootDescriptorTable(1, gpuh(base));
@@ -642,7 +653,7 @@ void run_rays(Job& job) {
   g.msComposeWait += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   g.msBuild += job.captureMs;
   g.msRules += job.rulesMs;
-  g.picks += job.lightPicks, g.merged += job.mergedLights;
+  g.picks += job.lightPicks, g.merged += job.mergedLights, g.glowsSeen += glowCount;
   g.msTranslate += job.translateUs.load() / 1000.0;
   g.tris += fr.verts.size() / 3;
   g.lightsSeen += fr.lights.size();
@@ -653,10 +664,10 @@ void run_rays(Job& job) {
   }();
   if (++g.count == every) {
     const double n = g.count;
-    std::fprintf(stderr, "[rt] per frame, %u frames at %ux%u: GPU build %.2f ms and rays+cleanup %.2f ms (all %.2f, worst %.2f); CPU in the stream %.2f ms, translation beside it %.2f ms, rules %.2f ms, worker %.2f ms; %.0f triangles, lights %.1f (most %llu), picks %.1f, merged %.1f\n",
+    std::fprintf(stderr, "[rt] per frame, %u frames at %ux%u: GPU build %.2f ms and rays+cleanup %.2f ms (all %.2f, worst %.2f); CPU in the stream %.2f ms, translation beside it %.2f ms, rules %.2f ms, worker %.2f ms; %.0f triangles, lights %.1f (most %llu), picks %.1f, merged %.1f, glows %.1f\n",
                  g.count, g.w, g.h, (g.msGpu - g.msTrace) / n, g.msTrace / n, g.msGpu / n, g.msGpuMost, g.msBuild / n, g.msTranslate / n, g.msRules / n, g.msComposeWait / n, double(g.tris) / n, double(g.lightsSeen) / n,
-                 static_cast<unsigned long long>(g.lightsMost), g.picks / n, g.merged / n);
-    g.count = 0, g.msGpuMost = 0, g.msGpu = g.msTrace = g.msBuild = g.msRules = g.msTranslate = g.msComposeWait = 0, g.tris = 0, g.lightsSeen = 0, g.lightsMost = 0, g.picks = g.merged = 0;
+                 static_cast<unsigned long long>(g.lightsMost), g.picks / n, g.merged / n, g.glowsSeen / n);
+    g.count = 0, g.msGpuMost = 0, g.msGpu = g.msTrace = g.msBuild = g.msRules = g.msTranslate = g.msComposeWait = 0, g.tris = 0, g.lightsSeen = 0, g.lightsMost = 0, g.picks = g.merged = g.glowsSeen = 0;
   }
 }
 

@@ -51,7 +51,7 @@ u64 s_atCopy = 0;
 u32 s_liveTextures = 0;
 bool s_rayed = false;
 double s_captureMs = 0;
-float s_road = 0.9f, s_light = 1.f;
+float s_road = 0.9f, s_light = 1.f, s_glow = 0.f;
 u32 s_liveFirstNew = 0;
 u64 s_copyNow = 0;
 std::vector<DrawRec> s_draws;
@@ -215,6 +215,8 @@ void start() noexcept {
     s_road = static_cast<float>(std::atof(v));
   if (const char* v = std::getenv("AURORA_RT_LIGHT"))
     s_light = static_cast<float>(std::atof(v));
+  if (const char* v = std::getenv("AURORA_RT_GLOW"))
+    s_glow = static_cast<float>(std::atof(v));
   if (g_neutral || !s_path.empty())
     std::fprintf(stderr, "[rt] reflection stages %s; capture %s at display copy %llu\n", g_neutral ? "off" : "on",
                  s_path.c_str(), static_cast<unsigned long long>(s_at));
@@ -695,6 +697,10 @@ void run_rules(live::Job& j) {
   Tuning tuning;
   if (const char* v = std::getenv("AURORA_RT_LIGHT_FULL"))
     tuning.lightFull = static_cast<float>(std::atof(v));
+  if (j.glow > 0.f) {
+    tuning.texMeans = s_texAvg;
+    tuning.texCount = MostTexAvg;
+  }
   build_frame(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, tuning, j.frame);
   smooth_lights(j.frame);
   j.drawable = j.frame.main != nullptr && !j.frame.verts.empty();
@@ -975,7 +981,7 @@ static void send_rays() noexcept {
   auto job = std::move(s_jobOwned);
   s_job = nullptr;
   job->baseDraw = s_baseDraw, job->baseVert = s_baseVert, job->drawCount = draws;
-  job->road = s_road, job->light = s_light;
+  job->road = s_road, job->light = s_light, job->glow = s_glow;
   job->captureMs = s_captureMs;
   job->copy = s_copyNow;
   s_captureMs = 0;

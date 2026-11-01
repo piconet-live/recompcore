@@ -77,11 +77,77 @@ inline bool beside_engine_light(const DrawRec& d, const Vertex* verts, const std
   return false;
 }
 
+// A big glowing surface as light: a piece of it, its power as colour by area
+struct GlowLight {
+  float pos[3], area, colour[3], radius;
+};
+// What a draw's stages give on its textures' mean colours and its rasterised colour: the surface's colour on the whole, no pixels read.
+// Reflection layers left out, as the rays do.
+inline void draw_colour(const DrawRec& d, const Vertex* verts, const float (*texMeans)[4], std::uint32_t texCount, float out[4]) {
+  float ras[4]{};
+  const std::uint32_t step = std::max<std::uint32_t>(d.vertices / 8, 1);
+  std::uint32_t n = 0;
+  for (std::uint32_t v = 0; v < d.vertices; v += step, ++n)
+    for (int c = 0; c < 4; ++c)
+      ras[c] += verts[d.firstVertex + v].ras[c];
+  for (int c = 0; c < 4; ++c)
+    ras[c] /= static_cast<float>(std::max(n, 1u));
+  float r[4][4];
+  std::memcpy(r, d.regs, sizeof r);
+  for (std::uint32_t i = 0; i < std::min<std::uint32_t>(d.stages, 16u); ++i) {
+    const StageRec& s = d.stage[i];
+    if (s.reflection != 0)
+      continue;
+    float white[4] = {1.f, 1.f, 1.f, 1.f};
+    const float* t = s.tex < texCount ? texMeans[s.tex] : white;
+    const auto ci = [&](std::uint32_t a, int c) -> float {
+      if (a < 8)
+        return r[a / 2][a % 2 == 0 ? c : 3];
+      switch (a) {
+      case 8: return t[c];
+      case 9: return t[3];
+      case 10: return ras[c];
+      case 11: return ras[3];
+      case 12: return 1.f;
+      case 13: return 0.5f;
+      case 14: return s.k[c];
+      default: return 0.f;
+      }
+    };
+    const auto ai = [&](std::uint32_t a) -> float {
+      switch (a) {
+      case 0: case 1: case 2: case 3: return r[a][3];
+      case 4: return t[3];
+      case 5: return ras[3];
+      case 6: return s.k[3];
+      default: return 0.f;
+      }
+    };
+    const auto bias = [](std::uint32_t b) { return b == 1 ? 0.5f : b == 2 ? -0.5f : 0.f; };
+    const auto scale = [](std::uint32_t b) { return b == 1 ? 2.f : b == 2 ? 4.f : b == 3 ? 0.5f : 1.f; };
+    float col[3];
+    for (int c = 0; c < 3; ++c) {
+      const float k = ci(s.cc, c), l = ci(s.ca, c) * (1 - k) + ci(s.cb, c) * k, e = ci(s.cd, c);
+      col[c] = ((s.cop == 0 ? e + l : e - l) + bias(s.cbias)) * scale(s.cscale);
+      if (s.cclamp != 0)
+        col[c] = std::clamp(col[c], 0.f, 1.f);
+    }
+    const float k = ai(s.ac), l = ai(s.aa) * (1 - k) + ai(s.ab) * k, e = ai(s.ad);
+    float al = ((s.aop == 0 ? e + l : e - l) + bias(s.abias)) * scale(s.ascale);
+    if (s.aclamp != 0)
+      al = std::clamp(al, 0.f, 1.f);
+    for (int c = 0; c < 3; ++c)
+      r[s.creg & 3][c] = col[c];
+    r[s.areg & 3][3] = al;
+  }
+  std::memcpy(out, r[0], sizeof r[0]);
+}
+
 // What the rays read of a draw: small, the stages apart
 struct GpuDraw {
   std::uint32_t stages, firstStage, cls;  // cls: 0 solid, 1 translucent, 2 additive, 3 ignored
   float strength;                         // reflection strength; machines boosted, scenery capped
-  std::uint32_t highlight;                // has a stage looked up by the normal: the game's own shine
+  std::uint32_t highlight;                // bit 0: has a stage looked up by the normal, the game's own shine; bit 1: glows, gives light; bit 2: outside the depth, drawn over the world, takes no light
   std::uint32_t fogType;
   float fog[3];
   float fogColour[3];
@@ -92,6 +158,10 @@ struct Tuning {
   float machineGain = 2.f, machineCap = 0.45f, sceneryCap = 0.25f;
   std::uint32_t maxLights = 16;
   float lightMaxSize = 40.f, lightMinBright = 0.07f, lightMerge = 8.f, lightFull = 2.f, machineLight = 0.3f;
+  // Glowing surfaces: on when texMeans is given. The size where small lights end is where these begin.
+  const float (*texMeans)[4] = nullptr;
+  std::uint32_t texCount = 0, maxGlows = 64;
+  float glowAddBright = 0.25f, glowBright = 0.75f, glowColourful = 0.4f;
 };
 struct Frame {
   std::vector<Vertex> verts;        // solid surfaces first, then what light passes through (see-through, glows), then the sky
@@ -101,9 +171,103 @@ struct Frame {
   std::vector<LightPick> picks, merged;
   std::vector<EngineLight> machineLights;
   std::vector<EngineLight> lights;
+  std::vector<GlowLight> glows;
+  std::uint32_t glowDraws = 0, glowPieces = 0;
   const DrawRec* main = nullptr;
   std::uint32_t machineDraws = 0, reflective = 0;
 };
+
+// The one rule for glowing surfaces, the big side of the one rule for lights: big (not a small light) in the main view, colour written,
+// not the sky, and either additive and at all bright, or on the whole bright and colourful (a pale wall is bright but not colourful).
+// No labels and no tables: lava, a neon strip and a lit pad are the same to it. A big triangle is cut into pieces fixed to it, smaller
+// the nearer it is; pieces near one another become one; those that matter most from the view are kept.
+template <class Sky>
+inline void build_glows(const DrawRec* draws, std::uint32_t count, const Vertex* verts, const Tuning& t, const std::vector<float>& extent, const Sky& sky, Frame& out) {
+  out.glows.clear(), out.glowDraws = out.glowPieces = 0;
+  if (t.texMeans == nullptr)
+    return;
+  struct Piece {
+    float pos[3], area, colour[3], power;
+  };
+  static thread_local std::vector<Piece> pieces;
+  pieces.clear();
+  for (std::uint32_t i = 0; i < count; ++i) {
+    const DrawRec& d = draws[i];
+    GpuDraw& g = out.draws[i];
+    if (extent[i] < t.lightMaxSize || !d.colorUpdate || g.cls == 3 || sky(i))
+      continue;
+    float c[4];
+    draw_colour(d, verts, t.texMeans, t.texCount, c);
+    const float a = d.blendSrc == 4 ? std::clamp(c[3], 0.f, 1.f) : 1.f;
+    const float most = std::max({c[0], c[1], c[2]}), least = std::min({c[0], c[1], c[2]});
+    const bool glows = g.cls == 2 ? most * a > t.glowAddBright : most * a > t.glowBright && most > 0 && (most - least) / most > t.glowColourful;
+    if (!glows)
+      continue;
+    g.highlight |= 2;
+    ++out.glowDraws;
+    const float col[3] = {std::clamp(c[0], 0.f, 1.5f) * a, std::clamp(c[1], 0.f, 1.5f) * a, std::clamp(c[2], 0.f, 1.5f) * a};
+    const float lum = col[0] * 0.3f + col[1] * 0.59f + col[2] * 0.11f;
+    for (std::uint32_t v = 0; v + 2 < d.vertices; v += 3) {
+      const float* p0 = verts[d.firstVertex + v].pos;
+      const float* p1 = verts[d.firstVertex + v + 1].pos;
+      const float* p2 = verts[d.firstVertex + v + 2].pos;
+      const float e1[3] = {p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]}, e2[3] = {p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]};
+      const float cr[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+      const float area = 0.5f * std::sqrt(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]);
+      if (area <= 0.f)
+        continue;
+      const float mid[3] = {(p0[0] + p1[0] + p2[0]) / 3, (p0[1] + p1[1] + p2[1]) / 3, (p0[2] + p1[2] + p2[2]) / 3};
+      const float dist = std::sqrt(mid[0] * mid[0] + mid[1] * mid[1] + mid[2] * mid[2]);
+      const float edge = std::max(std::hypot(e1[0], e1[1], e1[2]), std::hypot(e2[0], e2[1], e2[2]));
+      const int n = std::clamp(static_cast<int>(edge / std::max(16.f, dist * 0.35f)) + 1, 1, 8);
+      for (int a0 = 0; a0 < n; ++a0)
+        for (int a1 = 0; a1 < n - a0; ++a1) {
+          // a coarse grid of the triangle's barycentrics: fixed to it, so it travels with the world
+          const float u = (a0 + 1.f / 3) / n, w = (a1 + 1.f / 3) / n;
+          Piece q;
+          for (int k = 0; k < 3; ++k)
+            q.pos[k] = p0[k] + e1[k] * u + e2[k] * w, q.colour[k] = col[k];
+          q.area = area * 2 / static_cast<float>(n * n);  // pairs of small triangles of the grid, near enough
+          const float dd = q.pos[0] * q.pos[0] + q.pos[1] * q.pos[1] + q.pos[2] * q.pos[2];
+          q.power = lum * q.area / (3.14159f * dd + q.area + 1.f);
+          pieces.push_back(q);
+        }
+    }
+  }
+  out.glowPieces = static_cast<std::uint32_t>(pieces.size());
+  std::sort(pieces.begin(), pieces.end(), [](const Piece& a, const Piece& b) { return a.power > b.power; });
+  // greedy: the strongest first, each joining a light close by for its distance from the view
+  static thread_local std::vector<Piece> sums;
+  sums.clear();
+  for (const Piece& p : pieces) {
+    bool merged = false;
+    const float dd = p.pos[0] * p.pos[0] + p.pos[1] * p.pos[1] + p.pos[2] * p.pos[2];
+    const float r2 = std::max(8.f * 8.f, dd * 0.09f);
+    for (Piece& q : sums) {
+      const float x = q.pos[0] / q.area - p.pos[0], y = q.pos[1] / q.area - p.pos[1], z = q.pos[2] / q.area - p.pos[2];
+      if (x * x + y * y + z * z < r2) {
+        for (int k = 0; k < 3; ++k)
+          q.pos[k] += p.pos[k] * p.area, q.colour[k] += p.colour[k] * p.area;
+        q.area += p.area;
+        merged = true;
+        break;
+      }
+    }
+    if (merged || sums.size() == t.maxGlows)
+      continue;
+    Piece q = p;
+    for (int k = 0; k < 3; ++k)
+      q.pos[k] *= p.area, q.colour[k] *= p.area;
+    sums.push_back(q);
+  }
+  for (const Piece& q : sums) {
+    GlowLight l;
+    for (int k = 0; k < 3; ++k)
+      l.pos[k] = q.pos[k] / q.area, l.colour[k] = q.colour[k] / q.area;
+    l.area = q.area, l.radius = std::sqrt(q.area / 3.14159f);
+    out.glows.push_back(l);
+  }
+}
 
 // The main view is the perspective projection with the most triangles. Sky: the largest see-through shells around the view,
 // by size against the largest in the frame, with no table of courses.
@@ -182,6 +346,8 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
     for (int a = 0; a < 4; ++a)
       g.swap[a] = static_cast<std::uint32_t>(d.swap[a][0]) | static_cast<std::uint32_t>(d.swap[a][1]) << 8 |
                   static_cast<std::uint32_t>(d.swap[a][2]) << 16 | static_cast<std::uint32_t>(d.swap[a][3]) << 24;
+    if (!d.depthUpdate || !d.depthCompare)
+      g.highlight |= 4;
     g.fogType = d.fogType;
     g.fog[0] = d.fog[0], g.fog[1] = d.fog[1], g.fog[2] = d.fog[2];
     g.fogColour[0] = d.fogColour[0], g.fogColour[1] = d.fogColour[1], g.fogColour[2] = d.fogColour[2];
@@ -224,6 +390,7 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
     largest = std::max(largest, extent[i]);
   }
   const auto sky = [&](std::uint32_t i) { return extent[i] > largest * 0.3f && out.draws[i].cls != 0 && out.draws[i].cls != 3; };
+  build_glows(draws, count, verts, t, extent, sky, out);
   for (int pass = 0; pass < 3; ++pass) {
     if (pass == 1)
       out.seeFirstVertex = static_cast<std::uint32_t>(out.verts.size());
