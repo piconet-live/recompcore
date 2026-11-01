@@ -218,6 +218,8 @@ bool dol_aurora_initialize(int argc, char** argv,
                               ? backend_config->window_height
                               : defaults.window_height;
     config.allowTextureDumps = backend_config->allow_texture_dumps;
+    config.msaa = backend_config->msaa;
+    config.maxTextureAnisotropy = static_cast<decltype(config.maxTextureAnisotropy)>(backend_config->max_anisotropy);
     config.logCallback = gx_aurora::log_callback;
     config.logLevel = backend_config->info_logging ? LOG_INFO : LOG_ERROR;
     config.mem1Size = 0;

@@ -24,6 +24,9 @@ typedef struct AuroraBackendConfig {
     const char* data_dir;
     // inside another program (aurora_present): a hidden window, no gamepads, no audio device
     bool embedded;
+    // 0: Aurora's defaults (no MSAA; 16)
+    unsigned msaa;
+    unsigned max_anisotropy;
 } AuroraBackendConfig;
 
 bool dol_aurora_initialize(int argc, char** argv,

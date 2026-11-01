@@ -356,6 +356,13 @@ void run() {
   install_fault_stop();
   aurora_backend_set_fatal_handler(on_fatal);
   aurora_backend_set_guest_address_resolver(ram_resolver, nullptr);
+  // Owner's picture switches, read once. AURORA_MSAA=<samples>; AURORA_ANISO=<max>, with texture.cpp's AURORA_ANISO_GX=0;
+  // AURORA_NATIVE=1: the content frame buffer is the window's own pixels, no whole-number scale.
+  const auto env_number = [](const char* name) -> unsigned {
+    const char* v = std::getenv(name);
+    return v != nullptr ? static_cast<unsigned>(std::strtoul(v, nullptr, 10)) : 0u;
+  };
+  const bool native_size = env_number("AURORA_NATIVE") != 0;
   const AuroraBackendConfig config = {
       .app_name = "Piconet Aurora",
       .window_width = s->width,
@@ -367,6 +374,8 @@ void run() {
       .force_untextured = false,
       .data_dir = s->data_dir.c_str(),
       .embedded = true,
+      .msaa = env_number("AURORA_MSAA"),
+      .max_anisotropy = env_number("AURORA_ANISO"),
   };
 #ifdef _WIN32
   s_aurora_thread_id = GetCurrentThreadId();
@@ -392,7 +401,7 @@ void run() {
   const char* blocking = std::getenv("AURORA_DRAWS_BLOCKING");
   AuroraSetDrawsBlocking(blocking != nullptr && blocking[0] == '1');
   GXFlush();
-  if (s->scale > 1) {
+  if (s->scale > 1 || native_size) {
     // The render scale, as Aurora's own games ask for it: the game's EFB (640x528) is the logical frame buffer, and
     // viewports, scissors and copies map from it to a content frame buffer this many times its size. The (hidden)
     // window keeps its size.
@@ -401,7 +410,8 @@ void run() {
     mode.efbHeight = 528;
     mode.xfbHeight = 528;
     VIConfigure(&mode);
-    VISetFrameBufferScale(static_cast<float>(s->scale));
+    if (!native_size)
+      VISetFrameBufferScale(static_cast<float>(s->scale));
     AuroraSetViewportPolicy(AURORA_VIEWPORT_STRETCH);
   } else {
     AuroraSetViewportPolicy(AURORA_VIEWPORT_NATIVE);  // the game's own viewport, unscaled

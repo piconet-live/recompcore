@@ -3,6 +3,7 @@
 
 #include <cstdlib>
 #include "DolphinNoGUI/Platform.h"
+#include <cstdlib>
 #include "Common/RunSettings.h"
 #include "Common/WindowFrame.h"
 
@@ -307,6 +308,13 @@ bool PlatformWin32::Init()
 {
   if (!RegisterRenderWindowClass() || !CreateRenderWindow() || !CreateMenus())
     return false;
+
+  // AURORA_START_FULLSCREEN=1: the primary display, whole, before Aurora reads the window's size
+  if (const char* v = std::getenv("AURORA_START_FULLSCREEN"); v && v[0] == '1')
+  {
+    SetWindowPos(m_hwnd, nullptr, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    ToggleFullscreen();
+  }
 
   // TODO: Enter fullscreen if enabled.
   if (Config::Get(Config::MAIN_FULLSCREEN))

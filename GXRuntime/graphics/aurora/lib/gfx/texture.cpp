@@ -94,12 +94,22 @@ bool aniso_as_gx() noexcept {
   return v;
 }
 
+bool aniso_all() noexcept {
+  static const bool v = [] {
+    const char* e = std::getenv("AURORA_ANISO_ALL");
+    return e != nullptr && e[0] == '1';
+  }();
+  return v;
+}
+
 u16 wgpu_aniso(GXAnisotropy aniso) {
   switch (aniso) {
     DEFAULT_FATAL("invalid aniso {}", static_cast<int>(aniso));
   case GX_ANISO_1:
   case GX_MAX_ANISOTROPY:
-    return 1;
+    // AURORA_ANISO_GX=0 alone leaves what the game asks 1x at 1x, which is most of a course's surfaces:
+    // AURORA_ANISO_ALL=1 gives every texture with mips the config's maximum
+    return aniso_all() ? std::max<u16>(webgpu::g_graphicsConfig.textureAnisotropy, 1) : 1;
   case GX_ANISO_2:
     return aniso_as_gx() ? 2 : std::max<u16>(webgpu::g_graphicsConfig.textureAnisotropy / 2, 1);
   case GX_ANISO_4:
