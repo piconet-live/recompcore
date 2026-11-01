@@ -69,9 +69,12 @@ struct Slot {
     u64 size = 0;
     void* map = nullptr;
   } verts, draws, stages, lights;
-  ComPtr<ID3D12Resource> blas[2], tlas, scratch, instances;
-  u64 blasSize[2]{}, tlasSize = 0, scratchSize = 0;
+  ComPtr<ID3D12Resource> blas[3], tlas, scratch, instances;
+  u64 blasSize[3]{}, tlasSize = 0, scratchSize = 0;
   std::vector<ComPtr<ID3D12Resource>> keep;
+  // what this slot's timings belong to, for the time log
+  u64 copy = 0;
+  u32 tris = 0, lightCount = 0, uploads = 0;
 };
 struct State {
   bool failed = false, ready = false;
@@ -109,7 +112,9 @@ struct State {
 
   double msTrace = 0, msGpu = 0, msComposeWait = 0, msBuild = 0, msRules = 0, msTranslate = 0;
   double picks = 0, merged = 0;
+  double msGpuMost = 0;
   u64 tris = 0, lightsSeen = 0, lightsMost = 0, reports = 0;
+  FILE* timeLog = nullptr;
   u32 count = 0;
 } g;
 
@@ -273,6 +278,13 @@ void init_device() {
   RT_HR(g.dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.trace)));
   pd.CS = {composeCs->GetBufferPointer(), composeCs->GetBufferSize()};
   RT_HR(g.dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.compose)));
+  if (const char* path = std::getenv("AURORA_RT_TIMELOG")) {
+    g.timeLog = std::fopen(path, "wb");
+    if (g.timeLog != nullptr) {
+      std::setvbuf(g.timeLog, nullptr, _IOLBF, 4096);
+      std::fprintf(g.timeLog, "copy,build_ms,rays_ms,compose_ms,tris,lights,uploads\n");
+    }
+  }
   g.ready = true;
   std::fprintf(stderr, "[rt] live pass ready on Dawn's device, %.0f ms\n",
                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
@@ -374,23 +386,7 @@ void srv_buffer(ID3D12Resource* r, u32 count, u32 stride, u32 at) {
   g.dev->CreateShaderResourceView(r, &sv, cpuh(at));
 }
 void upload_texture(Slot& s, const LiveTexture& t) {
-  std::vector<std::vector<u8>> mips;
-  mips.push_back(t.rgba);
-  u32 w = t.w, h = t.h;
-  while (w > 1 || h > 1) {
-    const u32 nw = std::max(w / 2, 1u), nh = std::max(h / 2, 1u);
-    std::vector<u8> m(size_t(nw) * nh * 4);
-    const auto& a = mips.back();
-    for (u32 y = 0; y < nh; ++y)
-      for (u32 x = 0; x < nw; ++x)
-        for (u32 c = 0; c < 4; ++c) {
-          const u32 xa = std::min(x * 2, w - 1), ya = std::min(y * 2, h - 1), xb = std::min(x * 2 + 1, w - 1), yb = std::min(y * 2 + 1, h - 1);
-          m[(size_t(y) * nw + x) * 4 + c] = static_cast<u8>((a[(size_t(ya) * w + xa) * 4 + c] + a[(size_t(ya) * w + xb) * 4 + c] +
-                                                             a[(size_t(yb) * w + xa) * 4 + c] + a[(size_t(yb) * w + xb) * 4 + c] + 2) / 4);
-        }
-    mips.push_back(std::move(m));
-    w = nw, h = nh;
-  }
+  const auto& mips = t.mips;
   D3D12_HEAP_PROPERTIES hp{};
   hp.Type = D3D12_HEAP_TYPE_DEFAULT;
   D3D12_RESOURCE_DESC d{};
@@ -478,12 +474,19 @@ void run_rays(Job& job) {
     u64* ts = nullptr;
     const D3D12_RANGE range{8 * 4 * g.slot, 8 * 4 * (g.slot + 1)};
     if (SUCCEEDED(g.queryResult->Map(0, &range, reinterpret_cast<void**>(&ts)))) {
-      g.msGpu += double(ts[4 * g.slot + 3] - ts[4 * g.slot]) * 1000.0 / g.gpuTicks;
-      g.msTrace += double(ts[4 * g.slot + 2] - ts[4 * g.slot + 1]) * 1000.0 / g.gpuTicks;
+      const double k = 1000.0 / g.gpuTicks, all = double(ts[4 * g.slot + 3] - ts[4 * g.slot]) * k;
+      g.msGpu += all;
+      g.msGpuMost = std::max(g.msGpuMost, all);
+      g.msTrace += double(ts[4 * g.slot + 2] - ts[4 * g.slot + 1]) * k;
+      // AURORA_RT_TIMELOG=<file>: a line a frame, to find one slow frame by its copy and what it carried
+      if (g.timeLog != nullptr)
+        std::fprintf(g.timeLog, "%llu,%.3f,%.3f,%.3f,%u,%u,%u\n", static_cast<unsigned long long>(s.copy), double(ts[4 * g.slot + 1] - ts[4 * g.slot]) * k,
+                     double(ts[4 * g.slot + 2] - ts[4 * g.slot + 1]) * k, double(ts[4 * g.slot + 3] - ts[4 * g.slot + 2]) * k, s.tris, s.lightCount, s.uploads);
       g.queryResult->Unmap(0, nullptr);
     }
   }
   s.keep.clear();
+  s.copy = job.copy, s.tris = static_cast<u32>(job.frame.verts.size() / 3), s.lightCount = static_cast<u32>(job.frame.lights.size()), s.uploads = static_cast<u32>(job.textures.size());
   RT_HR(s.alloc->Reset());
   RT_HR(s.cl->Reset(s.alloc.Get(), nullptr));
   ID3D12GraphicsCommandList4* cl = s.cl.Get();
@@ -503,7 +506,10 @@ void run_rays(Job& job) {
   stage(s, s.lights, fr.lights.data(), fr.lights.size() * sizeof(EngineLight));
   if (g.failed)
     return;
-  const u32 skyVerts = static_cast<u32>(fr.verts.size()) - fr.skyFirstVertex;
+  // solid, see-through and glows, sky: a structure each, so a shadow ray can leave out what light passes through
+  const u32 firsts[3] = {0, fr.seeFirstVertex, fr.skyFirstVertex};
+  const u32 counts[3] = {fr.seeFirstVertex, fr.skyFirstVertex - fr.seeFirstVertex, static_cast<u32>(fr.verts.size()) - fr.skyFirstVertex};
+  static constexpr u32 masks[3] = {1, 4, 2};
   ensure(s.scratch, s.scratchSize, 64u << 20, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   u64 scratchAt = 0;
   {
@@ -512,20 +518,22 @@ void run_rays(Job& job) {
     bs[0].UAV.pResource = nullptr;
     cl->ResourceBarrier(1, bs);
   }
-  build_blas(s, 0, s.verts.gpu->GetGPUVirtualAddress(), fr.skyFirstVertex, scratchAt);
-  if (skyVerts)
-    build_blas(s, 1, s.verts.gpu->GetGPUVirtualAddress() + u64(fr.skyFirstVertex) * sizeof(Vertex), skyVerts, scratchAt);
+  for (u32 i = 0; i < 3; ++i)
+    if (counts[i])
+      build_blas(s, i, s.verts.gpu->GetGPUVirtualAddress() + u64(firsts[i]) * sizeof(Vertex), counts[i], scratchAt);
   D3D12_RESOURCE_BARRIER uav{};
   uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
   cl->ResourceBarrier(1, &uav);
-  D3D12_RAYTRACING_INSTANCE_DESC inst[2]{};
-  for (auto& i : inst)
-    i.Transform[0][0] = i.Transform[1][1] = i.Transform[2][2] = 1;
-  inst[0].InstanceMask = 1;
-  inst[0].AccelerationStructure = s.blas[0]->GetGPUVirtualAddress();
-  if (skyVerts) {
-    inst[1].InstanceMask = 2;
-    inst[1].AccelerationStructure = s.blas[1]->GetGPUVirtualAddress();
+  D3D12_RAYTRACING_INSTANCE_DESC inst[3]{};
+  u32 instances = 0;
+  for (u32 i = 0; i < 3; ++i) {
+    if (!counts[i])
+      continue;
+    auto& d = inst[instances++];
+    d.Transform[0][0] = d.Transform[1][1] = d.Transform[2][2] = 1;
+    d.InstanceMask = masks[i];
+    d.InstanceID = firsts[i] / 3;  // a hit's triangle: this plus its primitive index
+    d.AccelerationStructure = s.blas[i]->GetGPUVirtualAddress();
   }
   if (!s.instances)
     s.instances = make_buffer(D3D12_HEAP_TYPE_UPLOAD, sizeof inst, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -536,7 +544,7 @@ void run_rays(Job& job) {
   D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS tin{};
   tin.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
   tin.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-  tin.NumDescs = skyVerts ? 2 : 1;
+  tin.NumDescs = instances;
   tin.InstanceDescs = s.instances->GetGPUVirtualAddress();
   D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO pre{};
   g.dev->GetRaytracingAccelerationStructurePrebuildInfo(&tin, &pre);
@@ -595,7 +603,11 @@ void run_rays(Job& job) {
     const char* v = std::getenv("AURORA_RT_LIGHT_RANGE");
     return v != nullptr ? static_cast<float>(std::atof(v)) : 4.f;
   }();
-  static const u32 shadow = std::getenv("AURORA_RT_LIGHT_SHADOW") != nullptr ? 1 : 0;
+  // on unless switched off: AURORA_RT_LIGHT_SHADOW=0
+  static const u32 shadow = [] {
+    const char* v = std::getenv("AURORA_RT_LIGHT_SHADOW");
+    return v != nullptr && v[0] == '0' ? 0u : 1u;
+  }();
   p.lightRange = range;
   p.lightShadow = shadow;
   p.bodyCalm = 1.f;
@@ -641,10 +653,10 @@ void run_rays(Job& job) {
   }();
   if (++g.count == every) {
     const double n = g.count;
-    std::fprintf(stderr, "[rt] per frame, %u frames at %ux%u: GPU build %.2f ms and rays+cleanup %.2f ms (all %.2f); CPU in the stream %.2f ms, translation beside it %.2f ms, rules %.2f ms, worker %.2f ms; %.0f triangles, lights %.1f (most %llu), picks %.1f, merged %.1f\n",
-                 g.count, g.w, g.h, (g.msGpu - g.msTrace) / n, g.msTrace / n, g.msGpu / n, g.msBuild / n, g.msTranslate / n, g.msRules / n, g.msComposeWait / n, double(g.tris) / n, double(g.lightsSeen) / n,
+    std::fprintf(stderr, "[rt] per frame, %u frames at %ux%u: GPU build %.2f ms and rays+cleanup %.2f ms (all %.2f, worst %.2f); CPU in the stream %.2f ms, translation beside it %.2f ms, rules %.2f ms, worker %.2f ms; %.0f triangles, lights %.1f (most %llu), picks %.1f, merged %.1f\n",
+                 g.count, g.w, g.h, (g.msGpu - g.msTrace) / n, g.msTrace / n, g.msGpu / n, g.msGpuMost, g.msBuild / n, g.msTranslate / n, g.msRules / n, g.msComposeWait / n, double(g.tris) / n, double(g.lightsSeen) / n,
                  static_cast<unsigned long long>(g.lightsMost), g.picks / n, g.merged / n);
-    g.count = 0, g.msGpu = g.msTrace = g.msBuild = g.msRules = g.msTranslate = g.msComposeWait = 0, g.tris = 0, g.lightsSeen = 0, g.lightsMost = 0, g.picks = g.merged = 0;
+    g.count = 0, g.msGpuMost = 0, g.msGpu = g.msTrace = g.msBuild = g.msRules = g.msTranslate = g.msComposeWait = 0, g.tris = 0, g.lightsSeen = 0, g.lightsMost = 0, g.picks = g.merged = 0;
   }
 }
 

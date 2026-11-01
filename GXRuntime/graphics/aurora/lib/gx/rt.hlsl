@@ -42,6 +42,8 @@ struct Params {
   uint _pad;
 };
 struct Light { float3 pos; float3 colour; float reach; };
+// The acceleration structure's instances: solid surfaces, the sky's shells, and what light passes through (see-through, glows)
+static const uint MaskSolid = 1, MaskSky = 2, MaskSee = 4, MaskSeen = MaskSolid | MaskSee;
 ConstantBuffer<Params> P : register(b0);
 RaytracingAccelerationStructure Scene : register(t0);
 StructuredBuffer<Vertex> Verts : register(t1);
@@ -137,7 +139,6 @@ float3 fogged(Draw d, float3 pos, float3 c) {
   else { float g = 1 - f; z = pow(2, -8 * g * g); }
   return lerp(c, d.fogColour, saturate(z));
 }
-uint first_vertex(uint inst) { return inst == 1 ? P.skyFirst : 0; }
 // The sky: its shells only. A ray the game culled has none in that direction: looked up mirrored to the view's front.
 float3 sky_along(float3 dir, float lod) {
   float3 sum = 0;
@@ -147,11 +148,11 @@ float3 sky_along(float3 dir, float lod) {
     for (int layer = 0; layer < 6; ++layer) {
       RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
       RayDesc ray; ray.Origin = 0; ray.Direction = d; ray.TMin = tmin; ray.TMax = 1000000;
-      q.TraceRayInline(Scene, RAY_FLAG_NONE, 2, ray);
+      q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskSky, ray);
       q.Proceed();
       if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) break;
       float t = q.CommittedRayT();
-      Hit h = fetch(P.skyFirst / 3 + q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
+      Hit h = fetch(q.CommittedInstanceID() + q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
       float4 c = shade(h, lod);
       sum += c.rgb * saturate(c.a);
       tmin = t + 1;
@@ -166,11 +167,11 @@ float3 trace_reflection(float3 org, float3 dir, float maxLodScale) {
   for (int bounce = 0; bounce < 8; ++bounce) {
     RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
     RayDesc ray; ray.Origin = org; ray.Direction = dir; ray.TMin = tmin; ray.TMax = 100000;
-    q.TraceRayInline(Scene, RAY_FLAG_NONE, 1, ray);
+    q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskSeen, ray);
     q.Proceed();
     if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) { sum += through * (P.miss + sky_along(dir, 2.0)); break; }
     float t = q.CommittedRayT();
-    Hit h = fetch(q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
+    Hit h = fetch(q.CommittedInstanceID() + q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
     Draw d = Draws[h.draw];
     tmin = t + 0.02;
     if (d.cls == 3) continue;
@@ -209,7 +210,7 @@ float3 engine_light(float3 pos, float3 N) {
     if (P.lightShadow != 0 && fall * wrap > 0.02) {
       RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
       RayDesc ray; ray.Origin = pos + N * 0.03; ray.Direction = L; ray.TMin = 0.02; ray.TMax = max(dist - 0.6, 0.03);
-      q.TraceRayInline(Scene, RAY_FLAG_NONE, 1, ray);
+      q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskSolid, ray);
       q.Proceed();
       if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) vis = 0.25;
     }
@@ -235,11 +236,11 @@ void main(uint3 id : SV_DispatchThreadID) {
     for (int i = 0; i < 8; ++i) {
       RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
       RayDesc ray; ray.Origin = 0; ray.Direction = v; ray.TMin = tmin; ray.TMax = 100000;
-      q.TraceRayInline(Scene, RAY_FLAG_NONE, 1, ray);
+      q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskSeen, ray);
       q.Proceed();
       if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) break;
       float t = q.CommittedRayT();
-      Hit h = fetch(q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
+      Hit h = fetch(q.CommittedInstanceID() + q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
       Draw d = Draws[h.draw];
       if (P.mode == 7) { dbg = float3(h.draw & 255, (h.draw >> 8) & 255, 1) / 255.0; break; }
       if (d.cls >= 2) { tmin = t + 0.02; continue; }

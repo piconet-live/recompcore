@@ -11,7 +11,7 @@
 namespace aurora::gx::rt::live {
 struct LiveTexture {
   std::uint32_t index, w, h;
-  std::vector<std::uint8_t> rgba;
+  std::vector<std::vector<std::uint8_t>> mips;  // made beside the render worker; the first is the texture
 };
 struct Job {
   // filled by the translation workers, each draw in the slot its packet names; these are the only frame buffers, recycled

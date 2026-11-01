@@ -94,8 +94,8 @@ struct Tuning {
   float lightMaxSize = 40.f, lightMinBright = 0.07f, lightMerge = 8.f, lightFull = 2.f, machineLight = 0.3f;
 };
 struct Frame {
-  std::vector<Vertex> verts;        // scene triangles first, then the sky's
-  std::uint32_t skyFirstVertex = 0; // the sky's first vertex
+  std::vector<Vertex> verts;        // solid surfaces first, then what light passes through (see-through, glows), then the sky
+  std::uint32_t seeFirstVertex = 0, skyFirstVertex = 0;
   std::vector<GpuDraw> draws;
   std::vector<StageRec> stages;
   std::vector<LightPick> picks, merged;
@@ -108,7 +108,7 @@ struct Frame {
 // The main view is the perspective projection with the most triangles. Sky: the largest see-through shells around the view,
 // by size against the largest in the frame, with no table of courses.
 inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex* verts, const Tuning& t, Frame& out) {
-  out.verts.clear(), out.draws.clear(), out.stages.clear(), out.main = nullptr, out.machineDraws = out.reflective = 0, out.skyFirstVertex = 0;
+  out.verts.clear(), out.draws.clear(), out.stages.clear(), out.main = nullptr, out.machineDraws = out.reflective = 0, out.seeFirstVertex = out.skyFirstVertex = 0;
   const auto key = [](const DrawRec& d) { return std::array<int, 2>{static_cast<int>(d.proj[0] * 1000), static_cast<int>(d.proj[5] * 1000)}; };
   std::array<int, 2> best{};
   {
@@ -224,11 +224,14 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
     largest = std::max(largest, extent[i]);
   }
   const auto sky = [&](std::uint32_t i) { return extent[i] > largest * 0.3f && out.draws[i].cls != 0 && out.draws[i].cls != 3; };
-  for (int pass = 0; pass < 2; ++pass) {
+  for (int pass = 0; pass < 3; ++pass) {
     if (pass == 1)
+      out.seeFirstVertex = static_cast<std::uint32_t>(out.verts.size());
+    if (pass == 2)
       out.skyFirstVertex = static_cast<std::uint32_t>(out.verts.size());
     for (std::uint32_t i = 0; i < count; ++i) {
-      if (extent[i] <= 0.f || sky(i) != (pass == 1))
+      const int group = sky(i) ? 2 : out.draws[i].cls == 0 ? 0 : 1;
+      if (extent[i] <= 0.f || group != pass)
         continue;
       out.verts.insert(out.verts.end(), verts + draws[i].firstVertex, verts + draws[i].firstVertex + draws[i].vertices);
     }

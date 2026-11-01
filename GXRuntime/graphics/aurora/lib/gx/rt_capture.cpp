@@ -618,6 +618,26 @@ void smooth_lights(Frame& f) {
   last = f.lights;
 }
 
+static std::vector<std::vector<u8>> make_mips(u32 w, u32 h, std::vector<u8> rgba) {
+  std::vector<std::vector<u8>> mips;
+  mips.push_back(std::move(rgba));
+  while (w > 1 || h > 1) {
+    const u32 nw = std::max(w / 2, 1u), nh = std::max(h / 2, 1u);
+    std::vector<u8> m(size_t(nw) * nh * 4);
+    const auto& a = mips.back();
+    for (u32 y = 0; y < nh; ++y)
+      for (u32 x = 0; x < nw; ++x)
+        for (u32 c = 0; c < 4; ++c) {
+          const u32 xa = std::min(x * 2, w - 1), ya = std::min(y * 2, h - 1), xb = std::min(x * 2 + 1, w - 1), yb = std::min(y * 2 + 1, h - 1);
+          m[(size_t(y) * nw + x) * 4 + c] = static_cast<u8>((a[(size_t(ya) * w + xa) * 4 + c] + a[(size_t(ya) * w + xb) * 4 + c] +
+                                                             a[(size_t(yb) * w + xa) * 4 + c] + a[(size_t(yb) * w + xb) * 4 + c] + 2) / 4);
+        }
+    mips.push_back(std::move(m));
+    w = nw, h = nh;
+  }
+  return mips;
+}
+
 FILE* s_lightLog = nullptr;
 bool s_lateCheck = false;
 struct LateRec {
@@ -681,11 +701,24 @@ void run_rules(live::Job& j) {
   j.textures.clear();
   if (j.drawable) {
     // only a job that will run carries textures away: their indices are for good
+    // In index order, a bounded amount a frame: a scene's first frame brings dozens, and they must not stall the picture. Until a
+    // texture is up, rays read it as plain white for the few frames that takes.
     {
-      std::lock_guard lock{s_texLock};
-      for (auto& t : s_texs)
-        j.textures.push_back({t.index, t.w, t.h, std::move(t.rgba)});
-      s_texs.clear();
+      constexpr size_t Budget = 1u << 20;
+      size_t bytes = 0;
+      std::unique_lock lock{s_texLock};
+      size_t n = 0;
+      static thread_local std::vector<Tex> take;
+      take.clear();
+      while (n < s_texs.size() && (n == 0 || bytes + s_texs[n].rgba.size() <= Budget)) {
+        bytes += s_texs[n].rgba.size();
+        take.push_back(std::move(s_texs[n]));
+        ++n;
+      }
+      s_texs.erase(s_texs.begin(), s_texs.begin() + static_cast<std::ptrdiff_t>(n));
+      lock.unlock();
+      for (Tex& t : take)
+        j.textures.push_back({t.index, t.w, t.h, make_mips(t.w, t.h, std::move(t.rgba))});
     }
     std::memcpy(j.proj, j.frame.main->proj, sizeof j.proj);
     std::memcpy(j.viewport, j.frame.main->viewport, sizeof j.viewport);
