@@ -43,8 +43,6 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
-#include <timeapi.h>
-#pragma comment(lib, "winmm.lib")
 #endif
 
 namespace aurora::gfx::timewarp {
@@ -651,28 +649,53 @@ void shoot_depth() {
   std::fflush(stderr);
 }
 
+// Sleeps to a moment without spinning: a high-resolution waitable timer (about 0.5 ms), no change of the system's timer.
+class PacerSleep {
+public:
+#if defined(_WIN32)
+  PacerSleep() {
+    m_timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+  }
+  ~PacerSleep() {
+    if (m_timer != nullptr)
+      CloseHandle(m_timer);
+  }
+  void for_ns(int64_t ns) {
+    if (m_timer == nullptr) {
+      std::this_thread::sleep_for(std::chrono::nanoseconds(ns));
+      return;
+    }
+    LARGE_INTEGER due;
+    due.QuadPart = -std::max<int64_t>(ns / 100, 1);
+    SetWaitableTimer(m_timer, &due, 0, nullptr, nullptr, FALSE);
+    WaitForSingleObject(m_timer, 100);
+  }
+
+private:
+  HANDLE m_timer = nullptr;
+#else
+  void for_ns(int64_t ns) { std::this_thread::sleep_for(std::chrono::nanoseconds(ns)); }
+#endif
+};
+
 void pacer_main() {
 #if defined(_WIN32)
-  timeBeginPeriod(1);
   SetThreadDescription(GetCurrentThread(), L"Aurora timewarp");
 #endif
+  PacerSleep sleep;
   const double period = TrueFrameMs / (s_warpsAFrame + 1);
   while (s_running.load(std::memory_order_acquire)) {
     const int64_t base = s_trueNs.load(std::memory_order_acquire);
     const int index = s_nextWarp.load(std::memory_order_acquire);
     if (base == 0 || index > s_warpsAFrame) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      sleep.for_ns(1'000'000);
       continue;
     }
     const int64_t due = base + static_cast<int64_t>(index * period * 1e6);
     const int64_t left = due - ns_now();
-    if (left > 1'500'000) {
-      std::this_thread::sleep_for(std::chrono::microseconds(left / 1000 - 1200));
-      continue;  // (a new true frame may have moved the moment)
-    }
     if (left > 0) {
-      std::this_thread::yield();
-      continue;
+      sleep.for_ns(left);
+      continue;  // (a new true frame may have moved the moment)
     }
     int expected = index;
     if (!s_nextWarp.compare_exchange_strong(expected, index + 1))
@@ -681,9 +704,6 @@ void pacer_main() {
       continue;
     render_worker::enqueue_work([due] { warp_job(due); });
   }
-#if defined(_WIN32)
-  timeEndPeriod(1);
-#endif
 }
 
 double median_of(std::vector<double> v) {
