@@ -1,4 +1,5 @@
 #include "command_processor.hpp"
+#include "fifo.hpp"
 
 #include "../gfx/recording.hpp"
 #include "../internal.hpp"
@@ -24,6 +25,17 @@
 #include <vector>
 
 namespace aurora::gx::fifo {
+// set_drawing_off (Patch 25)
+bool g_drawingOff = false;
+
+void set_drawing_off(bool off) noexcept {
+  if (off == g_drawingOff) {
+    return;
+  }
+  drain();  // the worker reads it: what came before is decoded under the old value
+  g_drawingOff = off;
+}
+
 namespace {
 constexpr Module Log{"aurora::gx::fifo"};
 // recomp seam: GX_CMD_CALL_DL nesting depth (display lists resolved from guest memory)
@@ -807,7 +819,7 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
   u32 totalVtxBytes = vtxCount * vtxSize;
   if (totalVtxBytes > reader.remaining())
     UNLIKELY { handle_draw_overrun(totalVtxBytes, reader); }
-  if (g_gxState.cullMode == GX_CULL_ALL)
+  if (g_gxState.cullMode == GX_CULL_ALL || g_drawingOff)
     UNLIKELY {
       // GX_CULL_ALL rasterises nothing (the hardware culls both faces; lines and points too)
       reader.skip(totalVtxBytes);

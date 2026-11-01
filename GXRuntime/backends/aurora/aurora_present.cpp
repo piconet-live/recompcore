@@ -42,6 +42,10 @@ extern "C" volatile int g_auroraDrawDump;  // command_processor.cpp (AURORA_DUMP
 
 namespace aurora::webgpu {
 void set_host_window(void* window) noexcept;  // dawn/BackendBinding.cpp
+void force_device_loss_for_test() noexcept;   // webgpu/gpu.cpp
+}
+namespace aurora::gx::fifo {
+void set_drawing_off(bool off) noexcept;  // gx/command_processor.cpp
 }
 namespace aurora::window {
 void set_frame_buffer_size(int width, int height) noexcept;  // window.cpp
@@ -200,8 +204,11 @@ struct State {
   std::uint32_t width = 640, height = 528, most_behind = 4, scale = 1;
   void* window = nullptr;
   std::atomic<bool> fatal{false};  // a fatal error of Aurora's: its thread is parked, never joined, Aurora never shut down
-  // the bytes waiting at most (a frame is 1 KB in menus, 100-300 KB in a race): the bound on what falling behind costs
+  // the bytes waiting at most: the bound on what falling behind costs. A race frame is about 2.4 MB with its lists in
+  // place (course 37, 30 racers). Into the host's window a stop leaves the player without a picture, so it holds more:
+  // about 7 s of a thread of Aurora's stuck, against about 2 s.
   static constexpr std::size_t most_bytes_behind = 256u << 20;
+  static constexpr std::size_t most_bytes_behind_window = 1024u << 20;
   std::size_t bytes_waiting = 0;  // (under lock)
   Clock::time_point t0;
 
@@ -220,11 +227,21 @@ struct State {
   std::atomic<bool> stopped{false};
   bool up = false;  // (under lock) Aurora started and the frames that waited for it drained: the tight bound from then on
   std::vector<double> feed_ms, present_ms, readback_ms;
+  std::uint64_t frames_not_drawn = 0;  // (Aurora's thread) into the host's window: decoded, not drawn, to catch up
 };
 State* s = nullptr;
 
 double ms(Clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); }
 double us_since(Clock::time_point t) { return std::chrono::duration<double, std::micro>(t - s->t0).count(); }
+
+// The recent times the medians are of, not all of them: the stats are read every frame into the host's window, and a
+// session lasts for hours.
+void keep_time(std::vector<double>& times, double value) {
+  constexpr std::size_t most = 8192;
+  if (times.size() >= most)
+    times.erase(times.begin(), times.begin() + most / 2);
+  times.push_back(value);
+}
 
 double median(std::vector<double> v) {
   if (v.empty())
@@ -298,9 +315,48 @@ bool is_shot(std::uint64_t copy) {
   return std::find(s->shots.begin(), s->shots.end(), copy) != s->shots.end();
 }
 
-void stop_for_run(const char* why) {
-  if (!s->stopped.exchange(true))
+#ifdef _WIN32
+// Into the host's window there is no other picture to go back to: the race goes on under a still picture, so the player
+// is told. A window of its own, over the host's, on a thread of its own (Aurora's may be parked for good), which never
+// takes the focus. It goes with the process.
+void show_stopped_notice(HWND host) {
+  std::thread([host] {
+    RECT r{};
+    if (!GetClientRect(host, &r))
+      return;
+    POINT at{(r.right - r.left) / 2, (r.bottom - r.top) / 2};
+    ClientToScreen(host, &at);
+    constexpr int w = 620, h = 76;
+    HWND notice = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, L"STATIC",
+                                  L"The picture has stopped, but your race is still running.\r\n"
+                                  L"Close the game, then rejoin the race from the launcher.",
+                                  WS_POPUP | WS_BORDER | SS_CENTER, at.x - w / 2, at.y - h / 2, w, h, host, nullptr,
+                                  GetModuleHandleW(nullptr), nullptr);
+    if (notice == nullptr)
+      return;
+    LOGFONTW font{};
+    font.lfHeight = -20;
+    wcscpy_s(font.lfFaceName, L"Segoe UI");
+    SendMessageW(notice, WM_SETFONT, reinterpret_cast<WPARAM>(CreateFontIndirectW(&font)), TRUE);
+    ShowWindow(notice, SW_SHOWNOACTIVATE);
+    std::fprintf(stderr, "[aurora-present] the player is told the picture has stopped\n");
+    MSG m;
+    while (GetMessageW(&m, nullptr, 0, 0) > 0)
+      DispatchMessageW(&m);
+  }).detach();
+}
+#endif
+
+void stop_for_run(const char* why, bool tell_the_player = true) {
+  if (!s->stopped.exchange(true)) {
     std::fprintf(stderr, "[aurora-present] stopped for the run: %s\n", why);
+#ifdef _WIN32
+    if (s->window != nullptr && tell_the_player)
+      show_stopped_notice(static_cast<HWND>(s->window));
+#else
+    (void)tell_the_player;
+#endif
+  }
   s->stats.stopped = 1;
 }
 
@@ -435,6 +491,19 @@ void run() {
   };
   const std::uint64_t test_fault = test_copy("AURORA_TEST_FAULT");
   const std::uint64_t test_bad_xf = test_copy("AURORA_TEST_BAD_XF");
+  // AURORA_TEST_DEVICE_LOST=<copy> (a test): the graphics device is lost at this copy, the way a driver's reset loses it.
+  // AURORA_TEST_STALL=<copy>:<ms> (a test): Aurora's thread stops for that long once at this copy.
+  // AURORA_TEST_SLOW=<ms> (a test): every frame drawn takes at least that long, as a GPU too slow for the game.
+  const std::uint64_t test_device_lost = test_copy("AURORA_TEST_DEVICE_LOST");
+  std::uint64_t test_stall_copy = 0;
+  unsigned test_stall_ms = 0;
+  if (const char* v = std::getenv("AURORA_TEST_STALL")) {
+    char* end = nullptr;
+    test_stall_copy = std::strtoull(v, &end, 10);
+    if (end != nullptr && *end == ':')
+      test_stall_ms = static_cast<unsigned>(std::strtoul(end + 1, nullptr, 10));
+  }
+  const unsigned test_slow_ms = env_number("AURORA_TEST_SLOW");
 
   // Speed tests (stage 8), one at a time. AURORA_NO_READBACK=1: Aurora draws and presents into its hidden window and
   // no picture comes back (the emulator's own stays on screen), a stand-in for the later PresentTarget design.
@@ -455,6 +524,10 @@ void run() {
   // waits behind it: a slow GPU copy (100+ ms seen with a busy GPU) would run it into the stop for being behind.
   bool asked = false;
   std::uint64_t asked_copy = 0;
+  // Into the host's window nothing can be drawn late: with this many frames waiting behind one, it is decoded for its
+  // state and not drawn, so a slow GPU shows fewer pictures and never older ones (and the RAM a draw reads belongs to a
+  // frame no more than this far back). No effect on the race: nothing of it depends on Aurora.
+  constexpr std::size_t most_waiting_to_draw = 3;
   const auto frame_waits = [] {
     std::lock_guard g{s->lock};
     return !s->queue.empty();
@@ -493,6 +566,12 @@ void run() {
     if (test_fault != 0 && f.copy == test_fault) {
       *static_cast<volatile int*>(nullptr) = 1;
     }
+    if (test_device_lost != 0 && f.copy == test_device_lost) {
+      aurora::webgpu::force_device_loss_for_test();
+    }
+    if (test_stall_copy != 0 && f.copy == test_stall_copy) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(test_stall_ms));
+    }
     if (test_bad_xf != 0 && f.copy == test_bad_xf) {
       f.bytes.push_back(0x10);
       f.bytes.insert(f.bytes.end(), {0xFF, 0xFF, 0x00, 0x00});
@@ -500,11 +579,19 @@ void run() {
     }
     s_test_frame = &f.bytes;
     s_test_frame_copy = f.copy;
+    const bool not_drawn = s->window != nullptr && waiting >= most_waiting_to_draw && !is_shot(f.copy);
+    aurora::gx::fifo::set_drawing_off(not_drawn);
     for (std::size_t off = 0; off < f.bytes.size(); off += 32768) {
       const std::size_t n = std::min<std::size_t>(32768, f.bytes.size() - off);
       aurora_backend_gx_write_burst(f.bytes.data() + off, static_cast<u32>(n));
     }
+    if (not_drawn) {
+      ++s->frames_not_drawn;
+      continue;
+    }
     const auto fed = Clock::now();
+    if (test_slow_ms != 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(test_slow_ms));
     // a picture when this is the newest frame (none waits behind it) or a test picture is wanted of it (which must be
     // of that frame: one still on its way comes first)
     const bool shot = is_shot(f.copy);
@@ -560,10 +647,10 @@ void run() {
     {
       std::lock_guard g{s->lock};
       ++s->stats.frames_drawn;
-      s->feed_ms.push_back(ms(fed - start));
-      s->present_ms.push_back(ms(presented - fed));
+      keep_time(s->feed_ms, ms(fed - start));
+      keep_time(s->present_ms, ms(presented - fed));
       if (got) {
-        s->readback_ms.push_back(ms(pictured - presented));
+        keep_time(s->readback_ms, ms(pictured - presented));
         std::swap(back, s->ready);
         s->fresh = true;
         ++s->stats.pictures;
@@ -571,13 +658,16 @@ void run() {
     }
     if (aurora_backend_should_quit()) {
       std::lock_guard g{s->lock};
-      stop_for_run("Aurora's window was closed");
+      stop_for_run("Aurora's window was closed", false);
       s->queue.clear();
       break;
     }
   }
   if (log)
     std::fclose(log);
+  if (s->frames_not_drawn != 0)
+    std::fprintf(stderr, "[aurora-present] %llu frames not drawn, to catch up\n",
+                 static_cast<unsigned long long>(s->frames_not_drawn));
   dol_aurora_shutdown();
 }
 }  // namespace
@@ -638,7 +728,8 @@ void aurora_present_frame(uint64_t copy) {
     // In the host window there is no picture of the emulator's to go back to: a stop would freeze the window with the
     // race going on (course 36 under load, 1214 frames in), so only the byte bound stops it there.
     const std::size_t most = (s->up && s->window == nullptr) ? s->most_behind : 1800u;
-    if (s->queue.size() >= most || s->bytes_waiting + f.bytes.size() > State::most_bytes_behind) {
+    const std::size_t most_bytes = s->window != nullptr ? State::most_bytes_behind_window : State::most_bytes_behind;
+    if (s->queue.size() >= most || s->bytes_waiting + f.bytes.size() > most_bytes) {
       stop_for_run(s->queue.size() >= most ? "too many frames behind" : "too many bytes behind");
       s->queue.clear();
       s->bytes_waiting = 0;
