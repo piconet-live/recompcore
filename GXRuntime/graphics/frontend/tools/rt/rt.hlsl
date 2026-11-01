@@ -8,13 +8,15 @@ struct Stage {
   float4 k;
 };
 struct Draw {
-  uint stages;
+  uint stages, firstStage;
   uint cls;       // 0 solid, 1 translucent, 2 additive, 3 ignored
   float strength; // the draw's own reflection strength
   uint highlight; // the draw has a stage looked up by the normal: the game's own shine
+  uint fogType;
+  float3 fog;
+  float3 fogColour;
   float4 regs[4];
-  float swap[4][4];
-  Stage stage[16];
+  uint swap[4];
 };
 struct Params {
   float2 size;
@@ -35,6 +37,9 @@ struct Params {
   float lightRange;
   uint lightShadow;
   float bodyCalm;
+  float2 projZ;
+  uint skyFirst;
+  uint _pad;
 };
 struct Light { float3 pos; float3 colour; };
 ConstantBuffer<Params> P : register(b0);
@@ -43,7 +48,10 @@ StructuredBuffer<Vertex> Verts : register(t1);
 StructuredBuffer<Draw> Draws : register(t2);
 Texture2D<float4> Raster : register(t3);
 StructuredBuffer<Light> Lights : register(t4);
+StructuredBuffer<Stage> Stages : register(t5);
 RWTexture2D<float4> Out : register(u0);
+RWTexture2D<float4> Final : register(u1);
+Texture2D<float4> Term : register(t6);
 Texture2D<float4> Tex[] : register(t0, space1);
 SamplerState Linear : register(s0);
 
@@ -91,14 +99,14 @@ float4 shade(Hit h, float lod) {
   float4 r[4];
   for (int i = 0; i < 4; ++i) r[i] = d.regs[i];
   for (uint i = 0; i < d.stages; ++i) {
-    Stage s = d.stage[i];
+    Stage s = Stages[d.firstStage + i];
     if (s.reflection != 0) continue;
     float4 tex = 1.xxxx;
     if (s.tex != 0xFFFFFFFFu && s.tex < P.textures) {
       float2 uv = s.tc < 4 ? h.uv[s.tc] : 0.xx;
       float4 t = Tex[NonUniformResourceIndex(s.tex)].SampleLevel(Linear, uv, lod);
-      float sw[4] = d.swap[s.swapTex];
-      tex = float4(t[(uint)sw[0]], t[(uint)sw[1]], t[(uint)sw[2]], t[(uint)sw[3]]);
+      uint sw = d.swap[s.swapTex & 3];
+      tex = float4(t[sw & 3], t[(sw >> 8) & 3], t[(sw >> 16) & 3], t[(sw >> 24) & 3]);
     }
     float3 a = cin(s.ca, r, tex, h.ras, s.k), b = cin(s.cb, r, tex, h.ras, s.k), c = cin(s.cc, r, tex, h.ras, s.k), e = cin(s.cd, r, tex, h.ras, s.k);
     float3 l = a * (1 - c) + b * c;
@@ -115,6 +123,42 @@ float4 shade(Hit h, float lod) {
   }
   return r[0];
 }
+// The game's fog at a hit, as its own shader computes it from the hit's depth
+float3 fogged(Draw d, float3 pos, float3 c) {
+  if (d.fogType == 0 || (d.fogType & 8) != 0 || pos.z >= 0) return c;
+  float depth = saturate(1 + (P.projZ.x * pos.z + P.projZ.y) / -pos.z);
+  float base = d.fog.x / (d.fog.y - depth);
+  float f = saturate(base - d.fog.z);
+  float z = f;
+  if (d.fogType == 4) z = f;
+  else if (d.fogType == 5) z = 1 - pow(2, -8 * f);
+  else if (d.fogType == 6) z = 1 - pow(2, -8 * f * f);
+  else if (d.fogType == 7) z = pow(2, -8 * (1 - f));
+  else { float g = 1 - f; z = pow(2, -8 * g * g); }
+  return lerp(c, d.fogColour, saturate(z));
+}
+uint first_vertex(uint inst) { return inst == 1 ? P.skyFirst : 0; }
+// The sky: its shells only. A ray the game culled has none in that direction: looked up mirrored to the view's front.
+float3 sky_along(float3 dir, float lod) {
+  float3 sum = 0;
+  for (int pass = 0; pass < 2 && all(sum == 0); ++pass) {
+    float3 d = pass == 0 ? dir : float3(dir.x, dir.y, -abs(dir.z));
+    float tmin = 1;
+    for (int layer = 0; layer < 6; ++layer) {
+      RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
+      RayDesc ray; ray.Origin = 0; ray.Direction = d; ray.TMin = tmin; ray.TMax = 1000000;
+      q.TraceRayInline(Scene, RAY_FLAG_NONE, 2, ray);
+      q.Proceed();
+      if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) break;
+      float t = q.CommittedRayT();
+      Hit h = fetch(P.skyFirst / 3 + q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
+      float4 c = shade(h, lod);
+      sum += c.rgb * saturate(c.a);
+      tmin = t + 1;
+    }
+  }
+  return sum;
+}
 float3 trace_reflection(float3 org, float3 dir, float maxLodScale) {
   float3 sum = 0;
   float through = 1;
@@ -122,9 +166,9 @@ float3 trace_reflection(float3 org, float3 dir, float maxLodScale) {
   for (int bounce = 0; bounce < 8; ++bounce) {
     RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
     RayDesc ray; ray.Origin = org; ray.Direction = dir; ray.TMin = tmin; ray.TMax = 100000;
-    q.TraceRayInline(Scene, RAY_FLAG_NONE, 0xFF, ray);
+    q.TraceRayInline(Scene, RAY_FLAG_NONE, 1, ray);
     q.Proceed();
-    if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) { sum += through * P.miss; break; }
+    if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) { sum += through * (P.miss + sky_along(dir, 2.0)); break; }
     float t = q.CommittedRayT();
     Hit h = fetch(q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
     Draw d = Draws[h.draw];
@@ -132,6 +176,7 @@ float3 trace_reflection(float3 org, float3 dir, float maxLodScale) {
     if (d.cls == 3) continue;
     float lod = clamp(log2(max(t, 1.0) * maxLodScale), 0.0, 8.0);
     float4 c = shade(h, lod);
+    c.rgb = fogged(d, h.pos, c.rgb);
     // a glow right beside the surface is the machine's own flame, a camera-facing sprite: seen from its own bodywork it is a flat sheet
     if (d.cls == 2) { if (t > 8) sum += through * c.rgb * saturate(c.a); continue; }
     if (d.cls == 1) {
@@ -164,7 +209,7 @@ float3 engine_light(float3 pos, float3 N) {
     if (P.lightShadow != 0 && fall * wrap > 0.02) {
       RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
       RayDesc ray; ray.Origin = pos + N * 0.03; ray.Direction = L; ray.TMin = 0.02; ray.TMax = max(dist - 0.6, 0.03);
-      q.TraceRayInline(Scene, RAY_FLAG_NONE, 0xFF, ray);
+      q.TraceRayInline(Scene, RAY_FLAG_NONE, 1, ray);
       q.Proceed();
       if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) vis = 0.25;
     }
@@ -178,6 +223,7 @@ void main(uint3 id : SV_DispatchThreadID) {
   float3 sum = 0;
   float3 light = 0;
   float3 dbg = 0;
+  float hitDepth = 0;
   uint seed = id.x * 1973u + id.y * 9277u + P.frame * 26699u + 1u;
   for (uint n = 0; n < P.spp; ++n) {
     float2 px = id.xy + (P.spp > 1 ? float2(rnd(seed), rnd(seed)) : 0.5.xx);
@@ -189,7 +235,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     for (int i = 0; i < 8; ++i) {
       RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
       RayDesc ray; ray.Origin = 0; ray.Direction = v; ray.TMin = tmin; ray.TMax = 100000;
-      q.TraceRayInline(Scene, RAY_FLAG_NONE, 0xFF, ray);
+      q.TraceRayInline(Scene, RAY_FLAG_NONE, 1, ray);
       q.Proceed();
       if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) break;
       float t = q.CommittedRayT();
@@ -202,6 +248,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         surf = shade(h, 0);
         if (surf.a < 0.5) { tmin = t + 0.02; continue; }
       }
+      hitDepth = t;
       float3 N = h.nrm;
       if (dot(N, v) > 0) N = -N;
       if (P.mode == 3) { dbg += N * 0.5 + 0.5; break; }
@@ -243,9 +290,27 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
     sum += term;
   }
+  if (P.mode == 8) { Out[id.xy] = float4(sum + raster * light, hitDepth); return; }
   if (P.mode >= 6) { Out[id.xy] = float4(dbg, 1); return; }
   if (P.mode >= 2) { Out[id.xy] = float4(dbg / P.spp, 1); return; }
   float3 refl = sum / P.spp;
   float3 lit = raster * light / P.spp;
   Out[id.xy] = float4(P.mode == 1 ? refl + lit : raster + refl + lit, 1);
+}
+
+// Live: one ray a pixel, so the term is noisy and its edges jagged: a small cross, kept to the same surface by depth, then over the raster
+[numthreads(8, 8, 1)]
+void compose(uint3 id : SV_DispatchThreadID) {
+  int2 c = id.xy;
+  float4 mid = Term[c];
+  float3 sum = mid.rgb;
+  float weight = 1;
+  static const int2 off[8] = {int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1), int2(1, 1), int2(-1, 1), int2(1, -1), int2(-1, -1)};
+  for (int i = 0; i < 8; ++i) {
+    float4 o = Term[c + off[i]];
+    float w = (i < 4 ? 0.6 : 0.35) * saturate(1 - abs(o.a - mid.a) / max(mid.a * 0.02, 0.02));
+    sum += o.rgb * w;
+    weight += w;
+  }
+  Final[c] = float4(saturate(Raster[c].rgb + sum / weight), 1);
 }

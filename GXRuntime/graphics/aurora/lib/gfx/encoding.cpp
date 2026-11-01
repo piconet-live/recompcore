@@ -31,6 +31,9 @@ using namespace detail;
 using webgpu::g_device;
 using webgpu::g_queue;
 
+void (*g_beforeFrameSubmit)() = nullptr;
+void (*g_afterFrameSubmit)() = nullptr;
+
 namespace {
 constexpr Module Log{"aurora::gfx"};
 WGPURenderPipeline g_currentPipeline = nullptr;
@@ -89,6 +92,7 @@ void execute_encoder_task(wgpu::CommandEncoder& cmd, FramePacket& frame, const E
       .indexBuffer = res.indexBuffer,
       .uniformBuffer = res.uniformBuffer,
       .storageBuffer = res.storageBuffer,
+      .frameEncoder = &cmd,
   };
   taskType->callback(context, cmd, task.payload.data(), task.payloadSize, taskType->userdata);
   if (taskType->afterSubmit != nullptr) {

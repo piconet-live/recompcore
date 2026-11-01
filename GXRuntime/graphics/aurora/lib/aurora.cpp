@@ -418,7 +418,11 @@ void end_frame() noexcept {
     const auto buffer = encoder.Finish(&cmdBufDescriptor);
     {
       ZoneScopedN("Queue Submit");
+      if (gfx::g_beforeFrameSubmit != nullptr)
+        gfx::g_beforeFrameSubmit();
       g_queue.Submit(1, &buffer);
+      if (gfx::g_afterFrameSubmit != nullptr)
+        gfx::g_afterFrameSubmit();
       g_timingSubmitNs.store(timing_now_ns(), std::memory_order_release);
       g_queue.OnSubmittedWorkDone(wgpu::CallbackMode::AllowSpontaneous,
                                   [](wgpu::QueueWorkDoneStatus, wgpu::StringView) {

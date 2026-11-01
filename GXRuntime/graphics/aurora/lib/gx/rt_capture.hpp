@@ -18,6 +18,12 @@ void start() noexcept;  // reads the switches, once
 bool is_reflection_stage(const TevStage& stage, const std::array<TcgConfig, MaxTexCoord>& tcgs) noexcept;
 void neutralise(ShaderConfig& config) noexcept;
 
+// The live pass: before each draw (the first orthographic draw after the view is the HUD: the rays go first), and at a copy that
+// clears the EFB (what was drawn so far went to a texture, not the picture)
+void before_draw() noexcept;
+void efb_cleared() noexcept;
+extern bool g_live;
+
 // The command processor, once a draw's pipeline and textures are settled: `vertices` are the draw's raw bytes
 void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertices) noexcept;
 // copy_xfb, before the copy: a frame ends here

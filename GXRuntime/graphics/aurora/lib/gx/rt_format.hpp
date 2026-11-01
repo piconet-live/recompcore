@@ -27,6 +27,9 @@ struct DrawRec {
   std::uint32_t prim, vtxCount, hasNormal, hasColor, lit;
   float regs[4][4];
   float swap[4][4];  // for each swap table, the channel routed to red, green, blue, alpha
+  std::uint32_t fogType;
+  float fog[3];       // a, b, c
+  float fogColour[4];
   StageRec stage[16];
 };
 } // namespace aurora::gx::rt

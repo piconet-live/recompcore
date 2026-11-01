@@ -106,6 +106,12 @@ bool in_display_list();
 
 // Ensure all buffered commands have been processed.
 void drain();
+// On the stream's own thread, for a call that would otherwise wait for the stream to reach itself
+struct HoldDrain {
+  HoldDrain() noexcept { ++depth; }
+  ~HoldDrain() { --depth; }
+  static thread_local int depth;
+};
 
 // Internal buffer inspection
 const uint8_t* get_buffer_data();

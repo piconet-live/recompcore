@@ -1,5 +1,6 @@
 #include <cstdio>
 #include "regs.hpp"
+#include "rt_capture.hpp"
 
 #include "gx_fmt.hpp"
 #include "recomp.hpp"
@@ -421,6 +422,8 @@ void bp_efb_copy(u8, u32 value) noexcept {
                      g_gxState.texCopySrc.height, g_gxState.texCopyDstWidth, g_gxState.texCopyDstHeight, clear ? 1 : 0,
                      (unsigned)g_gxState.pixelFmt);
       }
+      if (clear)
+        rt::efb_cleared();
       copy_tex(g_gxState.texCopyDest, clear);
     } else {
       Log.warn("Skipping GXCopyTex with unresolved destination");

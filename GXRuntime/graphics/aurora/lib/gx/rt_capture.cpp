@@ -1,10 +1,15 @@
 #include "rt_capture.hpp"
 #include "rt_format.hpp"
+#if defined(AURORA_RT_LIVE)
+#include "rt_live.hpp"
+#endif
 
 #include "recomp.hpp"
 #include "../gfx/texture_convert.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cstddef>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -21,6 +26,7 @@ namespace aurora::gx::rt {
 bool g_neutral = false;
 bool g_capturing = false;
 bool g_noHud = false;
+bool g_live = false;
 static bool s_seenPerspective = false;
 
 bool skip_draw() noexcept {
@@ -36,7 +42,12 @@ std::string s_path;
 u64 s_at = 0;
 u64 s_frame = 0;
 u64 s_atCopy = 0;
-std::vector<DrawRec> s_draws;
+u32 s_liveTextures = 0;
+bool s_rayed = false;
+double s_captureMs = 0;
+float s_road = 0.9f, s_light = 1.f;
+u32 s_liveFirstNew = 0;
+DrawList s_draws;
 std::vector<Vertex> s_verts;
 struct Tex {
   u32 w, h, wrapS, wrapT;
@@ -128,6 +139,8 @@ u32 add_texture(u32 slot) {
   const auto key = std::make_tuple(obj.data, w, h, fmt, palette ? tlut.data : nullptr);
   if (const auto it = s_texIndex.find(key); it != s_texIndex.end())
     return it->second;
+  if (g_live && s_liveTextures >= 8000)
+    return UINT32_MAX;
   const size_t bytes = GXGetTexBufferSize(static_cast<u16>(w), static_cast<u16>(h), fmt, GX_FALSE, 0);
   gfx::ConvertedTexture conv;
   if (palette) {
@@ -144,8 +157,9 @@ u32 add_texture(u32 slot) {
   }
   Tex t{w, h, static_cast<u32>(obj.wrap_s()), static_cast<u32>(obj.wrap_t()), {}};
   t.rgba.assign(conv.data.data(), conv.data.data() + static_cast<size_t>(w) * h * 4u);
+  // live: an index for good, the pixels leave with the next job
+  const u32 index = g_live ? s_liveTextures++ : static_cast<u32>(s_texs.size());
   s_texs.push_back(std::move(t));
-  const u32 index = static_cast<u32>(s_texs.size() - 1);
   s_texIndex[key] = index;
   return index;
 }
@@ -154,7 +168,11 @@ float dot4(const Vec4<float>& m, float x, float y, float z, float w) { return m[
 
 void start() noexcept {
   const char* on = std::getenv("AURORA_RT");
-  g_neutral = on != nullptr && on[0] == '1';
+  // 1: the live pass; 2: only the game's fake reflections off, for the still tool's pictures
+  g_neutral = on != nullptr && (on[0] == '1' || on[0] == '2');
+#if defined(AURORA_RT_LIVE)
+  g_live = on != nullptr && on[0] == '1';
+#endif
   if (const char* path = std::getenv("AURORA_RT_CAPTURE"))
     s_path = path;
   if (const char* at = std::getenv("AURORA_RT_CAPTURE_AT"))
@@ -163,7 +181,11 @@ void start() noexcept {
   g_noHud = noHud != nullptr && noHud[0] == '1';
   if (const char* at = std::getenv("AURORA_RT_CAPTURE_COPY"))
     s_atCopy = std::strtoull(at, nullptr, 10);
-  g_capturing = !s_path.empty() && s_at == 0 && s_atCopy == 0;
+  g_capturing = g_live || (!s_path.empty() && s_at == 0 && s_atCopy == 0);
+  if (const char* v = std::getenv("AURORA_RT_ROAD"))
+    s_road = static_cast<float>(std::atof(v));
+  if (const char* v = std::getenv("AURORA_RT_LIGHT"))
+    s_light = static_cast<float>(std::atof(v));
   if (g_neutral || !s_path.empty())
     std::fprintf(stderr, "[rt] reflection stages %s; capture %s at display copy %llu\n", g_neutral ? "off" : "on",
                  s_path.c_str(), static_cast<unsigned long long>(s_at));
@@ -206,7 +228,12 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
   if (prim == GX_LINES || prim == GX_LINESTRIP || prim == GX_POINTS || vtxCount < 3)
     return;
   auto& st = g_gxState;
-  DrawRec d{};
+  if (g_live && st.projType != GX_PERSPECTIVE)
+    return;
+  const auto liveStart = g_live ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  const u32 drawIndex = static_cast<u32>(s_draws.size());
+  DrawRec& d = s_draws.emplace_back();
+  std::memset(static_cast<void*>(&d), 0, g_live ? offsetof(DrawRec, stage) : sizeof(DrawRec));
   std::memcpy(d.proj, &st.proj, sizeof d.proj);
   const auto& vp = st.logicalViewport;
   d.viewport[0] = vp.left, d.viewport[1] = vp.top, d.viewport[2] = vp.width, d.viewport[3] = vp.height,
@@ -216,6 +243,9 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
   d.blendMode = st.blendMode, d.blendSrc = st.blendFacSrc, d.blendDst = st.blendFacDst;
   d.depthUpdate = st.depthUpdate, d.depthCompare = st.depthCompare, d.cull = st.cullMode, d.colorUpdate = st.colorUpdate;
   d.prim = prim, d.vtxCount = vtxCount;
+  d.fogType = st.fog.type, d.fog[0] = st.fog.a, d.fog[1] = st.fog.b, d.fog[2] = st.fog.c;
+  for (int i = 0; i < 4; ++i)
+    d.fogColour[i] = st.fog.color[i];
   for (int i = 0; i < 4; ++i)
     for (int j = 0; j < 4; ++j)
       d.regs[i][j] = st.colorRegs[i][j];
@@ -292,7 +322,7 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
 
   const auto read_vertex = [&](const u8* v) {
     Vertex out{};
-    out.draw = static_cast<u32>(s_draws.size());
+    out.draw = drawIndex;
     const u32 mi = fields[GX_VA_PNMTXIDX].type != GX_NONE ? v[fields[GX_VA_PNMTXIDX].offset] / 3u : st.currentPnMtx;
     const auto& mtx = st.pnMtx[std::min<u32>(mi, MaxPnMtx - 1)];
     float p[3]{};
@@ -393,13 +423,14 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
   };
 
   d.firstVertex = static_cast<u32>(s_verts.size());
-  std::vector<Vertex> strip(vtxCount);
+  static thread_local std::vector<Vertex> strip;
+  strip.resize(vtxCount);
   for (u32 i = 0; i < vtxCount; ++i)
     strip[i] = read_vertex(vertices + i * stride);
   const auto tri = [&](u32 a, u32 b, u32 c) {
-    s_verts.push_back(strip[a]);
-    s_verts.push_back(strip[b]);
-    s_verts.push_back(strip[c]);
+    const size_t at = s_verts.size();
+    s_verts.resize(at + 3);
+    s_verts[at] = strip[a], s_verts[at + 1] = strip[b], s_verts[at + 2] = strip[c];
   };
   switch (prim) {
   case GX_TRIANGLES:
@@ -424,7 +455,53 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
     break;
   }
   d.vertices = static_cast<u32>(s_verts.size()) - d.firstVertex;
-  s_draws.push_back(d);
+  if (g_live)
+    s_captureMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - liveStart).count();
+}
+
+#if defined(AURORA_RT_LIVE)
+static void send_rays() noexcept {
+  if (s_rayed)
+    return;
+  s_rayed = true;
+  g_capturing = false;
+  if (s_draws.empty() || live::failed())
+    return;
+  // the rules run beside the stream, on buffers handed over whole
+  auto job = live::take_job();
+  std::swap(job->draws, s_draws);
+  std::swap(job->verts, s_verts);
+  s_draws.clear();
+  s_verts.clear();
+  job->road = s_road, job->light = s_light;
+  job->textures.clear();
+  for (u32 i = 0; i < s_texs.size(); ++i)
+    job->textures.push_back({s_liveFirstNew + i, s_texs[i].w, s_texs[i].h, std::move(s_texs[i].rgba)});
+  s_liveFirstNew += static_cast<u32>(s_texs.size());
+  s_texs.clear();
+  job->captureMs = s_captureMs;
+  s_captureMs = 0;
+  live::submit_job(std::move(job));
+}
+#endif
+
+void before_draw() noexcept {
+#if defined(AURORA_RT_LIVE)
+  if (s_rayed)
+    return;
+  if (g_gxState.projType == GX_PERSPECTIVE)
+    s_seenPerspective = true;
+  else if (s_seenPerspective)
+    send_rays();
+#endif
+}
+
+void efb_cleared() noexcept {
+  if (!g_live || s_rayed)
+    return;
+  s_draws.clear();
+  s_verts.clear();
+  s_seenPerspective = false;
 }
 
 void begin_copy(std::uint64_t copy) noexcept {
@@ -435,11 +512,24 @@ void begin_copy(std::uint64_t copy) noexcept {
 }
 
 void frame_end() noexcept {
+#if defined(AURORA_RT_LIVE)
+  if (g_live) {
+    if (s_seenPerspective)
+      send_rays();
+    s_rayed = false;
+    s_seenPerspective = false;
+    s_draws.clear();
+    s_verts.clear();
+    s_captureMs = 0;
+    g_capturing = !live::failed();
+    return;
+  }
+#endif
   s_seenPerspective = false;
   if (g_capturing) {
     g_capturing = false;
     if (FILE* f = std::fopen(s_path.c_str(), "wb")) {
-      const u32 head[4] = {0x33435452u, static_cast<u32>(s_draws.size()), static_cast<u32>(s_verts.size()), static_cast<u32>(s_texs.size())};
+      const u32 head[4] = {0x34435452u, static_cast<u32>(s_draws.size()), static_cast<u32>(s_verts.size()), static_cast<u32>(s_texs.size())};
       std::fwrite(head, 4, 4, f);
       const float rect[4] = {static_cast<float>(g_gxState.texCopySrc.x), static_cast<float>(g_gxState.texCopySrc.y),
                              static_cast<float>(g_gxState.texCopySrc.width), static_cast<float>(g_gxState.texCopySrc.height)};
