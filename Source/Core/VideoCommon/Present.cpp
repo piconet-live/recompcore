@@ -1019,7 +1019,12 @@ void Presenter::Present(PresentInfo* present_info)
 {
   m_present_count++;
 
-  if (g_gfx->IsHeadless() || (!m_onscreen_ui && !m_xfb_entry))
+  if (g_gfx->IsHeadless())
+  {
+    PresentOverlayToAurora();
+    return;
+  }
+  if (!m_onscreen_ui && !m_xfb_entry)
     return;
 
   if (!g_gfx->SupportsUtilityDrawing())
@@ -1105,6 +1110,31 @@ void Presenter::Present(PresentInfo* present_info)
     m_onscreen_ui->BeginImGuiFrame(m_backbuffer_width, m_backbuffer_height);
 
   g_gfx->EndUtilityDrawing();
+}
+
+// The video off with Aurora in the host's window: the emulator has no surface, and its on-screen drawing (the host's
+// overlays) goes to Aurora, which draws it at its own presents. Made at the first present, once Aurora is known to be
+// on, so that any other run of the null backend has no ImGui at all. Nothing here waits.
+void Presenter::PresentOverlayToAurora()
+{
+  u32 width = 0, height = 0;
+  if (!AuroraPresent::VideoOffSize(&width, &height))
+    return;
+  m_backbuffer_width = static_cast<int>(width);
+  m_backbuffer_height = static_cast<int>(height);
+  if (!m_onscreen_ui)
+  {
+    m_onscreen_ui = std::make_unique<OnScreenUI>();
+    if (!m_onscreen_ui->Initialize(width, height, m_backbuffer_scale))
+      m_onscreen_ui.reset();
+    return;
+  }
+  // the host's overlays lay themselves on the picture: where Aurora shows it, the whole window until it has
+  if (!AuroraPresent::PictureInWindow(&m_target_rectangle))
+    m_target_rectangle = MathUtil::Rectangle<int>(0, 0, m_backbuffer_width, m_backbuffer_height);
+  m_onscreen_ui->Finalize();
+  m_onscreen_ui->SendToAurora();
+  m_onscreen_ui->BeginImGuiFrame(width, height);
 }
 
 TimePoint Presenter::GetUpdatedPresentationTime(TimePoint intended_presentation_time)

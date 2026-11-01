@@ -38,6 +38,8 @@ public:
                                                    const void* cache_data = nullptr,
                                                    size_t cache_data_length = 0) override;
   SurfaceInfo GetSurfaceInfo() const override { return {}; }
+  // an overlay's list asks for its sampling here (AuroraPresent::OverlayFrame)
+  void SetSamplerState(u32 index, const SamplerState& state) override;
 };
 
 class NullEFBInterface final : public EFBInterfaceBase

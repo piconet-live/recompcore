@@ -3,6 +3,8 @@
 
 #include "VideoCommon/AuroraPresent.h"
 
+#include <imgui.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -36,7 +38,7 @@ namespace VideoCommon::AuroraPresent
 {
 namespace
 {
-// gxruntime/aurora_present.h, as the library exports it (ABI 3)
+// gxruntime/aurora_present.h, as the library exports it (ABI 4)
 struct LibConfig
 {
   u32 abi;
@@ -67,7 +69,7 @@ struct LibStats
   u32 fatal;
   u32 scale;
 };
-constexpr u32 LIB_ABI = 3;
+constexpr u32 LIB_ABI = 4;
 void* s_video_off_window = nullptr;  // SetVideoOffWindow
 u64 s_presents_counted = 0;
 // The hand-off's time on the thread that decodes (the report's last figure): the bursts kept, the calls swapped for
@@ -82,6 +84,31 @@ struct HandoffTimer
   }
 };
 
+// (gxruntime/aurora_present.h's, as the rest: this build does not include it)
+struct AuroraOverlayVertex
+{
+  float x, y, u, v;
+  u32 rgba;
+};
+struct AuroraOverlayDraw
+{
+  u64 texture;
+  float clip[4];
+  u32 first_index, index_count;
+  s32 base_vertex;
+  u32 linear;
+};
+struct AuroraOverlayFrame
+{
+  u32 width, height;
+  const AuroraOverlayVertex* vertices;
+  u32 vertex_count;
+  const u16* indices;
+  u32 index_count;
+  const AuroraOverlayDraw* draws;
+  u32 draw_count;
+};
+
 struct Library
 {
   int (*start)(const LibConfig*) = nullptr;
@@ -90,6 +117,10 @@ struct Library
   int (*take)(LibPicture*) = nullptr;
   void (*stats)(LibStats*) = nullptr;
   void (*stop)() = nullptr;
+  void (*overlay_texture)(u64, u32, u32, u32, u32, u32, u32, const u8*, u32) = nullptr;
+  void (*overlay_forget)(u64) = nullptr;
+  void (*overlay_frame)(const void*) = nullptr;
+  int (*picture_rect)(s32*) = nullptr;
 };
 
 Settings s_settings;
@@ -153,7 +184,11 @@ bool Load(const std::string& path)
   }
   if (!Bind(&s_lib.start, "aurora_present_start") || !Bind(&s_lib.write, "aurora_present_write") ||
       !Bind(&s_lib.frame, "aurora_present_frame") || !Bind(&s_lib.take, "aurora_present_take") ||
-      !Bind(&s_lib.stats, "aurora_present_stats") || !Bind(&s_lib.stop, "aurora_present_stop"))
+      !Bind(&s_lib.stats, "aurora_present_stats") || !Bind(&s_lib.stop, "aurora_present_stop") ||
+      !Bind(&s_lib.overlay_texture, "aurora_present_overlay_texture") ||
+      !Bind(&s_lib.overlay_forget, "aurora_present_overlay_forget") ||
+      !Bind(&s_lib.overlay_frame, "aurora_present_overlay_frame") ||
+      !Bind(&s_lib.picture_rect, "aurora_present_picture_rect"))
   {
     s_load_problem = fmt::format("{} lacks an aurora_present function", path);
     s_lib = {};
@@ -205,7 +240,7 @@ void Start()
                                (g_framebuffer_manager ? g_framebuffer_manager->GetEFBScale() : 1);
   if (!s_lib.start(&c))
   {
-    s_load_problem = "the library's interface is not this emulator's (ABI 1)";
+    s_load_problem = "the library's interface is not this emulator's (ABI 4)";
     s_on = false;
     return;
   }
@@ -499,6 +534,124 @@ const AbstractTexture* Picture(MathUtil::Rectangle<int>* rect)
 bool CountsFrames()
 {
   return s_video_off_window && On();
+}
+
+bool VideoOffSize(u32* width, u32* height)
+{
+  if (!CountsFrames())
+    return false;
+#ifdef _WIN32
+  RECT client{};
+  if (!GetClientRect(static_cast<HWND>(s_video_off_window), &client) || client.right <= 0 || client.bottom <= 0)
+    return false;
+  *width = static_cast<u32>(client.right);
+  *height = static_cast<u32>(client.bottom);
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool PictureInWindow(MathUtil::Rectangle<int>* rect)
+{
+  s32 r[4];
+  if (!s_started || !s_lib.picture_rect || !s_lib.picture_rect(r) || r[2] <= 0 || r[3] <= 0)
+    return false;
+  *rect = MathUtil::Rectangle<int>(r[0], r[1], r[0] + r[2], r[1] + r[3]);
+  return true;
+}
+
+// The presenter's thread. Aurora starts at the GPU's first burst, after the overlay has made its fonts: the textures
+// are sent whole the first frame after that, and only their changes from then on.
+namespace
+{
+bool s_overlay_sent = false;
+bool s_overlay_smooth = false;
+std::vector<AuroraOverlayDraw> s_overlay_draws;
+std::vector<ImDrawVert> s_overlay_vertices;
+std::vector<ImDrawIdx> s_overlay_indices;
+
+void SendWhole(ImTextureData* tex)
+{
+  s_lib.overlay_texture(static_cast<u64>(tex->GetTexID()), tex->Width, tex->Height, 0, 0, tex->Width, tex->Height,
+                        static_cast<const u8*>(tex->GetPixels()), tex->GetPitch());
+}
+}  // namespace
+
+void OverlayTexture(ImTextureData* tex, int status, u64 id)
+{
+  if (!s_started || !s_overlay_sent)
+    return;
+  if (tex->Status == ImTextureStatus_Destroyed)
+    s_lib.overlay_forget(id);
+  else if (status == ImTextureStatus_WantCreate)
+    SendWhole(tex);
+  else if (status == ImTextureStatus_WantUpdates)
+    for (const ImTextureRect& r : tex->Updates)
+      s_lib.overlay_texture(static_cast<u64>(tex->GetTexID()), tex->Width, tex->Height, r.x, r.y, r.w, r.h,
+                            static_cast<const u8*>(tex->GetPixelsAt(r.x, r.y)), tex->GetPitch());
+}
+
+void OverlaySampler(bool smooth)
+{
+  s_overlay_smooth = smooth;
+}
+
+void OverlayFrame(const ImDrawData* data, u32 width, u32 height)
+{
+  if (!s_started)
+    return;
+  if (!s_overlay_sent && data->Textures != nullptr)
+  {
+    s_overlay_sent = true;
+    for (ImTextureData* tex : *data->Textures)
+      if (tex->Status == ImTextureStatus_OK && tex->GetTexID() != ImTextureID_Invalid)
+        SendWhole(tex);
+  }
+  static_assert(sizeof(ImDrawVert) == sizeof(AuroraOverlayVertex) && sizeof(ImDrawIdx) == sizeof(u16));
+  s_overlay_draws.clear();
+  s_overlay_vertices.clear();
+  s_overlay_indices.clear();
+  s_overlay_smooth = false;  // (each frame starts nearest, as OnScreenUI::DrawImGui)
+  for (int i = 0; i < data->CmdListsCount; ++i)
+  {
+    const ImDrawList* list = data->CmdLists[i];
+    const s32 list_vertex = static_cast<s32>(s_overlay_vertices.size());
+    const u32 list_index = static_cast<u32>(s_overlay_indices.size());
+    s_overlay_vertices.insert(s_overlay_vertices.end(), list->VtxBuffer.begin(), list->VtxBuffer.end());
+    s_overlay_indices.insert(s_overlay_indices.end(), list->IdxBuffer.begin(), list->IdxBuffer.end());
+    for (const ImDrawCmd& cmd : list->CmdBuffer)
+    {
+      if (cmd.UserCallback != nullptr)
+      {
+        if (cmd.UserCallback != ImDrawCallback_ResetRenderState)
+          cmd.UserCallback(list, &cmd);
+        continue;
+      }
+      if (cmd.ElemCount == 0)
+        continue;
+      s_overlay_draws.push_back({static_cast<u64>(cmd.GetTexID()),
+                                 {cmd.ClipRect.x, cmd.ClipRect.y, cmd.ClipRect.z, cmd.ClipRect.w},
+                                 list_index + cmd.IdxOffset,
+                                 cmd.ElemCount,
+                                 list_vertex + static_cast<s32>(cmd.VtxOffset),
+                                 s_overlay_smooth ? 1u : 0u});
+    }
+  }
+  const AuroraOverlayFrame frame{width,
+                                 height,
+                                 reinterpret_cast<const AuroraOverlayVertex*>(s_overlay_vertices.data()),
+                                 static_cast<u32>(s_overlay_vertices.size()),
+                                 s_overlay_indices.data(),
+                                 static_cast<u32>(s_overlay_indices.size()),
+                                 s_overlay_draws.data(),
+                                 static_cast<u32>(s_overlay_draws.size())};
+  s_lib.overlay_frame(&frame);
+}
+
+u64 OverlayCopyTexture(u32 physical)
+{
+  return 0xA500000000000000ull | physical;
 }
 
 void SetVideoOffWindow(void* window)

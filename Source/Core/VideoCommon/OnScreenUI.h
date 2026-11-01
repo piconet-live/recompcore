@@ -46,6 +46,8 @@ public:
   // Renders ImGui windows to the currently-bound framebuffer.
   // Should be called with the ImGui lock held.
   void DrawImGui();
+  // With the video off: the frame's lists to Aurora, in place of DrawImGui (after Finalize)
+  void SendToAurora();
 
   // Recompiles ImGui pipeline - call when stereo mode changes.
   bool RecompileImGuiPipeline();

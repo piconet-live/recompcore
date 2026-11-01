@@ -3,6 +3,8 @@
 
 #include "VideoBackends/Null/NullGfx.h"
 
+#include "VideoCommon/AuroraPresent.h"
+
 #include "VideoBackends/Null/NullTexture.h"
 
 #include "VideoCommon/AbstractPipeline.h"
@@ -21,6 +23,11 @@ NullGfx::NullGfx()
 NullGfx::~NullGfx()
 {
   UpdateActiveConfig();
+}
+
+void NullGfx::SetSamplerState(u32 index, const SamplerState& state)
+{
+  VideoCommon::AuroraPresent::OverlaySampler(state.tm0.min_filter == FilterMode::Linear);
 }
 
 bool NullGfx::IsHeadless() const

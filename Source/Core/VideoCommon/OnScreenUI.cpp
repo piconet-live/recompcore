@@ -18,6 +18,7 @@
 #include "Core/System.h"
 
 #include "VideoCommon/AbstractGfx.h"
+#include "VideoCommon/AuroraPresent.h"
 #include "VideoCommon/AbstractPipeline.h"
 #include "VideoCommon/AbstractShader.h"
 #include "VideoCommon/AbstractStagingTexture.h"
@@ -435,7 +436,17 @@ void OnScreenUI::Finalize()
   if (draw_data->Textures != nullptr)
     for (ImTextureData* tex : *draw_data->Textures)
       if (tex->Status != ImTextureStatus_OK)
+      {
+        const ImTextureStatus status = tex->Status;
+        const ImTextureID id = tex->TexID;
         UpdateImguiTexture(tex);
+        AuroraPresent::OverlayTexture(tex, status, id);
+      }
+}
+
+void OnScreenUI::SendToAurora()
+{
+  AuroraPresent::OverlayFrame(ImGui::GetDrawData(), m_backbuffer_width, m_backbuffer_height);
 }
 
 void OnScreenUI::UpdateImguiTexture(ImTextureData* tex)

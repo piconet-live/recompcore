@@ -5,6 +5,7 @@
 #include "gxruntime/aurora_present.h"
 
 #include "aurora_backend_private.h"
+#include "aurora_overlay.h"
 #include "gxruntime/aurora_backend.h"
 #include "gxruntime/gx_recomp.h"
 
@@ -486,6 +487,7 @@ void run() {
   } else {
     AuroraSetViewportPolicy(AURORA_VIEWPORT_NATIVE);  // the game's own viewport, unscaled
   }
+  aurora_overlay_start(s->ram);
   // AURORA_TEST_FATAL=<copy> (a test): a fatal error at this copy, the way any of Aurora's goes
   const char* test_fatal_text = std::getenv("AURORA_TEST_FATAL");
   const std::uint64_t test_fatal = test_fatal_text != nullptr ? std::strtoull(test_fatal_text, nullptr, 10) : 0;

@@ -6,6 +6,7 @@
 #include "wgpu.hpp"
 
 #include <array>
+#include <functional>
 #include <cstdint>
 
 struct SDL_Window;
@@ -88,5 +89,22 @@ size_t load_from_cache(void const* key, size_t keySize, void* value, size_t valu
 void store_to_cache(void const* key, size_t keySize, void const* value, size_t valueSize, void* userdata);
 void cache_prune();
 void cache_shutdown();
+
+// Patch: what an embedding program draws at the present, on top of everything Aurora drew (a frame's picture, however it
+// got to the surface) and never into it; it is not in the present source and not in a readback.
+struct PresentHook {
+  using Draw = std::function<void(const wgpu::RenderPassEncoder& pass, const Viewport& picture, uint32_t surfaceWidth,
+                                  uint32_t surfaceHeight)>;
+  // Aurora's thread at the frame's end, the FIFO drained (the frame's copies can be looked up): what the frame's present
+  // draws, on the render worker. It may be called again for another present of the same frame.
+  Draw (*capture)() = nullptr;
+  // The render worker: the view the present draws into instead of the surface (null: the surface itself), and then
+  // the last pass from that view to the surface. For a filter of the whole picture.
+  wgpu::TextureView (*finalTarget)(uint32_t width, uint32_t height) = nullptr;
+  void (*finalPass)(const wgpu::CommandEncoder& encoder, const wgpu::TextureView& from,
+                    const wgpu::TextureView& surface) = nullptr;
+};
+void set_present_hook(const PresentHook& hook) noexcept;
+const PresentHook& present_hook() noexcept;
 
 } // namespace aurora::webgpu
