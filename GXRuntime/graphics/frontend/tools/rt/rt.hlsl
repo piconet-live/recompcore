@@ -209,13 +209,15 @@ void main(uint3 id : SV_DispatchThreadID) {
       float cosv = saturate(-dot(N, v));
       float fres = pow(1 - cosv, 5);
       // the surface's own colour: pale paint shows a reflection as dirt, so less of it, softer; dark road shines more than pale road
-      float3 baseCol = (k > 0 || (N.y > 0.2 && d.cls == 0)) ? shade(h, 0).rgb : 0.xxx;
+      float3 baseCol = (k > 0 || (N.y > 0.2 && d.cls == 0) || P.lightGain > 0) ? shade(h, 0).rgb : 0.xxx;
       float base = lum(baseCol);
       float pale = smoothstep(0.45, 0.85, base) * P.bodyCalm;
       float strength;
       if (k > 0) strength = k * (1 - 0.65 * pale) + (1 - k) * fres * (1 - 0.8 * pale);
       else strength = (N.y > 0.2 && d.cls == 0) ? P.roadShine * pow(1 - cosv, 3) * (1 - 0.6 * smoothstep(0.1, 0.5, base)) * (d.highlight != 0 ? 1.0 : 0.75) : 0;
-      if (P.lightGain > 0) light += engine_light(h.pos, N) * P.lightGain;
+      // where the raster is far brighter than this surface, a glow covers it: neither reflection nor light shows through the flame
+      float bare = 1 - smoothstep(0.15, 0.45, lum(raster) - base);
+      if (P.lightGain > 0) light += engine_light(h.pos, N) * P.lightGain * bare;
       if (P.mode == 2) { dbg += strength.xxx; break; }
       if (strength > 0.001) {
         float3 R = reflect(v, N);
@@ -231,8 +233,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         // dim only the surface itself, never a flame or glow the raster drew over it
         float3 under = min(raster, baseCol * 1.2);
         term = strength * (seen - under * P.conserve * (k > 0 ? 1 - 0.6 * pale : 0.5));
-        // where the raster is far brighter than this surface, a glow covers it: a reflection would show through the flame
-        term *= 1 - smoothstep(0.15, 0.45, lum(raster) - base);
+        term *= bare;
       }
       break;
     }
