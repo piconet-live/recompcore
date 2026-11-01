@@ -26,6 +26,8 @@
 #include <ranges>
 #include <variant>
 #include <thread>
+#include <vector>
+#include <cstdlib>
 
 #include <SDL3/SDL_iostream.h>
 #include <absl/container/flat_hash_map.h>
@@ -83,7 +85,7 @@ constexpr size_t BuildPipelinesPerFrame = 5;
 #else
 constexpr size_t BuildPipelinesPerFrame = 1;
 #endif
-static std::thread g_pipelineThread;
+static std::vector<std::thread> g_pipelineThreads;
 static std::atomic_bool g_pipelineThreadEnd = false;
 static std::condition_variable g_pipelineQueueCv;
 static std::condition_variable g_pipelineReadyCv;
@@ -993,18 +995,15 @@ static void pipeline_worker() {
   tracy::SetThreadName("Pipeline compilation thread");
 #endif
 
-  bool hasMore = false;
   bool wantedByDraw = false;
   while (g_hasPipelineThread || g_pipelinesPerFrame < BuildPipelinesPerFrame) {
     PendingPipeline pending;
     {
       std::unique_lock lock{g_pipelineMutex};
       if (g_hasPipelineThread) {
-        if (!hasMore) {
-          g_pipelineQueueCv.wait(lock, [] {
-            return !g_pipelineQueue.empty() || !g_backgroundPipelineQueue.empty() || g_pipelineThreadEnd;
-          });
-        }
+        g_pipelineQueueCv.wait(lock, [] {
+          return !g_pipelineQueue.empty() || !g_backgroundPipelineQueue.empty() || g_pipelineThreadEnd;
+        });
       } else if (g_pipelineQueue.empty() && g_backgroundPipelineQueue.empty()) {
         return;
       }
@@ -1030,7 +1029,6 @@ static void pipeline_worker() {
       std::lock_guard lock{g_pipelineMutex};
       g_pipelines.try_emplace(pending.hash, std::move(result));
       g_pendingPipelines.erase(pending.hash);
-      hasMore = !g_pipelineQueue.empty() || !g_backgroundPipelineQueue.empty();
     }
     if (!g_hasPipelineThread) {
       g_pipelinesPerFrame += std::max(1u, pipelineCount);
@@ -1149,6 +1147,31 @@ PipelineRef find_pipeline(const rmlui::PipelineConfig& config) {
 }
 #endif
 
+void precompile_pipeline(const gx::PipelineConfig& config) {
+  // Ahead of the warmup and behind any draw that is waiting. Remembered for a change of the render target's layout, and
+  // written to the cache only when a draw uses it (find_pipeline).
+  remember_pipeline_config(ShaderType::GX, config, UINT32_MAX, false);
+  const auto scene = scene_render_target_layout();
+  auto offscreen = scene;
+  offscreen.colorAttachmentCount = 1;
+  offscreen.sampleCount = 1;
+  detail::finalize_render_target_layout(offscreen);
+  resolve_pipeline(ShaderType::GX, config, scene, PipelinePriority::Normal);
+  if (offscreen.key != scene.key) {
+    resolve_pipeline(ShaderType::GX, config, offscreen, PipelinePriority::Normal);
+  }
+}
+
+size_t pipelines_waiting() {
+  std::lock_guard lock{g_pipelineMutex};
+  return g_pendingPipelines.size();
+}
+
+size_t pipelines_compiled() {
+  std::lock_guard lock{g_pipelineMutex};
+  return g_pipelines.size();
+}
+
 void rebuild_pipeline_cache() {
   ZoneScoped;
   const auto scene = scene_render_target_layout();
@@ -1189,7 +1212,14 @@ void initialize_pipeline_cache() {
     g_hasPipelineThread = false;
   } else {
     g_hasPipelineThread = true;
-    g_pipelineThread = std::thread(pipeline_worker);
+    unsigned threads = std::max(1u, std::min(8u, std::thread::hardware_concurrency() / 2));
+    if (const char* v = std::getenv("AURORA_PIPELINE_THREADS"); v != nullptr && std::atoi(v) > 0) {
+      threads = static_cast<unsigned>(std::atoi(v));
+    }
+    std::fprintf(stderr, "[pipelines] %u compile threads\n", threads);
+    for (unsigned i = 0; i < threads; ++i) {
+      g_pipelineThreads.emplace_back(pipeline_worker);
+    }
   }
 
   ms_since_start();
@@ -1210,7 +1240,10 @@ void shutdown_pipeline_cache() {
     g_pipelineThreadEnd = true;
     g_pipelineQueueCv.notify_all();
     g_pipelineReadyCv.notify_all();
-    g_pipelineThread.join();
+    for (auto& thread : g_pipelineThreads) {
+      thread.join();
+    }
+    g_pipelineThreads.clear();
   }
   g_hasPipelineThread = false;
 
