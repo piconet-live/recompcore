@@ -195,7 +195,27 @@ struct Frame {
   std::uint64_t copy = 0;
   std::vector<std::uint8_t> bytes;
   Clock::time_point in;
+  float between = 0;  // a picture between two steps (aurora_present_frame_between): its fraction of a field
 };
+
+// The run ahead's pictures between two steps: each a fraction of a field after the true picture before it, or left out.
+constexpr double kFieldMs = 1000.0 * 1001.0 / 60000.0;
+constexpr double kLateMs = 2.0;  // past its time by more than this, a picture between is not drawn at all
+
+void wait_until(Clock::time_point due) {
+#if defined(_WIN32)
+  static HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+  const auto left = due - Clock::now() - std::chrono::microseconds(600);
+  if (timer != nullptr && left > std::chrono::microseconds(100)) {
+    LARGE_INTEGER when;
+    when.QuadPart = -std::chrono::duration_cast<std::chrono::nanoseconds>(left).count() / 100;
+    if (SetWaitableTimer(timer, &when, 0, nullptr, nullptr, FALSE))
+      WaitForSingleObject(timer, 100);
+  }
+#endif
+  while (Clock::now() < due)
+    std::this_thread::yield();
+}
 
 struct Picture {
   std::vector<std::uint8_t> rgba;
@@ -218,6 +238,9 @@ struct State {
   static constexpr std::size_t most_bytes_behind = 256u << 20;
   static constexpr std::size_t most_bytes_behind_window = 1024u << 20;
   std::size_t bytes_waiting = 0;  // (under lock)
+  float next_between = 0;         // the GPU thread's: aurora_present_frame_between's, for the next frame
+  std::uint64_t between_drawn = 0, between_late = 0, between_left_out = 0;  // Aurora's thread's
+  double between_late_ms = 0;
   Clock::time_point t0;
 
   // the GPU thread's frame being built (its own; moved into the queue at each copy)
@@ -527,8 +550,10 @@ void run() {
   aurora::gfx::timewarp::start();
   FILE* log = s->log_path.empty() ? nullptr : std::fopen(s->log_path.c_str(), "w");
   if (log)
-    std::fprintf(log, "copy,in_us,start_us,fed_us,presented_us,picture_us,waiting,bytes\n");
+    std::fprintf(log, "copy,in_us,start_us,fed_us,presented_us,picture_us,waiting,bytes,between\n");
 
+  Clock::time_point last_true{};
+  double feed_mean_ms = 3.0;  // what a frame's decoding has cost lately
   Picture back;
   // A readback asked for and not yet taken, and the frame it is of. Aurora never waits for its pixels while a frame
   // waits behind it: a slow GPU copy (100+ ms seen with a busy GPU) would run it into the stop for being behind.
@@ -545,6 +570,7 @@ void run() {
   for (;;) {
     Frame f;
     std::size_t waiting = 0;
+    bool true_waits = false;
     {
       std::unique_lock g{s->lock};
       s->wake.wait(g, [] { return s->quit || !s->queue.empty(); });
@@ -554,6 +580,8 @@ void run() {
       s->queue.pop_front();
       s->bytes_waiting -= f.bytes.size();
       waiting = s->queue.size();
+      for (const Frame& q : s->queue)
+        true_waits = true_waits || q.between <= 0;
       // the tight bound from when the frames that waited for the start are gone: while they drain, a new frame found
       // 4 waiting and stopped Aurora for the run in its first half second (course 37, a window)
       if (waiting == 0)
@@ -589,7 +617,17 @@ void run() {
     }
     s_test_frame = &f.bytes;
     s_test_frame_copy = f.copy;
-    const bool not_drawn = s->window != nullptr && waiting >= most_waiting_to_draw && !is_shot(f.copy);
+    // A picture between that cannot be on time is left out: the true one never waits for it. (Decoded all the same: a
+    // frame missed would leave Aurora's state wrong.)
+    const bool between = f.between > 0;
+    const Clock::time_point due =
+        last_true + std::chrono::microseconds(static_cast<long long>(f.between * kFieldMs * 1000.0));
+    const bool too_late = between && !is_shot(f.copy) &&
+                          (last_true == Clock::time_point{} || true_waits ||
+                           ms(start - due) + feed_mean_ms > kLateMs);
+    if (too_late)
+      ++s->between_left_out;
+    const bool not_drawn = (s->window != nullptr && waiting >= most_waiting_to_draw && !is_shot(f.copy)) || too_late;
     aurora::gx::fifo::set_drawing_off(not_drawn);
     for (std::size_t off = 0; off < f.bytes.size(); off += 32768) {
       const std::size_t n = std::min<std::size_t>(32768, f.bytes.size() - off);
@@ -601,6 +639,19 @@ void run() {
       continue;
     }
     const auto fed = Clock::now();
+    feed_mean_ms += (ms(fed - start) - feed_mean_ms) / 8.0;
+    if (between) {
+      const double late = ms(fed - due);
+      if (late > 0) {
+        ++s->between_late;
+        s->between_late_ms += late;
+      } else {
+        wait_until(due);
+      }
+      ++s->between_drawn;
+    } else {
+      last_true = Clock::now();
+    }
     if (test_slow_ms != 0)
       std::this_thread::sleep_for(std::chrono::milliseconds(test_slow_ms));
     // a picture when this is the newest frame (none waits behind it) or a test picture is wanted of it (which must be
@@ -654,9 +705,9 @@ void run() {
       }
     }
     if (log)
-      std::fprintf(log, "%llu,%.0f,%.0f,%.0f,%.0f,%.0f,%zu,%zu\n", static_cast<unsigned long long>(f.copy),
+      std::fprintf(log, "%llu,%.0f,%.0f,%.0f,%.0f,%.0f,%zu,%zu,%.3f\n", static_cast<unsigned long long>(f.copy),
                    us_since(f.in), us_since(start), us_since(fed), us_since(presented),
-                   got ? us_since(pictured) : -1.0, waiting, f.bytes.size());
+                   got ? us_since(pictured) : -1.0, waiting, f.bytes.size(), f.between);
     {
       std::lock_guard g{s->lock};
       ++s->stats.frames_drawn;
@@ -678,6 +729,11 @@ void run() {
   }
   if (log)
     std::fclose(log);
+  if (s->between_drawn != 0 || s->between_left_out != 0)
+    std::fprintf(stderr, "[aurora-present] pictures between two steps: %llu drawn (%llu of them late, %.2f ms on average), %llu left out\n",
+                 static_cast<unsigned long long>(s->between_drawn), static_cast<unsigned long long>(s->between_late),
+                 s->between_late ? s->between_late_ms / static_cast<double>(s->between_late) : 0.0,
+                 static_cast<unsigned long long>(s->between_left_out));
   if (s->frames_not_drawn != 0)
     std::fprintf(stderr, "[aurora-present] %llu frames not drawn, to catch up\n",
                  static_cast<unsigned long long>(s->frames_not_drawn));
@@ -722,12 +778,20 @@ void aurora_present_write(const uint8_t* bytes, uint32_t size) {
   s->building.insert(s->building.end(), bytes, bytes + size);
 }
 
+void aurora_present_frame_between(uint64_t copy, float fraction) {
+  (void)copy;
+  if (s != nullptr)
+    s->next_between = fraction;
+}
+
 void aurora_present_frame(uint64_t copy) {
   if (s == nullptr || s->stopped.load(std::memory_order_relaxed))
     return;
   Frame f;
   f.copy = copy;
   f.in = Clock::now();
+  f.between = s->next_between;
+  s->next_between = 0;
   f.bytes = std::move(s->building);
   s->building = {};
   s->building.reserve(std::max<std::size_t>(f.bytes.size() + f.bytes.size() / 4, 64u * 1024u));
