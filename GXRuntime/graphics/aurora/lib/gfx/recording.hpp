@@ -19,6 +19,7 @@ void begin_recording(FramePacket& packet, size_t frameSlot);
 RecordedFrame end_recording();
 void shutdown_recording();
 void increment_merged_draw_count() noexcept;
+uint32_t current_pass_index() noexcept;
 
 namespace testing {
 struct OffscreenCacheStats {

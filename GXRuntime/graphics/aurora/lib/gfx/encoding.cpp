@@ -448,6 +448,23 @@ void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op)
     break;
   }
 }
+// The same again for a picture between: nothing uploaded, nothing read back; a ray tracing task's job is gone
+void encode_op_again(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op) {
+  switch (op.type) {
+  case FrameOpType::RenderPass:
+    if (op.renderPass != nullptr) {
+      render(cmd, frame, *op.renderPass, op.index);
+    }
+    break;
+  case FrameOpType::TextureCopy:
+    if (op.textureCopy != nullptr) {
+      cmd.CopyTextureToTexture(&op.textureCopy->src, &op.textureCopy->dst, &op.textureCopy->size);
+    }
+    break;
+  default:
+    break;
+  }
+}
 } // namespace detail
 
 void bind_pipeline(const wgpu::RenderPipeline& pipeline, const wgpu::RenderPassEncoder& pass) {

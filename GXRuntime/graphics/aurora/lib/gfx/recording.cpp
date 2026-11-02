@@ -697,6 +697,8 @@ bool is_offscreen_cached(uint32_t width, uint32_t height, wgpu::TextureFormat co
 
 } // namespace testing
 
+uint32_t current_pass_index() noexcept { return g_recorder.currentRenderPass; }
+
 void increment_merged_draw_count() noexcept {
   if (g_recorder.active()) {
     ++g_recorder.mergedDrawCallCount;

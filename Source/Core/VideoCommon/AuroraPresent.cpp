@@ -116,6 +116,8 @@ struct Library
   void (*write)(const u8*, u32) = nullptr;
   void (*frame)(u64) = nullptr;
   void (*frame_between)(u64, float) = nullptr;
+  void (*frame_at)(u64) = nullptr;
+  void (*redraw)(const void*) = nullptr;
   int (*take)(LibPicture*) = nullptr;
   void (*stats)(LibStats*) = nullptr;
   void (*stop)() = nullptr;
@@ -169,6 +171,7 @@ struct Between
 std::mutex s_between_lock;
 std::deque<Between> s_between;
 float s_cut_fraction = 0;
+u64 s_cut_position = 0;
 
 #ifdef _WIN32
 HMODULE s_module = nullptr;
@@ -209,6 +212,8 @@ bool Load(const std::string& path)
     return false;
   }
   Bind(&s_lib.frame_between, "aurora_present_frame_between");
+  Bind(&s_lib.frame_at, "aurora_present_frame_at");
+  Bind(&s_lib.redraw, "aurora_present_redraw");
   return true;
 #else
   s_load_problem = "Aurora is only loaded on Windows so far";
@@ -372,6 +377,12 @@ void Configure(const Settings& settings)
   s_on = true;
 }
 
+void Redraw(const RedrawRequest* request)
+{
+  if (s_started && s_lib.redraw)
+    s_lib.redraw(request);
+}
+
 void NoteBetween(u64 position, float fraction)
 {
   if (!s_started)
@@ -422,6 +433,7 @@ void OnXFBCopy()
   ++s_copies;
   s_cut_copy = s_copies;
   s_cut = true;
+  s_cut_position = FrameRedraw::ReadPosition();
   {
     std::lock_guard guard(s_between_lock);
     s_cut_fraction = 0;
@@ -526,6 +538,8 @@ void OnCommandEnd(const u8* data, u32 size)
   const size_t frame = s_pending.size() - tail;
   if (frame)
     s_lib.write(s_pending.data(), static_cast<u32>(frame));
+  if (s_lib.frame_at)
+    s_lib.frame_at(s_cut_position);
   if (s_cut_fraction > 0 && s_lib.frame_between)
     s_lib.frame_between(s_cut_copy, s_cut_fraction);
   s_lib.frame(s_cut_copy);

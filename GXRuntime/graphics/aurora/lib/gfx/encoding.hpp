@@ -9,6 +9,7 @@ void bind_pipeline(const wgpu::RenderPipeline& pipeline, const wgpu::RenderPassE
 
 namespace detail {
 void encode_op(wgpu::CommandEncoder& encoder, FramePacket& frame, const FrameOp& op);
+void encode_op_again(wgpu::CommandEncoder& encoder, FramePacket& frame, const FrameOp& op);
 }
 
 } // namespace aurora::gfx

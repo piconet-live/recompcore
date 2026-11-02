@@ -10,6 +10,8 @@
 #include "tex_palette_conv.hpp"
 #include "texture_replacement.hpp"
 #include "../gx/gx.hpp"
+#include "../gx/redraw.hpp"
+#include "encoding.hpp"
 #ifdef AURORA_ENABLE_RMLUI
 #include "../rmlui/pipeline.hpp"
 #endif
@@ -664,6 +666,57 @@ bool begin_frame() {
   return true;
 }
 
+namespace {
+// AURORA_REDRAW: the frame last ended, kept for the pictures between (the render worker's)
+FramePacket g_held;
+std::vector<uint8_t> g_heldUniforms, g_patched;
+EndFrameCallback g_heldCallback;
+std::vector<bool> g_heldOffscreen;
+
+void note_held_passes() {
+  // A pass into another size than the picture's, or ending in a copy smaller than half of it: an offscreen pass
+  uint32_t width = 0, height = 0;
+  for (const auto& pass : g_held.renderPasses) {
+    if (pass.colorAttachmentCount != 0) {
+      width = std::max(width, pass.colorAttachments[SceneColorAttachmentIndex].size.width);
+      height = std::max(height, pass.colorAttachments[SceneColorAttachmentIndex].size.height);
+    }
+  }
+  g_heldOffscreen.clear();
+  for (const auto& pass : g_held.renderPasses) {
+    bool off = false;
+    if (pass.colorAttachmentCount != 0) {
+      const auto& size = pass.colorAttachments[SceneColorAttachmentIndex].size;
+      off = size.width != width || size.height != height;
+    }
+    if (pass.resolveTarget && pass.resolveRect.width * pass.resolveRect.height * 2 < static_cast<int64_t>(width) * height) {
+      off = true;
+    }
+    g_heldOffscreen.push_back(off);
+  }
+}
+} // namespace
+
+bool redraw_pass_offscreen(uint32_t pass) noexcept { return pass < g_heldOffscreen.size() && g_heldOffscreen[pass]; }
+
+bool redraw_held(const std::function<void(uint8_t* uniforms, size_t bytes)>& patch) {
+  if (!g_heldCallback || g_held.ops.empty()) {
+    return false;
+  }
+  g_patched = g_heldUniforms;
+  patch(g_patched.data(), g_patched.size());
+  constexpr wgpu::CommandEncoderDescriptor EncoderDescriptor{.label = "Picture between encoder"};
+  auto encoder = g_device.CreateCommandEncoder(&EncoderDescriptor);
+  webgpu::gpu_prof::frame_begin(encoder);
+  g_queue.WriteBuffer(g_resources.uniformBuffer, 0, g_patched.data(), AURORA_ALIGN(g_patched.size(), 4));
+  for (const auto& op : g_held.ops) {
+    encode_op_again(encoder, g_held, op);
+  }
+  g_heldCallback(encoder, {});
+  process_events();
+  return true;
+}
+
 void end_frame(EndFrameCallback callback) {
   ZoneScoped;
   if (g_cpuFrameStart.time_since_epoch().count() != 0) {
@@ -680,13 +733,26 @@ void end_frame(EndFrameCallback callback) {
   ++g_frameIndex;
 
   const size_t stagingSlot = frame.stagingBuffer;
-  render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, callback = std::move(callback)]() mutable {
+  gx::redraw::Notes notes;
+  if (gx::redraw::g_on) {
+    notes = gx::redraw::take_notes();
+  }
+  render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, callback = std::move(callback), notes = std::move(notes)]() mutable {
     auto& packet = g_framePackets[frameSlot];
+    if (gx::redraw::g_on) {
+      g_heldUniforms.assign(packet.uniforms.data(), packet.uniforms.data() + packet.uniforms.size());
+    }
     g_stagingBuffers[stagingSlot].Unmap();
     g_mappingStates[stagingSlot].store(BufferMapState::Unmapped, std::memory_order_release);
     auto encoder = std::move(packet.encoder);
     const auto stats = packet.stats;
     auto afterSubmitCallbacks = std::move(packet.afterSubmitCallbacks);
+    if (gx::redraw::g_on) {
+      g_held = std::move(packet);
+      g_heldCallback = callback;
+      gx::redraw::hold(std::move(notes));
+      note_held_passes();
+    }
     packet = {};
     g_resources.stats.drawCallCount = stats.drawCallCount;
     g_resources.stats.mergedDrawCallCount = stats.mergedDrawCallCount;

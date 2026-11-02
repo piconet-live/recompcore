@@ -35,6 +35,10 @@ void initialize();
 void shutdown();
 bool begin_frame();
 void end_frame(EndFrameCallback callback);
+// AURORA_REDRAW: the render worker, one more picture of the frame last ended: its uniforms given to `patch`, its passes encoded again,
+// presented as it was. False when no frame is held.
+bool redraw_held(const std::function<void(uint8_t* uniforms, size_t bytes)>& patch);
+bool redraw_pass_offscreen(uint32_t pass) noexcept;
 uint32_t current_frame() noexcept;
 void gpu_synchronize();
 void after_present() noexcept;
