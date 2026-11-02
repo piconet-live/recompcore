@@ -127,6 +127,8 @@ void FileLogger::StartWholeDisc(const DiscIO::Volume& volume, const DiscIO::Part
       }
     };
     walk(file_system->GetRoot());
+    if (!m_whole_disc_stop)
+      VideoCommon::AuroraPresent::ModelFile({}, nullptr, 0, true);  // the walk's end
   });
 }
 

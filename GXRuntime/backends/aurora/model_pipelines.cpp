@@ -69,7 +69,10 @@ std::deque<File> s_files, s_disc_files;
 uint64_t s_disc_bytes = 0;
 // Tier: First a new shader, plain form, the scene's target. Same: more pipelines of known shaders. PostSmall: post stages of
 // models in the 16-bit vertex form (machines are; only an order, a guess that costs nothing if wrong). Rest: all else.
-enum Tier { First, Same, PostSmall, Rest, Tiers };
+// DiscFirst: a new shader from the disc walk, not from a file the game reads.
+enum Tier { First, Same, PostSmall, DiscFirst, Rest, Tiers };
+bool s_from_disc = false;  // the file being read comes from the disc walk
+uint64_t s_disc_read = 0;
 struct Form {
   PipelineConfig config;
   bool scene, other;
@@ -298,7 +301,7 @@ void plan(const PipelineConfig& base, uint8_t fog, int post, bool small) {
   shader.back() = c.dstAlpha == UINT32_MAX;
   const bool first = s_shaders.insert(std::move(shader)).second;
   const Tier tier = post != 0 ? (small && c.dstAlpha != UINT32_MAX ? PostSmall : Rest)
-                    : first && c.dstAlpha != UINT32_MAX ? First
+                    : first && c.dstAlpha != UINT32_MAX ? (s_from_disc ? DiscFirst : First)
                     : first || c.dstAlpha == 255 ? Same
                                                  : Rest;
   s_tiers[tier].push_back(Form{c, true, false});
@@ -461,6 +464,10 @@ bool tiers_empty() {
   return std::all_of(std::begin(s_tiers), std::end(s_tiers), [](const auto& t) { return t.empty(); });
 }
 
+bool near_tiers_empty() {
+  return s_tiers[First].empty() && s_tiers[Same].empty() && s_tiers[PostSmall].empty() && s_tiers[DiscFirst].empty();
+}
+
 // The nearest tier's next few; false when none is left
 bool ask_next(size_t count) {
   for (auto& tier : s_tiers) {
@@ -489,7 +496,7 @@ void run() {
     return v != nullptr && std::atoi(v) > 0 ? unsigned(std::atoi(v)) : 3u;
   }();
   constexpr size_t Short = 32;  // the compile queue counts as short: later work never stands in front of a file being read
-  bool told = true, told_first = true;
+  bool told = true, told_first = true, walk_told = false;
   for (;;) {
     File f;
     bool have = false;
@@ -514,21 +521,38 @@ void run() {
           s_wake.wait_for(g, std::chrono::milliseconds(20), [] { return s_quit || !s_files.empty(); });
           continue;
         }
+        if (!s_disc_files.empty() && near_tiers_empty()) {
+          f = std::move(s_disc_files.front());
+          s_disc_files.pop_front();
+          s_disc_bytes -= f.bytes.size();
+          g.unlock();
+          s_wake.notify_all();  // (the disc walk waits for room)
+          if (f.path.empty()) {  // (the walk's end)
+            std::fprintf(stderr, "[pipelines] whole disc read: %llu files, %zu shaders asked, %.0f ms after the first file\n",
+                         (unsigned long long)s_disc_read, s_shaders.size(),
+                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+            walk_told = true;
+          } else {
+            s_from_disc = true;
+            read_file(f);
+            s_from_disc = false;
+            ++s_disc_read;
+          }
+          told = told_first = false;
+          continue;
+        }
+        if (walk_told && s_tiers[DiscFirst].empty() && waiting == 0) {
+          walk_told = false;
+          std::fprintf(stderr, "[pipelines] whole disc: every shader made, %.0f ms after the first file\n",
+                       std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+        }
         if (!tiers_empty()) {
           g.unlock();
           ask_next(Short);
           told = false;
           continue;
         }
-        if (!s_disc_files.empty()) {
-          f = std::move(s_disc_files.front());
-          s_disc_files.pop_front();
-          s_disc_bytes -= f.bytes.size();
-          have = true;
-          g.unlock();
-          s_wake.notify_all();  // (the disc walk waits for room)
-          g.lock();
-        } else {
+        {
           if (!told) {
             told = true;
             std::fprintf(stderr, "[pipelines] models: %llu meshes (%llu left out), %llu forms, %zu pipelines compiled, nothing waiting, %.0f ms after the first file\n",
