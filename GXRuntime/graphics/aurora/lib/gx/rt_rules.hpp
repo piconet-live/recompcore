@@ -173,6 +173,7 @@ struct Frame {
   std::vector<std::pair<std::uint32_t, std::uint32_t>> spans;  // the draw order's first vertex and count behind verts
   std::vector<Vertex> verts;        // solid surfaces first, then what light passes through (see-through, glows), then the sky
   std::uint32_t seeFirstVertex = 0, layerFirstVertex = 0, skyFirstVertex = 0;
+  std::uint32_t primaryFirstVertex = 0;  // AURORA_RT_SCENE_STEADY: static placements' draws for primary rays alone, after the sky
   std::vector<GpuDraw> draws;
   std::vector<StageRec> stages;
   std::vector<LightPick> picks, merged;
@@ -288,7 +289,7 @@ inline void build_glows(const DrawRec* draws, std::uint32_t count, const Vertex*
 // The main view is the perspective projection with the most triangles. Sky: the largest see-through shells around the view,
 // by size against the largest in the frame, with no table of courses.
 inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex* verts, const Tuning& t, Frame& out) {
-  out.verts.clear(), out.prevPos.clear(), out.spans.clear(), out.draws.clear(), out.stages.clear(), out.main = nullptr, out.machineDraws = out.reflective = 0, out.seeFirstVertex = out.layerFirstVertex = out.skyFirstVertex = 0;
+  out.verts.clear(), out.prevPos.clear(), out.spans.clear(), out.draws.clear(), out.stages.clear(), out.main = nullptr, out.machineDraws = out.reflective = 0, out.seeFirstVertex = out.layerFirstVertex = out.skyFirstVertex = out.primaryFirstVertex = 0;
   const auto key = [](const DrawRec& d) { return std::array<int, 2>{static_cast<int>(d.proj[0] * 1000), static_cast<int>(d.proj[5] * 1000)}; };
   std::array<int, 2> best{};
   {
@@ -418,18 +419,23 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
   build_glows(draws, count, verts, t, extent, sky, out);
 }
 // The triangles the rays get: solid, what light passes through, blended layers writing no depth (only with layersApart, AURORA_RT_LAYER_PASS; else they stay
-// in the first two), sky. drop: a byte a draw, 1 where the static track already holds it (may be null).
+// in the first two), sky, then what primary rays alone see. drop: a byte a draw, 1 where the static track already holds it, 2 where a static placement's
+// draw is for primary rays alone (AURORA_RT_SCENE_STEADY; a layer or the sky stays in its own) (may be null).
 inline void assemble_frame(const DrawRec* draws, std::uint32_t count, const Vertex* verts, const std::uint8_t* drop, Frame& out, bool layersApart = false) {
-  for (int pass = 0; pass < 4; ++pass) {
+  for (int pass = 0; pass < 5; ++pass) {
     if (pass == 1)
       out.seeFirstVertex = static_cast<std::uint32_t>(out.verts.size());
     if (pass == 2)
       out.layerFirstVertex = static_cast<std::uint32_t>(out.verts.size());
     if (pass == 3)
       out.skyFirstVertex = static_cast<std::uint32_t>(out.verts.size());
+    if (pass == 4)
+      out.primaryFirstVertex = static_cast<std::uint32_t>(out.verts.size());
     for (std::uint32_t i = 0; i < count; ++i) {
-      const int group = out.is_sky(i) ? 3 : layersApart && (out.draws[i].highlight & 8) != 0 ? 2 : out.draws[i].cls == 0 ? 0 : 1;
-      if (out.extent[i] <= 0.f || group != pass || (drop != nullptr && drop[i] != 0))
+      int group = out.is_sky(i) ? 3 : layersApart && (out.draws[i].highlight & 8) != 0 ? 2 : out.draws[i].cls == 0 ? 0 : 1;
+      if (drop != nullptr && drop[i] == 2 && group < 2)
+        group = 4;
+      if (out.extent[i] <= 0.f || group != pass || (drop != nullptr && drop[i] == 1))
         continue;
       out.verts.insert(out.verts.end(), verts + draws[i].firstVertex, verts + draws[i].firstVertex + draws[i].vertices);
       out.spans.emplace_back(draws[i].firstVertex, draws[i].vertices);

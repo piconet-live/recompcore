@@ -123,6 +123,11 @@ struct Scene {
 bool on() noexcept;
 bool static_on() noexcept;  // AURORA_RT_SCENE_STATIC=1, with the scene
 bool merge_on() noexcept;   // AURORA_RT_SCENE_MERGE=1, with the static track
+// AURORA_RT_SCENE_STEADY=1 (off by default), with the merged track: what light, sun and reflection rays see of the static track never depends on
+// whether the game drew a placement this frame. They see the merged world alone, every placement at its largest level, each mesh by the material
+// first learned of it (its list's draw; for a list that stays as draws, its first draw's colour and class) or else the file's own. The frame's
+// draws of static placements (lists still drawn, draws mid-fade, other levels) go to primary rays alone. Moving things stay each frame's draws.
+bool steady_on() noexcept;
 // From the reader, on its thread, for files the game is reading (never the disc walk's). Bytes unpacked.
 void add_course(const std::vector<std::uint8_t>& whole);
 void add_file(const char* path, const std::vector<std::uint8_t>& whole);
@@ -165,6 +170,9 @@ struct Frame {
   // for the report
   std::uint32_t draws = 0, matched = 0, moved = 0, drawnCount = 0, partial = 0;
   double matchMs = 0;
+  // AURORA_RT_SCENE_TOGGLES=1, a line a frame: placements drawn now and not the frame before, the other way, placements drawn at another level
+  // than the scene holds, and the frame's draws of static placements kept for the rays (steady: for primary rays alone)
+  std::uint32_t turnedOn = 0, turnedOff = 0, lowLevel = 0, staticDraws = 0;
 };
 // The rules thread, once for each frame in the frame's order or not: the camera, what was drawn. proj0, proj5: the main view's.
 void match(const DrawRec* draws, std::uint32_t count, const Vertex* verts, const float (*texMeans)[4], std::uint32_t texCount,

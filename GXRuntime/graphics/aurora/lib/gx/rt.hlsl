@@ -45,7 +45,7 @@ struct Params {
   float wet;
   uint lightRays;    // the surface's light from rays, this many a pixel; 0 off
   float skyGain, lightReach, bounce, visFloor;
-  uint stableShine;  // bit 0 stable shine, bit 1 Before holds a picture, bit 2 AURORA_RT_PAIR_GAP, bit 3 AURORA_RT_LAYER_PASS
+  uint stableShine;  // bit 0 stable shine, bit 1 Before holds a picture, bit 2 AURORA_RT_PAIR_GAP, bit 3 AURORA_RT_LAYER_PASS, bit 4 AURORA_RT_SCENE_STEADY
 };
 struct Light { float3 pos; float3 colour; float reach; };
 struct GlowLight { float3 pos; float area; float3 colour; float radius; };
@@ -60,12 +60,20 @@ static const uint MaskWorldDrawn = 32, MaskWorldDrawnSee = 64, WorldDrawn = 0x40
 static const uint MaskPrimary = MaskSeen | MaskWorldDrawn | MaskWorldDrawnSee;
 // AURORA_RT_LAYER_PASS=1: blended layers that write no depth, a structure of their own that no other mask takes in (rt_rules.hpp assemble_frame)
 static const uint MaskLayer = 128;
+// AURORA_RT_SCENE_STEADY=1 (bit 4 of stableShine): what light, sun and reflection rays see of the static track never hangs on whether the game drew a
+// placement this frame. A drawn placement's own instances (32) then take both its parts, and 64 holds the frame's draws of static placements (lists
+// still drawn, draws mid-fade, other levels): primary rays alone see them, as they see the game's picture. All other rays meet the merged world, never
+// passed for being drawn (its flags stay 0), each mesh by the material first learned of it or the file's own.
+static const uint MaskStaticDraws = 64;
 static const uint NoDraw = 0xFFFFFFFFu;
 struct WorldMesh { float4 colour; uint cls; uint draw; uint first; uint flags; };
 StructuredBuffer<WorldMesh> World : register(t11);
 struct WorldAttr { float3 pos; uint nrm; uint ras; float2 uv[2]; };
 StructuredBuffer<WorldAttr> WorldAttrs : register(t12);
 ConstantBuffer<Params> P : register(b0);
+bool steady_on() { return (P.stableShine & 16) != 0; }
+// the look for draws around a drawn placement's hit (AURORA_RT_PAIR_GAP): the frame's draws, wherever they are kept
+uint gap_mask() { return steady_on() ? MaskSeen | MaskStaticDraws : MaskSeen; }
 RaytracingAccelerationStructure Scene : register(t0);
 StructuredBuffer<Vertex> Verts : register(t1);
 StructuredBuffer<Draw> Draws : register(t2);
@@ -579,7 +587,7 @@ void main(uint3 id : SV_DispatchThreadID) {
       const float gapT = gapAt, gapR = PairGapLeast + gapAt * PairGapShare;
       gapAt = -1;
       RayDesc ray; ray.Origin = 0; ray.Direction = v; ray.TMin = gapLook ? max(gapT - gapR, 0.01) : tmin; ray.TMax = gapLook ? gapT + gapR : 100000;
-      q.TraceRayInline(Scene, RAY_FLAG_NONE, gapLook ? MaskSeen : MaskPrimary, ray);
+      q.TraceRayInline(Scene, RAY_FLAG_NONE, gapLook ? gap_mask() : MaskPrimary, ray);
       q.Proceed();
       if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) { if (gapLook) continue; break; }
       float t = q.CommittedRayT();
@@ -750,7 +758,7 @@ void light_pass(uint3 id : SV_DispatchThreadID) {
     const float gapT = gapAt, gapR = PairGapLeast + gapAt * PairGapShare;
     gapAt = -1;
     RayDesc ray; ray.Origin = 0; ray.Direction = v; ray.TMin = gapLook ? max(gapT - gapR, 0.01) : tmin; ray.TMax = gapLook ? gapT + gapR : 100000;
-    q.TraceRayInline(Scene, RAY_FLAG_NONE, gapLook ? MaskSeen : MaskPrimary, ray);
+    q.TraceRayInline(Scene, RAY_FLAG_NONE, gapLook ? gap_mask() : MaskPrimary, ray);
     q.Proceed();
     if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) { if (gapLook) continue; break; }
     float t = q.CommittedRayT();

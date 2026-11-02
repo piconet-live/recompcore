@@ -206,10 +206,12 @@ void world_instances(Slot& s, Job& job, std::vector<D3D12_RAYTRACING_INSTANCE_DE
       inst.push_back(d);
     };
     const bool merged = g.worldMergedOn[0] || g.worldMergedOn[1];
+    // AURORA_RT_SCENE_STEADY: a drawn placement's see-through part by mask 32 too (only primary rays take 32 and 64, both alike); 64 then holds the static draws kept for primary rays
+    const u32 seeMask = merged ? (scene::steady_on() ? 32 : 64) : 16 | 64;
     for (const scene::DrawnPair& q : w.pairs) {
       const scene::ModelBlas& b = sc.modelBlas[q.model];
       put(b.solid, q.m, merged ? 32 : 8 | 32, 0x400000u);
-      put(b.see, q.m, merged ? 64 : 16 | 64, 0x400000u);
+      put(b.see, q.m, seeMask, 0x400000u);
     }
     if (merged) {
       // What light and reflections see: the whole track, placed by the camera. A hit tells its placed mesh by the geometry; primary rays still meet only the pairs above, the game's level and matrix.

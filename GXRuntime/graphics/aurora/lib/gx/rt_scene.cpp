@@ -745,6 +745,13 @@ bool merge_on() noexcept {
   }();
   return v;
 }
+bool steady_on() noexcept {
+  static const bool v = [] {
+    const char* e = std::getenv("AURORA_RT_SCENE_STEADY");
+    return e != nullptr && e[0] == '1' && merge_on();
+  }();
+  return v;
+}
 void add_course(const std::vector<u8>& whole) {
   if (!on())
     return;
@@ -1183,6 +1190,23 @@ bool observe(Scene& sc, ListInfo& L, u32 i, const DrawRec& d, const Vertex* vert
   const GpuDraw& g = fr.draws[i];
   const auto keep = [&](u32& why) {
     ++why;
+    // AURORA_RT_SCENE_STEADY: a list that stays as draws from its first sight gives its meshes, once, the colour and class of that first draw
+    // (sky: rays pass it, as every ray passes the frame's sky), so the rays' world copy is that material whether the game draws it or not
+    if (steady_on() && L.seen == 0) {
+      float colour[4];
+      bool have = false;
+      for (const ListOcc& o : L.occ) {
+        if (sc.meshMaterial[o.mesh] != None || sc.learned[o.mesh] != 0)
+          continue;
+        if (!have)
+          draw_colour(d, verts, texMeans, texCount, colour), have = true;
+        sc.learned[o.mesh] = 1;
+        for (int a = 0; a < 4; ++a)
+          sc.meshes[o.mesh].colour[a] = std::clamp(colour[a], 0.f, 2.f);
+        if (sc.meshes[o.mesh].cls != 3)
+          sc.meshes[o.mesh].cls = fr.is_sky(i) ? 3 : g.cls;
+      }
+    }
     keep_list(sc, L);
     return false;
   };
@@ -1299,6 +1323,7 @@ void match_static(const DrawRec* draws, u32 count, const Vertex* verts, const fl
   out.known = false;
   out.fogDraw = None;
   out.draws = out.matched = out.moved = out.drawnCount = out.partial = 0;
+  out.turnedOn = out.turnedOff = out.lowLevel = out.staticDraws = 0;
   out.skipped = 0;
   out.drop.assign(count, 0);
   out.pairs.clear();
@@ -1350,14 +1375,29 @@ void match_static(const DrawRec* draws, u32 count, const Vertex* verts, const fl
         ++out.matched;
       else
         ++out.moved;
+      if (found && out.drop[i] == 0) {
+        ++out.staticDraws;
+        // AURORA_RT_SCENE_STEADY: a static placement's draw still in the rays is for primary rays alone (assemble_frame); the world copy stands for it in all others
+        if (steady_on())
+          out.drop[i] = 2;
+      }
     }
     std::sort(out.pairs.begin(), out.pairs.end(), [](const DrawnPair& a, const DrawnPair& b) { return a.placed != b.placed ? a.placed < b.placed : a.model < b.model; });
     out.pairs.erase(std::unique(out.pairs.begin(), out.pairs.end(), [](const DrawnPair& a, const DrawnPair& b) { return a.placed == b.placed && a.model == b.model; }), out.pairs.end());
-    for (const DrawnPair& p : out.pairs)
+    for (const DrawnPair& p : out.pairs) {
       if (!out.drawn[p.placed]) {
         out.drawn[p.placed] = 1;
         ++out.drawnCount;
       }
+      if (p.model != sc.placed[p.placed].top)
+        ++out.lowLevel;
+    }
+    // for AURORA_RT_SCENE_TOGGLES: against the last frame the rules saw
+    static std::vector<u8> last;
+    if (last.size() == out.drawn.size())
+      for (size_t k = 0; k < last.size(); ++k)
+        out.turnedOn += out.drawn[k] && !last[k] ? 1 : 0, out.turnedOff += !out.drawn[k] && last[k] ? 1 : 0;
+    last = out.drawn;
     const u32 base = static_cast<u32>(fr.stages.size());
     for (const GpuDraw& one : sc.staticDraws) {
       if (out.fogDraw == None && one.fogType != 0 && (one.fogType & 8) == 0)
@@ -1371,12 +1411,14 @@ void match_static(const DrawRec* draws, u32 count, const Vertex* verts, const fl
   out.colours.resize(firstMerged + sc.merged[0].size() + sc.merged[1].size());
   if (!sc.meshes.empty())
     std::memcpy(out.colours.data() + 1, sc.meshes.data(), sc.meshes.size() * sizeof(GpuMesh));
-  // Each placed mesh of the merged structures, as its mesh, and flags 1 when the game drew that placement this frame: its lists still drawn are in the rays by their draws
+  // Each placed mesh of the merged structures, as its mesh, and flags 1 when the game drew that placement this frame: its lists still drawn are in the rays by their draws.
+  // AURORA_RT_SCENE_STEADY: never; those draws are for primary rays alone, and the world copy is what every other ray meets
   size_t at = firstMerged;
+  const bool steady = steady_on();
   for (const auto& kind : sc.merged)
     for (const Scene::MergedGeo& g : kind) {
       out.colours[at] = sc.meshes[g.mesh];
-      out.colours[at].flags = !out.drawn.empty() && out.drawn[g.placed] ? 1 : 0;
+      out.colours[at].flags = !steady && !out.drawn.empty() && out.drawn[g.placed] ? 1 : 0;
       ++at;
     }
   out.matchMs = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
