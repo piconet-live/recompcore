@@ -423,8 +423,10 @@ float sun_term(float3 pos, float3 N, float dist) {
       Hit wh;
       const bool known = world_fetch(m, q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), q.CommittedObjectToWorld3x4(), wh);
       if (!known && (q.CommittedInstanceID() & WorldDrawn) != 0) continue;
-      if (m.cls == 0) return 0;
-      if (m.cls == 1 && (known ? Draws[wh.draw].cls == 0 || shade(wh, 2.0).a >= 0.5 : m.colour.a >= 0.5)) return 0;
+      // the draw's own class once it was drawn: a mesh the file calls solid can be drawn blended
+      const uint wc = known ? Draws[wh.draw].cls : m.cls;
+      if (wc == 0) return 0;
+      if (wc == 1 && (known ? shade(wh, 2.0).a >= 0.5 : m.colour.a >= 0.5)) return 0;
       continue;
     }
     Hit h = fetch(q.CommittedInstanceID() + q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());

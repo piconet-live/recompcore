@@ -345,6 +345,11 @@ u32 triangle_vertices(GXPrimitive prim, u32 n) {
   }
 }
 
+// AURORA_RT_SCENE_FADE=0: a fading draw counts against its list as before, to compare
+static const bool s_fadeAsDraw = [] {
+  const char* v = std::getenv("AURORA_RT_SCENE_FADE");
+  return v == nullptr || v[0] != '0';
+}();
 // Anywhere, in any order: the packet says where its draw and triangles go
 void translate(const Packet& st, DrawRec& d, Vertex* outVerts) noexcept {
   const auto* base = reinterpret_cast<const u8*>(&st);
@@ -462,6 +467,10 @@ void translate(const Packet& st, DrawRec& d, Vertex* outVerts) noexcept {
     }
   }
   d.lit = st.colorChannelConfig[GX_COLOR0 + chan].lightingEnabled;
+  {
+    const auto& cc = st.colorChannelConfig[GX_ALPHA0 + chan];
+    d.fading = s_fadeAsDraw && cc.matSrc != GX_SRC_VTX && !cc.lightingEnabled && st.colorChannelState[GX_ALPHA0 + chan].matColor[3] < 0.99f ? 1 : 0;
+  }
 
   const auto read_vertex = [&](const u8* v) {
     Vertex out{};
@@ -1215,6 +1224,16 @@ static void make_packet(u8* room, const size_t size, const u32 stages, const u32
   std::memcpy(room + at, vertices, rawBytes);
 }
 
+// As translate's d.fading, from the stream's state: the channel the stages read is the first, or the second if a stage asks for it
+static bool draw_fading() noexcept {
+  const auto& st = g_gxState;
+  u32 chan = 0;
+  for (u32 i = 0; i < std::min<u32>(st.numTevStages, 16u); ++i)
+    if (st.tevStages[i].channelId == GX_COLOR1A1 || st.tevStages[i].channelId == GX_COLOR1 || st.tevStages[i].channelId == GX_ALPHA1)
+      chan = 1;
+  const auto& cc = st.colorChannelConfig[GX_ALPHA0 + chan];
+  return s_fadeAsDraw && cc.matSrc != GX_SRC_VTX && !cc.lightingEnabled && st.colorChannelState[GX_ALPHA0 + chan].matColor[3] < 0.99f;
+}
 void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertices, size_t rawBytes) noexcept {
   auto& st = g_gxState;
   // lines only for what they light: sparks are additive lines and strips, and no ray ever hits a line
@@ -1244,7 +1263,7 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
 #endif
 #if defined(AURORA_RT_LIVE)
   // AURORA_RT_SCENE_STATIC=1: a draw the static scene holds, proved the same, costs its bytes' hash here and nothing further on. Additive and no-depth passes always go on: a second pass over the same list isn't the surface.
-  if (g_live && scene::static_on() && (prim == GX_TRIANGLES || prim == GX_TRIANGLESTRIP || prim == GX_TRIANGLEFAN) && vtxCount >= 3 && st.vtxDesc[GX_VA_PNMTXIDX] == GX_NONE && st.vtxDesc[GX_VA_POS] == GX_DIRECT && st.depthUpdate && st.depthCompare && st.colorUpdate && !(st.blendMode == 1 && st.blendFacDst == 1)) {
+  if (g_live && scene::static_on() && (prim == GX_TRIANGLES || prim == GX_TRIANGLESTRIP || prim == GX_TRIANGLEFAN) && vtxCount >= 3 && st.vtxDesc[GX_VA_PNMTXIDX] == GX_NONE && st.vtxDesc[GX_VA_POS] == GX_DIRECT && st.depthUpdate && st.depthCompare && st.colorUpdate && !(st.blendMode == 1 && st.blendFacDst == 1) && !draw_fading()) {
     ensure_job();
     if (scene::Scene* sc = s_job->world.scene.get()) {
       const auto& mtx = st.pnMtx[std::min<u32>(st.currentPnMtx, MaxPnMtx - 1)].pos;

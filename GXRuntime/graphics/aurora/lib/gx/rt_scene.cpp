@@ -1094,8 +1094,21 @@ bool observe(Scene& sc, ListInfo& L, u32 i, const DrawRec& d, const Vertex* vert
   static thread_local std::vector<WorldAttr> now;
   for (const ListOcc& o : L.occ) {
     // a solid draw of a list the file calls see-through stays fine: rays read the draw's class. The other way shadow rays would stop at something see-through.
-    if (sc.meshes[o.mesh].cls == 0 && g.cls != 0)
+    if (sc.meshes[o.mesh].cls == 0 && g.cls != 0) {
+      static int told = 0;
+      if ((told++ % 37) == 0 && std::getenv("AURORA_RT_SCENE_WHY") != nullptr) {
+        float least = 1.f;
+        for (u32 k = 0; k < d.vertices; ++k)
+          least = std::min(least, verts[d.firstVertex + k].ras[3]);
+        std::fprintf(stderr, "[rt] class differs: cls %u blend %u %u %u verts %u ras-alpha-least %.3f stages %u:", g.cls, d.blendMode, d.blendSrc, d.blendDst, d.vertices, least, g.stages);
+        for (u32 q = 0; q < g.stages; ++q) {
+          const StageRec& t = d.stage[q];
+          std::fprintf(stderr, " [a %u %u %u %u ka %.2f texA %.3f refl %u]", t.aa, t.ab, t.ac, t.ad, t.k[3], t.tex != None && t.tex < texCount ? texMeans[t.tex][3] : -1.f, t.reflection);
+        }
+        std::fprintf(stderr, "\n");
+      }
       return keep(sc.kept.classDiffers);
+    }
     if (o.verts != d.vertices)
       return keep(sc.kept.sizeDiffers);
     if (sc.meshMaterial[o.mesh] != None && (sc.meshCoords[o.mesh] != mat.coords || !same_material(sc, sc.meshMaterial[o.mesh], mat)))
@@ -1134,11 +1147,16 @@ bool observe(Scene& sc, ListInfo& L, u32 i, const DrawRec& d, const Vertex* vert
   const ListOcc& o = L.occ[0];
   if (!same_attrs(sc.attrs.data() + sc.meshes[o.mesh].first + o.first, now.data(), d.vertices)) {
     static int told = 0;
-    if (told < 12 && std::getenv("AURORA_RT_SCENE_WHY") != nullptr) {
-      ++told;
-      const WorldAttr& a = sc.attrs[sc.meshes[o.mesh].first + o.first];
-      const WorldAttr& b = now[0];
-      std::fprintf(stderr, "[rt] list changed: seen %u, %u verts, nrm %08x %08x ras %08x %08x uv %g,%g %g,%g / %g,%g %g,%g coords %u %u %u %u\n", L.seen, d.vertices, a.nrm, b.nrm, a.ras, b.ras, a.uv[0][0], a.uv[0][1], b.uv[0][0], b.uv[0][1], a.uv[1][0], a.uv[1][1], b.uv[1][0], b.uv[1][1], mat.coords[0], mat.coords[1], mat.coords[2], mat.coords[3]);
+    if ((told++ % 41) == 0 && std::getenv("AURORA_RT_SCENE_WHY") != nullptr) {
+      const WorldAttr* A = sc.attrs.data() + sc.meshes[o.mesh].first + o.first;
+      u32 k = 0;
+      while (k + 1 < d.vertices && same_attrs(A + k, now.data() + k, 1))
+        ++k;
+      const WorldAttr& a = A[k];
+      const WorldAttr& b = now[k];
+      const float* mm = d.motionMtx;
+      std::fprintf(stderr, "[rt] scale %.3f %.3f %.3f placed-of-model %zu ", std::sqrt(mm[0] * mm[0] + mm[4] * mm[4] + mm[8] * mm[8]), std::sqrt(mm[1] * mm[1] + mm[5] * mm[5] + mm[9] * mm[9]), std::sqrt(mm[2] * mm[2] + mm[6] * mm[6] + mm[10] * mm[10]), sc.placementsOf[L.model].size());
+      std::fprintf(stderr, "[rt] list changed: seen %u, was %u, at %u of %u verts, nrm %08x %08x ras %08x %08x uv %g,%g %g,%g / %g,%g %g,%g coords %u %u %u %u blend %u %u %u stages %u texgen-tc0 %u\n", L.seen, unsigned(L.state.load()), k, d.vertices, a.nrm, b.nrm, a.ras, b.ras, a.uv[0][0], a.uv[0][1], b.uv[0][0], b.uv[0][1], a.uv[1][0], a.uv[1][1], b.uv[1][0], b.uv[1][1], mat.coords[0], mat.coords[1], mat.coords[2], mat.coords[3], d.blendMode, d.blendSrc, d.blendDst, g.stages, d.stage[0].tc);
     }
     if (L.state.load(std::memory_order_relaxed) == ListState::Proved)
       ++sc.kept.auditFails;
@@ -1200,7 +1218,8 @@ void match_static(const DrawRec* draws, u32 count, const Vertex* verts, const fl
         DrawnPair pair{p, L.model, {}};
         std::memcpy(pair.m, d.motionMtx, 48);
         out.pairs.push_back(pair);
-        if (L.state.load(std::memory_order_relaxed) != ListState::Keep && observe(sc, L, i, d, verts, texMeans, texCount, fr))
+        // A draw mid-fade stays a draw this frame: it says nothing of the list, which fades by the state the draw is drawn with, not by its bytes
+        if (d.fading == 0 && L.state.load(std::memory_order_relaxed) != ListState::Keep && observe(sc, L, i, d, verts, texMeans, texCount, fr))
           out.drop[i] = 1;
       }
       if (found)
