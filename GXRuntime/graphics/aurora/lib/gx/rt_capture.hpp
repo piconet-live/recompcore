@@ -16,6 +16,7 @@ extern bool g_noHud;
 bool skip_draw() noexcept;
 extern bool g_noGameShadow;  // with own light: the game's machine shadow not drawn (AURORA_RT_GAME_SHADOW=1 keeps it)
 bool is_game_shadow() noexcept;
+void note_draw(u16 vtxCount) noexcept;
 void start() noexcept;  // reads the switches, once
 
 // A stage is a reflection layer when it adds or multiplies a texture looked up by the normal (a sphere map), with a

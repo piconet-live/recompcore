@@ -1135,10 +1135,30 @@ static bool samples_copy() noexcept {
   }
   return false;
 }
-// The game's own machine shadow, from the draw alone: it lays a copy of the picture on the road, blended by what the picture's alpha holds, and writes no depth. No rule by model or course. Rays stand in for it.
+// The game's own machine shadow, from the draw alone: its blend takes the source by one minus the picture's alpha and the picture by its alpha, and it writes no depth. No rule by model or course. Rays stand in for it.
+// Not asked: whether its texture is a known picture copy. The game's shadow samples an address only sometimes known as one (the rule missed 15 in 16 draws on course 15).
 bool is_game_shadow() noexcept {
   const auto& st = g_gxState;
-  return st.blendMode == 1 && st.blendFacDst == 6 && !st.depthUpdate && samples_copy();
+  return st.blendMode == GX_BM_BLEND && st.blendFacSrc == GX_BL_INVDSTALPHA && st.blendFacDst == GX_BL_DSTALPHA && !st.depthUpdate;
+}
+// AURORA_RT_DRAWLOG=first,last: on those copies, each draw that writes no depth or samples a picture copy: its state, whether the rule took it, where it is
+void note_draw(const u16 vtxCount) noexcept {
+  static u64 first = 0, last = 0;
+  static const bool on = [] {
+    const char* v = std::getenv("AURORA_RT_DRAWLOG");
+    if (v != nullptr && std::strchr(v, ',') != nullptr)
+      first = std::strtoull(v, nullptr, 10), last = std::strtoull(std::strchr(v, ',') + 1, nullptr, 10);
+    return v != nullptr;
+  }();
+  if (!on || s_copyNow < first || s_copyNow > last)
+    return;
+  const auto& st = g_gxState;
+  if (st.depthUpdate && !samples_copy())
+    return;
+  const auto& m = st.pnMtx[st.currentPnMtx / 3];
+  std::fprintf(stderr, "[rt] draw copy %llu: proj %d blend %d src %d dst %d zwrite %d zcmp %d zfunc %d colour %d alpha %d copy %d stages %u gens %u verts %u cull %d rule %d tex %p at %.1f %.1f %.1f\n",
+               static_cast<unsigned long long>(s_copyNow), int(st.projType), int(st.blendMode), int(st.blendFacSrc), int(st.blendFacDst), int(st.depthUpdate), int(st.depthCompare), int(st.depthFunc),
+               int(st.colorUpdate), int(st.alphaUpdate), int(samples_copy()), st.numTevStages, st.numTexGens, vtxCount, int(st.cullMode), int(is_game_shadow()), st.numTevStages > 0 && st.tevStages[0].texMapId < MaxTextures ? st.textures[st.tevStages[0].texMapId].texObj.data : nullptr, m.pos.m0.w(), m.pos.m1.w(), m.pos.m2.w());
 }
 static void make_packet(u8* room, const size_t size, const u32 stages, const u32 mtxCount, const bool lit, GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
                         const u8* vertices, const u32 rawBytes, u32 drawSlot, u32 vertSlot, u32 drawIndex, u32 firstVertex, u32 epoch) noexcept {

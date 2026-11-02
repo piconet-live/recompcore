@@ -821,6 +821,7 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
   u32 totalVtxBytes = vtxCount * vtxSize;
   if (totalVtxBytes > reader.remaining())
     UNLIKELY { handle_draw_overrun(totalVtxBytes, reader); }
+  if (rt::g_hook) UNLIKELY { rt::note_draw(vtxCount); }
   if (g_gxState.cullMode == GX_CULL_ALL || g_drawingOff || (rt::g_noHud && rt::skip_draw()) || (rt::g_noGameShadow && rt::is_game_shadow()))
     UNLIKELY {
       // GX_CULL_ALL rasterises nothing (the hardware culls both faces; lines and points too)
