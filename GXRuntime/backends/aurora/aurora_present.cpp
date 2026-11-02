@@ -750,7 +750,18 @@ void aurora_present_frame(uint64_t copy) {
     // In the host window there is no picture of the emulator's to go back to: a stop would freeze the window with the
     // race going on (course 36 under load, 1214 frames in), so only the byte bound stops it there.
     const std::size_t most = (s->up && s->window == nullptr) ? s->most_behind : 1800u;
-    const std::size_t most_bytes = s->window != nullptr ? State::most_bytes_behind_window : State::most_bytes_behind;
+    // AURORA_MOST_MB_BEHIND=<MB> (tests only: further behind, the guest's RAM may hold a later frame's lists); AURORA_QUEUE_LOG=<file>: a line a frame, copy, bytes, frames and bytes waiting
+    static const std::size_t mostMb = [] {
+      const char* v = std::getenv("AURORA_MOST_MB_BEHIND");
+      return v != nullptr ? static_cast<std::size_t>(std::atoll(v)) : std::size_t{0};
+    }();
+    static FILE* queueLog = [] {
+      const char* v = std::getenv("AURORA_QUEUE_LOG");
+      return v != nullptr ? std::fopen(v, "wb") : nullptr;
+    }();
+    if (queueLog != nullptr)
+      std::fprintf(queueLog, "%llu,%zu,%zu,%zu\n", static_cast<unsigned long long>(copy), f.bytes.size(), s->queue.size(), s->bytes_waiting);
+    const std::size_t most_bytes = mostMb != 0 ? mostMb << 20 : s->window != nullptr ? State::most_bytes_behind_window : State::most_bytes_behind;
     if (s->queue.size() >= most || s->bytes_waiting + f.bytes.size() > most_bytes) {
       stop_for_run(s->queue.size() >= most ? "too many frames behind" : "too many bytes behind");
       s->queue.clear();
