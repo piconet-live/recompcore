@@ -12,8 +12,17 @@
 #include "../sqlite_utils.hpp"
 #include "../webgpu/gpu.hpp"
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 #include <algorithm>
 #include <atomic>
+#include <climits>
+#include <chrono>
+#include <cstdio>
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
@@ -24,6 +33,8 @@
 #include <ranges>
 #include <variant>
 #include <thread>
+#include <vector>
+#include <cstdlib>
 
 #include <SDL3/SDL_iostream.h>
 #include <absl/container/flat_hash_map.h>
@@ -43,6 +54,7 @@ using NewPipelineCallback = std::function<CompiledPipeline()>;
 struct PendingPipeline {
   PipelineRef hash;
   NewPipelineCallback create;
+  std::chrono::steady_clock::time_point queuedAt = std::chrono::steady_clock::now();
 };
 
 struct PipelineCacheWrite {
@@ -80,7 +92,7 @@ constexpr size_t BuildPipelinesPerFrame = 5;
 #else
 constexpr size_t BuildPipelinesPerFrame = 1;
 #endif
-static std::thread g_pipelineThread;
+static std::vector<std::thread> g_pipelineThreads;
 static std::atomic_bool g_pipelineThreadEnd = false;
 static std::condition_variable g_pipelineQueueCv;
 static std::condition_variable g_pipelineReadyCv;
@@ -955,39 +967,100 @@ static void pipeline_cache_writer() {
   }
 }
 
+// The skip counter: draws left out of a frame because their pipeline is not compiled yet, one log line for each frame
+// that had any. Only the render thread's get_pipeline and frame end touch these, under g_pipelineMutex.
+static uint64_t g_frameDraws = 0;
+static uint64_t g_frameSkippedDraws = 0;
+static uint64_t g_totalSkippedDraws = 0;
+static uint64_t g_framesWithSkips = 0;
+static absl::flat_hash_set<PipelineRef> g_frameSkippedPipelines;
+
+static double ms_since_start() {
+  static const auto start = std::chrono::steady_clock::now();
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
+static void report_skipped_draws() {
+  std::lock_guard lock{g_pipelineMutex};
+  if (g_frameSkippedDraws != 0) {
+    g_totalSkippedDraws += g_frameSkippedDraws;
+    ++g_framesWithSkips;
+    std::fprintf(stderr,
+                 "[pipelines] frame %u at %.0f ms: skipped %llu of %llu draws, %zu pipelines missing, queued %zu; so far %llu draws in %llu frames\n",
+                 current_frame(), ms_since_start(), static_cast<unsigned long long>(g_frameSkippedDraws),
+                 static_cast<unsigned long long>(g_frameDraws), g_frameSkippedPipelines.size(),
+                 g_pipelineQueue.size(), static_cast<unsigned long long>(g_totalSkippedDraws),
+                 static_cast<unsigned long long>(g_framesWithSkips));
+    g_frameSkippedPipelines.clear();
+  }
+  g_frameDraws = 0;
+  g_frameSkippedDraws = 0;
+}
+
+// How many compile threads may work on the background queue at once; a draw's pipeline can always take any thread
+static std::atomic_uint g_backgroundLimit{UINT_MAX};
+static unsigned g_backgroundWorking = 0;  // under g_pipelineMutex
+
+void set_background_compile_threads(unsigned count) {
+  g_backgroundLimit = count;
+  g_pipelineQueueCv.notify_all();
+}
+
 static void pipeline_worker() {
 #ifdef TRACY_ENABLE
   tracy::SetThreadName("Pipeline compilation thread");
 #endif
+#ifdef _WIN32
+  // Never ahead of the game's thread or Aurora's: a race beside a load of compiles keeps its pace
+  if (g_hasPipelineThread) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+  }
+#endif
 
-  bool hasMore = false;
+  bool wantedByDraw = false;
   while (g_hasPipelineThread || g_pipelinesPerFrame < BuildPipelinesPerFrame) {
     PendingPipeline pending;
     {
       std::unique_lock lock{g_pipelineMutex};
       if (g_hasPipelineThread) {
-        if (!hasMore) {
-          g_pipelineQueueCv.wait(lock, [] {
-            return !g_pipelineQueue.empty() || !g_backgroundPipelineQueue.empty() || g_pipelineThreadEnd;
-          });
-        }
+        g_pipelineQueueCv.wait(lock, [] {
+          return !g_pipelineQueue.empty() || g_pipelineThreadEnd ||
+                 (!g_backgroundPipelineQueue.empty() && g_backgroundWorking < g_backgroundLimit);
+        });
       } else if (g_pipelineQueue.empty() && g_backgroundPipelineQueue.empty()) {
         return;
       }
       if (g_pipelineThreadEnd) {
         break;
       }
+      wantedByDraw = !g_pipelineQueue.empty();
       auto& source = !g_pipelineQueue.empty() ? g_pipelineQueue : g_backgroundPipelineQueue;
       pending = std::move(source.front());
       source.pop_front();
+      if (!wantedByDraw) {
+        ++g_backgroundWorking;
+      }
     }
+    const bool wanted = wantedByDraw;
+    const auto compileStart = std::chrono::steady_clock::now();
     auto result = pending.create();
+    const auto compileEnd = std::chrono::steady_clock::now();
     const auto pipelineCount = result.pipeline_count();
+    std::fprintf(stderr, "[pipelines] compiled %s: %.1f ms, %.1f ms after it was queued, at %.0f ms%s\n",
+                 wanted ? "for a draw" : "ahead",
+                 std::chrono::duration<double, std::milli>(compileEnd - compileStart).count(),
+                 std::chrono::duration<double, std::milli>(compileEnd - pending.queuedAt).count(), ms_since_start(),
+                 result.main ? "" : ", FAILED");
     {
       std::lock_guard lock{g_pipelineMutex};
       g_pipelines.try_emplace(pending.hash, std::move(result));
       g_pendingPipelines.erase(pending.hash);
-      hasMore = !g_pipelineQueue.empty() || !g_backgroundPipelineQueue.empty();
+      if (!wanted) {
+        --g_backgroundWorking;
+      }
+    }
+    if (!wanted) {
+      g_pipelineQueueCv.notify_one();
     }
     if (!g_hasPipelineThread) {
       g_pipelinesPerFrame += std::max(1u, pipelineCount);
@@ -1106,6 +1179,33 @@ PipelineRef find_pipeline(const rmlui::PipelineConfig& config) {
 }
 #endif
 
+void precompile_pipeline(const gx::PipelineConfig& config, bool scene_target, bool other_target) {
+  // Behind any draw that is waiting (a draw moves its own pipeline to the front of the line). Remembered for a change of the render target's layout, and
+  // written to the cache only when a draw uses it (find_pipeline).
+  remember_pipeline_config(ShaderType::GX, config, UINT32_MAX, false);
+  const auto scene = scene_render_target_layout();
+  auto offscreen = scene;
+  offscreen.colorAttachmentCount = 1;
+  offscreen.sampleCount = 1;
+  detail::finalize_render_target_layout(offscreen);
+  if (scene_target) {
+    resolve_pipeline(ShaderType::GX, config, scene, PipelinePriority::Background);
+  }
+  if (other_target && offscreen.key != scene.key) {
+    resolve_pipeline(ShaderType::GX, config, offscreen, PipelinePriority::Background);
+  }
+}
+
+size_t pipelines_waiting() {
+  std::lock_guard lock{g_pipelineMutex};
+  return g_pendingPipelines.size();
+}
+
+size_t pipelines_compiled() {
+  std::lock_guard lock{g_pipelineMutex};
+  return g_pipelines.size();
+}
+
 void rebuild_pipeline_cache() {
   ZoneScoped;
   const auto scene = scene_render_target_layout();
@@ -1146,11 +1246,20 @@ void initialize_pipeline_cache() {
     g_hasPipelineThread = false;
   } else {
     g_hasPipelineThread = true;
-    g_pipelineThread = std::thread(pipeline_worker);
+    unsigned threads = std::max(1u, std::min(8u, std::thread::hardware_concurrency() / 2));
+    if (const char* v = std::getenv("AURORA_PIPELINE_THREADS"); v != nullptr && std::atoi(v) > 0) {
+      threads = static_cast<unsigned>(std::atoi(v));
+    }
+    std::fprintf(stderr, "[pipelines] %u compile threads\n", threads);
+    for (unsigned i = 0; i < threads; ++i) {
+      g_pipelineThreads.emplace_back(pipeline_worker);
+    }
   }
 
+  ms_since_start();
   const size_t loadedCount = load_pipeline_cache();
   rebuild_pipeline_cache();
+  std::fprintf(stderr, "[pipelines] cache: %zu known at start, compiled ahead in the background\n", loadedCount);
   if (!g_pipelineCacheBroken && loadedCount > 0) {
     g_gpuCachePrunePending = true;
   }
@@ -1165,7 +1274,10 @@ void shutdown_pipeline_cache() {
     g_pipelineThreadEnd = true;
     g_pipelineQueueCv.notify_all();
     g_pipelineReadyCv.notify_all();
-    g_pipelineThread.join();
+    for (auto& thread : g_pipelineThreads) {
+      thread.join();
+    }
+    g_pipelineThreads.clear();
   }
   g_hasPipelineThread = false;
 
@@ -1195,6 +1307,7 @@ void begin_pipeline_frame() {
 }
 
 void end_pipeline_frame() {
+  report_skipped_draws();
   if (!g_hasPipelineThread) {
     pipeline_worker();
   }
@@ -1202,8 +1315,11 @@ void end_pipeline_frame() {
 
 bool get_pipeline(PipelineRef ref, CompiledPipeline& pipeline) {
   std::lock_guard guard{g_pipelineMutex};
+  ++g_frameDraws;
   const auto it = g_pipelines.find(ref);
   if (it == g_pipelines.end() || !it->second.main) {
+    ++g_frameSkippedDraws;
+    g_frameSkippedPipelines.insert(ref);
     return false;
   }
   pipeline = it->second;

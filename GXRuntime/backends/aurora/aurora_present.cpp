@@ -7,6 +7,7 @@
 
 #include "aurora_backend_private.h"
 #include "aurora_overlay.h"
+#include "model_pipelines.h"
 #include "gxruntime/aurora_backend.h"
 #include "gxruntime/gx_recomp.h"
 
@@ -490,6 +491,7 @@ void run() {
     AuroraSetViewportPolicy(AURORA_VIEWPORT_NATIVE);  // the game's own viewport, unscaled
   }
   aurora_overlay_start(s->ram);
+  model_pipelines_aurora_up();
   // AURORA_TEST_FATAL=<copy> (a test): a fatal error at this copy, the way any of Aurora's goes
   const char* test_fatal_text = std::getenv("AURORA_TEST_FATAL");
   const std::uint64_t test_fatal = test_fatal_text != nullptr ? std::strtoull(test_fatal_text, nullptr, 10) : 0;
@@ -811,6 +813,7 @@ void aurora_present_stats(AuroraPresentStats* out) {
 }
 
 void aurora_present_stop(void) {
+  model_pipelines_stop();
   if (s == nullptr)
     return;
   {
