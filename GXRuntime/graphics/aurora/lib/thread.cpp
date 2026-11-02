@@ -1,6 +1,14 @@
+#include <cstdlib>
+#include <cstdio>
+#include <cwchar>
+#include <thread>
 #include "thread.hpp"
 
 #include <SDL3/SDL_thread.h>
+#if defined(_WIN32)
+#include <windows.h>
+#include <tlhelp32.h>
+#endif
 #include <tracy/Tracy.hpp>
 
 #include <algorithm>
@@ -300,6 +308,48 @@ void set_background(bool background) noexcept {
   SetThreadPriority(GetCurrentThread(), background ? THREAD_PRIORITY_LOWEST : THREAD_PRIORITY_NORMAL);
 #else
   (void)background;
+#endif
+}
+
+void raise_picture_threads_from_env() noexcept {
+#if defined(_WIN32)
+  const char* v = std::getenv("AURORA_THREADS_UP");
+  if (v == nullptr || v[0] != '1')
+    return;
+  std::thread([] {
+    static const wchar_t* const names[] = {L"CPU thread", L"Video thread", L"Aurora FIFO processor", L"Aurora render worker", L"Aurora RT", L"Main thread"};
+    const DWORD process = GetCurrentProcessId();
+    std::vector<DWORD> done;
+    // threads start over the first seconds (the ray workers with the first ray frame): looked for again a while
+    for (int round = 0; round < 40; ++round) {
+      HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+      if (snap != INVALID_HANDLE_VALUE) {
+        THREADENTRY32 te{};
+        te.dwSize = sizeof te;
+        for (BOOL more = Thread32First(snap, &te); more; more = Thread32Next(snap, &te)) {
+          if (te.th32OwnerProcessID != process || std::find(done.begin(), done.end(), te.th32ThreadID) != done.end())
+            continue;
+          HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+          if (h == nullptr)
+            continue;
+          PWSTR desc = nullptr;
+          if (SUCCEEDED(GetThreadDescription(h, &desc)) && desc != nullptr) {
+            for (const wchar_t* n : names)
+              if (std::wcscmp(desc, n) == 0) {
+                SetThreadPriority(h, THREAD_PRIORITY_ABOVE_NORMAL);
+                done.push_back(te.th32ThreadID);
+                std::fprintf(stderr, "[threads] %ls %lu above normal\n", desc, te.th32ThreadID);
+                break;
+              }
+            LocalFree(desc);
+          }
+          CloseHandle(h);
+        }
+        CloseHandle(snap);
+      }
+      Sleep(round < 10 ? 1000 : 3000);
+    }
+  }).detach();
 #endif
 }
 

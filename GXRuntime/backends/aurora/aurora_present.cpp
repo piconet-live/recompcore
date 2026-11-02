@@ -4,6 +4,7 @@
 
 #include "../../graphics/aurora/lib/gfx/stagelog.hpp"
 #include "gx/rt_capture.hpp"
+#include "../../graphics/aurora/lib/thread.hpp"
 #include "gxruntime/aurora_present.h"
 
 #include "aurora_backend_private.h"
@@ -728,6 +729,7 @@ int aurora_present_start(const AuroraPresentConfig* config) {
     s->most_behind = static_cast<std::uint32_t>(std::atoi(v));
   s->building.reserve(512u * 1024u);
   s->running = true;
+  aurora::thread::raise_picture_threads_from_env();
   s->thread = std::thread(run);
   return 1;
 }
