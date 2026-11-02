@@ -2,6 +2,7 @@
 #include <algorithm>
 #include "shader_info.hpp"
 
+#include "soft_cards.hpp"
 #include "../gfx/recording.hpp"
 
 #include <cmath>
@@ -364,6 +365,10 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
     info.uniformSize += MaxIndTexMtxs * sizeof(Mat2x4<float>);
   }
   info.uniformSize += info.sampledTextures.count() * sizeof(Vec4<float>);
+  if (config.softCard != 0) {
+    info.softCard = config.softCard;
+    info.uniformSize += sizeof(Vec4<float>);  // soft_card: the depth range of the viewport (least, span), the fade's share
+  }
   info.uniformSize = gfx::align_uniform(info.uniformSize);
   if (info.uniformSize > MaxUniformSize) {
     Log.fatal("Uniform size exceeds maximum: {} > {}", info.uniformSize, MaxUniformSize);
@@ -501,6 +506,13 @@ static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
       continue;
     }
     buf.append(texture_size_bias(get_texture(static_cast<GXTexMapID>(i))));
+  }
+  if (info.softCard != 0) {
+    // the depth range the viewport maps to (encoding.cpp apply_viewport), so the shader can take a depth back to a distance
+    const auto& vp = g_gxState.logicalViewport;
+    const float least = UseReversedZ ? 1.f - vp.zfar : vp.znear;
+    const float most = UseReversedZ ? 1.f - vp.znear : vp.zfar;
+    buf.append(Vec4{least, most - least, soft::share(), 0.f});
   }
 }
 

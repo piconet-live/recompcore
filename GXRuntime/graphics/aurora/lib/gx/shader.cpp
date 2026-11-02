@@ -1592,6 +1592,11 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
         "var tex{0}_samp: sampler;",
         i, i * 2, i * 2 + 1);
   }
+  if (config.softCard != 0) {
+    // AURORA_RT_SOFT_CARDS (soft_cards.hpp): the frame's depth behind the card, and the viewport's depth range with the fade's share
+    uniBufAttrs += "\n    soft_card: vec4f,";
+    texBindings += "\n@group(3) @binding(0)\nvar soft_depth: texture_2d<f32>;";
+  }
   if (!prevColorNormalized && !prevAlphaNormalized) {
     fragmentFn += "\n    prev = tev_overflow_vec4f(prev);";
   } else if (!prevColorNormalized) {
@@ -1636,6 +1641,28 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     fragmentFn += "\n    prev = vec4f(1.0, 1.0, 1.0, prev.a);";
   } else if (config.logicOutput == 2) {
     fragmentFn += "\n    prev = vec4f(1.0 - clamp(prev.rgb, vec3f(0.0), vec3f(1.0)), prev.a);";
+  }
+
+  if (config.softCard != 0) {
+    // A soft card (AURORA_RT_SOFT_CARDS): its share fades by how near it lies to the depth behind it, over soft_card.z of its own distance.
+    // Distances from depths by the draw's projection (z = (m2.w - n m3.w) / (n m3.z - m2.z) for the depth n before the viewport's range).
+    // Drawn orthographic (the HUD), nothing behind (the far end) or no depth to read: unchanged.
+    fragmentFn += fmt::format(
+        "\n    // Soft card"
+        "\n    if (ubuf.proj[3].w == 0.0) {{"
+        "\n        let soft_size = textureDimensions(soft_depth);"
+        "\n        let soft_at = min(vec2u(in.pos.xy), soft_size - vec2u(1u));"
+        "\n        let soft_behind = textureLoad(soft_depth, soft_at, 0).r;"
+        "\n        let soft_n = (vec2f(in.pos.z, soft_behind) - ubuf.soft_card.x) / max(ubuf.soft_card.y, 1e-6);"
+        "\n        let soft_z = (ubuf.proj[2].w - soft_n * ubuf.proj[3].w) / (soft_n * ubuf.proj[3].z - ubuf.proj[2].z);"
+        "\n        let soft_own = -soft_z.x;"
+        "\n        let soft_far = -soft_z.y;"
+        "\n        if (soft_behind != {0} && soft_own > 0.0 && soft_far > 0.0) {{"
+        "\n            let soft_fade = clamp((soft_far - soft_own) / max(soft_own * ubuf.soft_card.z, 1e-4), 0.0, 1.0);"
+        "\n            {1}"
+        "\n        }}"
+        "\n    }}",
+        UseReversedZ ? "0.0" : "1.0", config.softCard == 1 ? "prev.a *= soft_fade;" : "prev = vec4f(prev.rgb * soft_fade, prev.a);");
   }
 
   if (dstAlphaMode == DstAlphaMode::Replace) {

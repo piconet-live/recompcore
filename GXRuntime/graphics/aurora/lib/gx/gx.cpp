@@ -3,6 +3,7 @@
 
 #include "pipeline.hpp"
 #include "shader_info.hpp"
+#include "soft_cards.hpp"
 #include "texture.hpp"
 #include "../dolphin/vi/vi_internal.hpp"
 #include "../webgpu/gpu.hpp"
@@ -388,8 +389,10 @@ gfx::ClipRect map_logical_scissor(const gfx::ClipRect& logicalScissor) noexcept 
 }
 
 void set_logical_viewport(const gfx::Viewport& viewport) noexcept {
+  // (the depth range too: a soft card's uniform has it, soft_cards.hpp)
   if (viewport.left != g_gxState.logicalViewport.left || viewport.width != g_gxState.logicalViewport.width ||
-      viewport.height != g_gxState.logicalViewport.height) {
+      viewport.height != g_gxState.logicalViewport.height || viewport.znear != g_gxState.logicalViewport.znear ||
+      viewport.zfar != g_gxState.logicalViewport.zfar) {
     g_gxState.dirty |= DirtyUniform;
   }
   g_gxState.logicalViewport = viewport;
@@ -463,7 +466,7 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
   };
   const wgpu::RenderPipelineDescriptor descriptor{
       .label = label,
-      .layout = sPipelineLayout,
+      .layout = config.shaderConfig.softCard != 0 ? soft::pipeline_layout() : sPipelineLayout,
       .vertex =
           {
               .module = shader,
@@ -628,6 +631,7 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
       .alphaUpdate = alphaUpdate,
       .colorUpdate = g_gxState.colorUpdate,
   };
+  if (soft::on()) UNLIKELY { config.shaderConfig.softCard = soft::kind(primitive); }
 }
 
 GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {
@@ -738,12 +742,14 @@ void initialize() noexcept {
         .immediateSize = sizeof(DrawImmediateData),
     };
     sPipelineLayout = g_device.CreatePipelineLayout(&desc);
+    soft::initialize(layouts[0], layouts[1], layouts[2], sizeof(DrawImmediateData));
   }
 }
 
 void shutdown() noexcept {
   // TODO we should probably store this all in g_state.gx instead
   sTextureBindGroupLayout = {};
+  soft::shutdown();
   for (auto& item : g_gxState.textures) {
     item.ref.reset();
   }

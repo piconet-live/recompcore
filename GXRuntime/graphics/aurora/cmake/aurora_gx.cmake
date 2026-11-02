@@ -35,6 +35,7 @@ add_library(aurora_gx STATIC
         lib/gx/readback.cpp
         lib/gx/shader.cpp
         lib/gx/shader_info.cpp
+        lib/gx/soft_cards.cpp
         lib/dolphin/gx/GXBump.cpp
         lib/dolphin/gx/GXCull.cpp
         lib/dolphin/gx/GXCpu2Efb.cpp

@@ -1,6 +1,7 @@
 #include <cstdio>
 #include "regs.hpp"
 #include "rt_capture.hpp"
+#include "soft_cards.hpp"
 
 #include "gx_fmt.hpp"
 #include "recomp.hpp"
@@ -411,6 +412,9 @@ void bp_efb_copy(u8, u32 value) noexcept {
     return;
   }
   const bool clear = reg_get(value, 1, 11) != 0;
+  // soft cards' depth snapshot (AURORA_RT_SOFT_CARDS): gone with a clear, and with the frame at its display copy
+  if (clear || reg_get(value, 1, 14) != 0)
+    soft::efb_cleared();
   if (reg_get(value, 1, 14) != 0) {
     copy_xfb(value);
   } else {
