@@ -45,7 +45,7 @@ struct PipelineOptions {
 gfx::CompiledPipeline create_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout);
 void render(const DrawData& data, const wgpu::RenderPassEncoder& pass);
 // The same draw into a render bundle (AURORA_REDRAW_BUNDLES): `current` is the bundle's bound pipeline. False when its pipeline is not
-// ready (the draw is left out; the caller draws it directly instead) or it needs a blend constant (a bundle cannot set one).
+// ready (the draw is left out; the caller draws it directly instead). Its blend constant (dstAlpha) is the pass's, set by the caller.
 bool render_bundle(const DrawData& data, const wgpu::RenderBundleEncoder& bundle, WGPURenderPipeline& current);
 
 void queue_surface(const u8* dlStart, uint32_t dlSize, bool bigEndian) noexcept;

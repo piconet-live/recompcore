@@ -121,6 +121,7 @@ void execute_encoder_task(wgpu::CommandEncoder& cmd, FramePacket& frame, const E
 // the viewport and scissor as they were and the pipeline and bind groups unset.
 struct BundleRun {
   uint32_t first = 0, end = 0;  // the pass's commands [first, end)
+  uint32_t dstAlpha = UINT32_MAX;  // the blend constant its draws use (the pass's, set before the bundle), or none
   wgpu::RenderBundle bundle;
 };
 struct PassBundles {
@@ -131,13 +132,15 @@ std::vector<PassBundles> g_passBundles;  // by the pass's index (the render work
 constexpr uint32_t BundleLeast = 2;
 
 bool bundle_draw(const Command& cmd) noexcept {
-  return cmd.type == CommandType::Draw && cmd.data.draw.encoder == gx_draw_encoder() &&
-         reinterpret_cast<const gx::DrawData*>(cmd.data.draw.payload.data())->dstAlpha == UINT32_MAX;
+  return cmd.type == CommandType::Draw && cmd.data.draw.encoder == gx_draw_encoder();
+}
+const gx::DrawData& gx_data(const Command& cmd) noexcept {
+  return *reinterpret_cast<const gx::DrawData*>(cmd.data.draw.payload.data());
 }
 
 void build_bundles(PassBundles& out, RenderPass& passInfo) {
   const auto began = std::chrono::steady_clock::now();
-  uint64_t bundled = 0, direct = 0;
+  uint64_t bundled = 0, direct = 0, runs = 0;
   out.runs.clear();
   out.built = true;
   const auto layout = passInfo.target_layout();
@@ -159,8 +162,16 @@ void build_bundles(PassBundles& out, RenderPass& passInfo) {
       ++i;
       continue;
     }
-    uint32_t end = i;
+    // GX draws in a row whose blend constants agree (draws without one go with any; a bundle cannot set it)
+    uint32_t end = i, constant = UINT32_MAX;
     while (end < commands.size() && bundle_draw(commands[end])) {
+      const uint32_t a = gx_data(commands[end]).dstAlpha;
+      if (a != UINT32_MAX && constant != UINT32_MAX && a != constant) {
+        break;
+      }
+      if (a != UINT32_MAX) {
+        constant = a;
+      }
       ++end;
     }
     // a draw whose pipeline is not ready ends the run before it (it is drawn directly, as before, and tries its pipeline each picture)
@@ -171,13 +182,17 @@ void build_bundles(PassBundles& out, RenderPass& passInfo) {
         encoder.SetBindGroup(0, resources().staticBindGroup);
         encoder.SetBindGroup(2, gx::g_emptyTextureBindGroup);
         WGPURenderPipeline current = nullptr;
-        while (last < end &&
-               gx::render_bundle(*reinterpret_cast<const gx::DrawData*>(commands[last].data.draw.payload.data()), encoder, current)) {
+        uint32_t runConstant = UINT32_MAX;
+        while (last < end && gx::render_bundle(gx_data(commands[last]), encoder, current)) {
+          if (gx_data(commands[last]).dstAlpha != UINT32_MAX) {
+            runConstant = gx_data(commands[last]).dstAlpha;
+          }
           ++last;
         }
         if (last - i >= BundleLeast) {
-          out.runs.push_back({i, last, encoder.Finish()});
+          out.runs.push_back({i, last, runConstant, encoder.Finish()});
           bundled += last - i;
+          ++runs;
         } else {
           last = i;  // (too short: drawn directly)
         }
@@ -189,6 +204,7 @@ void build_bundles(PassBundles& out, RenderPass& passInfo) {
   if (stagelog::on()) {  // (the draws bundled; then the draws left direct, as the count of a stretch of its own)
     stagelog::note("rd_bundles", began, bundled);
     stagelog::note("rd_bundles_direct", began, direct);
+    stagelog::note("rd_bundles_runs", began, runs);
   }
 }
 
@@ -214,6 +230,10 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
   for (uint32_t at = 0; at < passInfo.commands.size(); ++at) {
     if (bundles != nullptr && nextRun < bundles->runs.size() && bundles->runs[nextRun].first == at) {
       const auto& run = bundles->runs[nextRun++];
+      if (run.dstAlpha != UINT32_MAX) {
+        const wgpu::Color color{0.f, 0.f, 0.f, run.dstAlpha / 255.f};
+        pass.SetBlendConstant(&color);
+      }
       pass.ExecuteBundles(1, &run.bundle);
       at = run.end - 1;
       g_currentPipeline = nullptr;

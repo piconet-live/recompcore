@@ -91,7 +91,7 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
 
 bool render_bundle(const DrawData& data, const wgpu::RenderBundleEncoder& bundle, WGPURenderPipeline& current) {
   gfx::CompiledPipeline pipeline;
-  if (data.dstAlpha != UINT32_MAX || !gfx::get_pipeline(data.pipeline, pipeline)) {
+  if (!gfx::get_pipeline(data.pipeline, pipeline)) {
     return false;
   }
   const auto& resources = gfx::detail::resources();
