@@ -52,6 +52,11 @@ void world_build(Slot& s, const std::shared_ptr<scene::Scene>& sc) {
     scratch += (pre.ScratchDataSizeInBytes + 255) & ~u64(255);
   }
   g.worldBytes = total;
+  if (scene::static_on()) {
+    if (g.worldAttrs)
+      s.keep.push_back(g.worldAttrs);
+    g.worldAttrs = make_buffer(D3D12_HEAP_TYPE_DEFAULT, sc->attrs.size() * sizeof(scene::WorldAttr), D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
+  }
   g.worldBlas = make_buffer(D3D12_HEAP_TYPE_DEFAULT, total, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
   auto scratchBuffer = make_buffer(D3D12_HEAP_TYPE_DEFAULT, scratch, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   if (g.failed)
@@ -73,12 +78,53 @@ void world_build(Slot& s, const std::shared_ptr<scene::Scene>& sc) {
 // The meshes' colours for this frame's rays. Element 0: the frame's facts, whether there is a scene or not.
 void world_stage(Slot& s, Job& job) {
   static const bool show = std::getenv("AURORA_RT_SCENE_SHOW") != nullptr;
+  if (scene::static_on() && job.world.scene) {
+    world_build(s, job.world.scene);
+    scene::Scene& sc = *job.world.scene;
+    if (!g.failed && job.world.scene == g.worldScene && g.worldAttrs) {
+      // what the rules learned: to the attributes, by the slot's own copy buffer
+      static thread_local std::vector<std::pair<u32, u32>> take;
+      take.clear();
+      {
+        std::lock_guard l{sc.pendingLock};
+        take.swap(sc.pending);
+      }
+      u64 need = 0;
+      for (const auto& [first, count] : take)
+        need += u64(count) * sizeof(scene::WorldAttr);
+      if (need != 0) {
+        if (s.attrUploadSize < need) {
+          if (s.attrUpload)
+            s.keep.push_back(s.attrUpload);
+          s.attrUploadSize = need + need / 2;
+          s.attrUpload = make_buffer(D3D12_HEAP_TYPE_UPLOAD, s.attrUploadSize, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+          if (g.failed)
+            return;
+          RT_HR(s.attrUpload->Map(0, nullptr, &s.attrUploadMap));
+        }
+        u64 at = 0;
+        for (const auto& [first, count] : take) {
+          const u64 bytes = u64(count) * sizeof(scene::WorldAttr);
+          std::memcpy(static_cast<u8*>(s.attrUploadMap) + at, sc.attrs.data() + first, bytes);
+          s.cl->CopyBufferRegion(g.worldAttrs.Get(), u64(first) * sizeof(scene::WorldAttr), s.attrUpload.Get(), at, bytes);
+          at += bytes;
+        }
+        D3D12_RESOURCE_BARRIER b{};
+        b.Transition.pResource = g.worldAttrs.Get();
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        s.cl->ResourceBarrier(1, &b);
+      }
+    }
+  }
   auto& c = job.world.colours;
   if (c.empty())
     c.resize(1);
   c[0] = {};
   c[0].colour[0] = show && job.world.known ? 1.f : 0.f;
   c[0].cls = job.world.known ? job.world.fogDraw : scene::None;
+  c[0].draw = job.world.staticBase;
   stage(s, s.worldMeshes, c.data(), c.size() * sizeof(scene::GpuMesh));
 }
 void world_instances(Slot& s, Job& job, std::vector<D3D12_RAYTRACING_INSTANCE_DESC>& inst) {
@@ -91,6 +137,42 @@ void world_instances(Slot& s, Job& job, std::vector<D3D12_RAYTRACING_INSTANCE_DE
   static const bool show = std::getenv("AURORA_RT_SCENE_SHOW") != nullptr;
   const scene::Scene& sc = *w.scene;
   const D3D12_GPU_VIRTUAL_ADDRESS at = g.worldBlas->GetGPUVirtualAddress();
+  // AURORA_RT_SCENE_STATIC=1: every static placement is in the rays by the scene. One the game drew: at the level it drew, by the matrix it drew with, seen by primary rays too (masks 32, 64; bit 22 of the id says so to the shader).
+  if (scene::static_on()) {
+    const auto put = [&](u32 blas, const float* m, u32 mask, u32 idBit) {
+      if (blas == scene::None)
+        return;
+      D3D12_RAYTRACING_INSTANCE_DESC d{};
+      std::memcpy(d.Transform, m, 48);
+      d.InstanceMask = mask;
+      d.InstanceID = 0x800000u | idBit | (sc.blases[blas].firstMesh + 1);
+      d.AccelerationStructure = at + g.worldAt[blas];
+      inst.push_back(d);
+    };
+    for (const scene::DrawnPair& q : w.pairs) {
+      const scene::ModelBlas& b = sc.modelBlas[q.model];
+      put(b.solid, q.m, 8 | 32, 0x400000u);
+      put(b.see, q.m, 16 | 64, 0x400000u);
+    }
+    for (size_t i = 0; i < sc.placed.size(); ++i) {
+      if (w.drawn[i])
+        continue;
+      const scene::Placed& p = sc.placed[i];
+      float m[12];
+      for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 4; ++c) {
+          float v = w.view[r * 4] * p.world[c] + w.view[r * 4 + 1] * p.world[4 + c] + w.view[r * 4 + 2] * p.world[8 + c];
+          if (c == 3)
+            v += w.view[r * 4 + 3];
+          m[r * 4 + c] = v;
+        }
+      const scene::ModelBlas& b = sc.modelBlas[p.top];
+      put(b.solid, m, 8, 0);
+      put(b.see, m, 16, 0);
+    }
+    g.worldInstances += static_cast<double>(inst.size());
+    return;
+  }
   const auto add = [&](u32 blas, const scene::Placed& p, u32 mask) {
     if (blas == scene::None)
       return;
@@ -117,11 +199,21 @@ void world_instances(Slot& s, Job& job, std::vector<D3D12_RAYTRACING_INSTANCE_DE
 }
 void world_count(const Job& job) {
   const auto& w = job.world;
+  g.worldSkipped += w.skipped, g.worldDropped += std::count(w.drop.begin(), w.drop.end(), u8(1));
   g.worldKnown += w.known ? 1 : 0, g.worldDrawn += w.drawnCount, g.worldDraws += w.draws, g.worldMatched += w.matched, g.worldMoved += w.moved, g.worldMs += w.matchMs, g.worldPartial += w.partial;
 }
 void world_report(double n) {
   if (scene::on() && g.worldScene)
     std::fprintf(stderr, "[rt] scene each frame: camera known %.2f, %.0f placements drawn of %zu, %.0f instances in the rays, draws by their bytes %.0f (%.0f placed where the file says, %.0f elsewhere), %.2f ms beside the rules; %.1f MB of structures; %.1f placements drawn in part\n",
                  g.worldKnown / n, g.worldDrawn / n, g.worldScene->placed.size(), g.worldInstances / n, g.worldDraws / n, g.worldMatched / n, g.worldMoved / n, g.worldMs / n, g.worldBytes / 1048576.0, g.worldPartial / n);
+  if (scene::static_on() && g.worldScene) {
+    const scene::Scene& sc = *g.worldScene;
+    u32 st[4]{};
+    for (u32 i = 0; i < sc.listCount; ++i)
+      ++st[static_cast<u32>(sc.lists[i].state.load(std::memory_order_relaxed))];
+    const scene::KeepCount& k = sc.kept;
+    std::fprintf(stderr, "[rt] static: draws skipped %.0f, translated then dropped %.1f; lists new %u seen %u proved %u kept %u; kept for: copy %u additive %u sky %u glow %u over-world %u coords %u class %u size %u material %u moved %u moved-after-proof %u; audit failures %llu; %zu materials, %zu attrs\n", g.worldSkipped / n, g.worldDropped / n, st[0], st[1], st[2], st[3], k.copy, k.additive, k.sky, k.glow, k.overWorld, k.coords, k.classDiffers, k.sizeDiffers, k.material, k.moved, k.moving, static_cast<unsigned long long>(k.auditFails), sc.staticDraws.size(), sc.attrs.size());
+    g.worldSkipped = g.worldDropped = 0;
+  }
   g.worldKnown = g.worldDrawn = g.worldInstances = g.worldDraws = g.worldMatched = g.worldMoved = g.worldMs = g.worldPartial = 0;
 }

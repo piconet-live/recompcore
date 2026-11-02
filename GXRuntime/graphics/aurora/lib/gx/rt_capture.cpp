@@ -774,6 +774,7 @@ std::unique_ptr<live::Job> s_jobOwned;
 std::unique_ptr<Chunk> s_chunk;
 u32 s_viewDraws = 0;
 float s_sunPower = 0.f, s_sunPos[3]{}, s_sunCol[3]{};
+u32 s_rulesTick = 0;
 u32 s_epoch = 0, s_baseDraw = 0, s_baseVert = 0, s_nextDraw = 0, s_nextVert = 0;
 
 // A light's middle hops as the draws in it change from frame to frame: half a step towards where it was, when it was near
@@ -886,6 +887,19 @@ void run_rules(live::Job& j) {
     tuning.texMeans = s_texAvg;
     tuning.texCount = MostTexAvg;
   }
+  // AURORA_RT_SCENE_STATIC=1: the main view counts what the stream left out, and the camera is known already
+  const bool staticScene = scene::static_on();
+  const scene::StreamView* staticView = nullptr;
+  if (staticScene) {
+    for (u32 i = 0; i < j.world.streamViews && i < 4; ++i) {
+      const scene::StreamView& v = j.world.stream[i];
+      tuning.extraKey[tuning.extraViews] = v.key, tuning.extraVerts[tuning.extraViews] = v.vertices;
+      ++tuning.extraViews;
+      tuning.largestFloor = std::max(tuning.largestFloor, v.largest);
+      if (v.known && (staticView == nullptr || v.vertices > staticView->vertices))
+        staticView = &v;
+    }
+  }
   // Motion data beside the rules, not after them: the rules alone are near a frame's whole time on a busy course, and the picture waits for them
   static std::vector<float> prev;
   static std::mutex motionLock;  // two frames' rules can overlap
@@ -897,11 +911,24 @@ void run_rules(live::Job& j) {
   }();
   if (s_motionOn)
     motionHeld.lock();
+  // the camera's move from the two frames' views, when the stream knew both
+  static float lastView[12];
+  static u64 lastViewCopy = 0;
+  static bool lastViewKnown = false;
+  Rigid staticMove;
+  bool staticMoveKnown = false;
+  if (staticScene && s_motionOn) {
+    if (staticView != nullptr && lastViewKnown && j.copy > lastViewCopy)
+      staticMoveKnown = rigid_a_over_b(lastView, staticView->view, staticMove);
+    if (staticView != nullptr && j.copy > lastViewCopy)
+      std::memcpy(lastView, staticView->view, sizeof lastView), lastViewCopy = j.copy;
+    lastViewKnown = staticView != nullptr;
+  }
   if (s_motionOn && !hashOnly)
-    motion = std::thread([&j] {
+    motion = std::thread([&j, staticMove, staticMoveKnown] {
       static MotionTracker tracker;
       const auto ts0 = std::chrono::steady_clock::now();
-      tracker.step(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, j.copy, prev, j.motion);
+      tracker.step(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, j.copy, prev, j.motion, staticMoveKnown ? &staticMove : nullptr);
       static double stepMs = 0;
       static u32 stepN = 0;
       stepMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts0).count();
@@ -911,8 +938,14 @@ void run_rules(live::Job& j) {
       }
     });
   build_frame(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, tuning, j.frame);
-  if (scene::on() && j.frame.main != nullptr)
-    scene::match(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, s_texAvg, MostTexAvg, j.frame.main->proj[0], j.frame.main->proj[5], j.world);
+  if (staticScene && j.frame.main != nullptr) {
+    scene::match_static(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, s_texAvg, MostTexAvg, j.frame.main->proj[0], j.frame.main->proj[5], j.frame, j.world);
+    assemble_frame(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, j.world.drop.data(), j.frame);
+  } else {
+    assemble_frame(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, nullptr, j.frame);
+    if (scene::on() && !staticScene && j.frame.main != nullptr)
+      scene::match(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, s_texAvg, MostTexAvg, j.frame.main->proj[0], j.frame.main->proj[5], j.world);
+  }
   if (motion.joinable()) {
     motion.join();
     j.frame.prevPos.clear();
@@ -1038,7 +1071,7 @@ void start_workers() {
   (void)started;
 }
 
-u8* packet_room(size_t need) {
+void ensure_job() {
   if (!s_job) {
     start_workers();
     s_jobOwned = live::take_job();
@@ -1055,7 +1088,14 @@ u8* packet_room(size_t need) {
     s_job->done = std::promise<void>();
     s_job->rules = s_job->done.get_future();
     s_epoch = s_baseDraw = s_baseVert = s_nextDraw = s_nextVert = 0;
+    if (scene::static_on()) {
+      s_job->world.scene = scene::current();
+      scene::stream_reset(s_job->world);
+    }
   }
+}
+u8* packet_room(size_t need) {
+  ensure_job();
   if (s_chunk && s_chunk->used + need > s_chunk->capacity)
     publish_chunk();
   if (!s_chunk) {
@@ -1179,6 +1219,22 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
       }
   }
 #endif
+#if defined(AURORA_RT_LIVE)
+  // AURORA_RT_SCENE_STATIC=1: a draw the static scene holds, proved the same, costs its bytes' hash here and nothing further on. Additive and no-depth passes always go on: a second pass over the same list isn't the surface.
+  if (g_live && scene::static_on() && (prim == GX_TRIANGLES || prim == GX_TRIANGLESTRIP || prim == GX_TRIANGLEFAN) && vtxCount >= 3 && st.vtxDesc[GX_VA_PNMTXIDX] == GX_NONE && st.vtxDesc[GX_VA_POS] == GX_DIRECT && st.depthUpdate && st.depthCompare && st.colorUpdate && !(st.blendMode == 1 && st.blendFacDst == 1)) {
+    ensure_job();
+    if (scene::Scene* sc = s_job->world.scene.get()) {
+      const auto& mtx = st.pnMtx[std::min<u32>(st.currentPnMtx, MaxPnMtx - 1)].pos;
+      float m[12] = {mtx.m0.x(), mtx.m0.y(), mtx.m0.z(), mtx.m0.w(), mtx.m1.x(), mtx.m1.y(), mtx.m1.z(), mtx.m1.w(), mtx.m2.x(), mtx.m2.y(), mtx.m2.z(), mtx.m2.w()};
+      float proj[16];
+      std::memcpy(proj, &st.proj, sizeof proj);
+      if (scene::stream_skip(s_job->world, *sc, prim, vtxCount, vertices, rawBytes, m, proj, triangle_vertices(prim, vtxCount), s_rulesTick)) {
+        s_captureMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - liveStart).count();
+        return;
+      }
+    }
+  }
+#endif
   const u32 stages = std::min<u32>(st.numTevStages, 16u);
   const u32 mtxCount = st.vtxDesc[GX_VA_PNMTXIDX] != GX_NONE ? MaxPnMtx : 1;
   bool lit = false;
@@ -1229,6 +1285,8 @@ static void forget_draws() noexcept {
   s_baseDraw = s_nextDraw, s_baseVert = s_nextVert;
   s_job->epoch.store(++s_epoch, std::memory_order_relaxed);
   s_captureMs = 0;
+  if (scene::static_on())
+    scene::stream_reset(s_job->world);
   if (s_nextDraw > MostDraws / 2 || s_nextVert > MostVerts / 2) {
     while (s_job->pending.load(std::memory_order_acquire) > 1)
       std::this_thread::yield();
@@ -1262,6 +1320,7 @@ static void send_rays() noexcept {
     return;
   }
   const u32 draws = s_nextDraw - s_baseDraw;
+  ++s_rulesTick;
   publish_chunk();
   auto job = std::move(s_jobOwned);
   s_job = nullptr;

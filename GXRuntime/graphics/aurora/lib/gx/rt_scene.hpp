@@ -8,10 +8,15 @@
 // their surface, as always); one it did not draw is in the rays by this scene. So one object is never there twice, and no surface ever
 // meets another level of detail of itself. No graphics API here.
 #include "rt_format.hpp"
+#include "rt_rules.hpp"
 
 #include <cstddef>
+#include <cstring>
+#include <atomic>
 #include <cstdint>
+#include <array>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -20,7 +25,16 @@ namespace aurora::gx::rt::scene {
 struct GpuMesh {
   float colour[4];
   std::uint32_t cls;  // as a draw's: 0 solid, 1 translucent, 2 additive, 3 ignored
-  std::uint32_t pad[3];
+  std::uint32_t draw;   // AURORA_RT_SCENE_STATIC: its material as first drawn, in the static draws; else None
+  std::uint32_t first;  // its first vertex in the scene: where its attributes begin
+  std::uint32_t flags;
+};
+// As rt.hlsl's WorldAttr: a vertex as a draw of it was translated, once, in the model's space. nrm 0: not yet drawn. Two sets of coordinates: what the non-reflection stages read.
+struct WorldAttr {
+  float pos[3];
+  std::uint32_t nrm;  // octahedral, 16 bits each, 0x8000 is zero; all ones: the draw has no normal
+  std::uint32_t ras;  // RGBA8
+  float uv[2][2];
 };
 struct Geometry {
   std::uint32_t firstVertex, vertices;  // in positions: triangles, three floats a vertex
@@ -33,8 +47,33 @@ struct Placed {
   float world[12];
   float inverse[12];
   std::uint32_t solid, see;  // index in blases, or none
+  std::uint32_t top;         // its largest level, in models
 };
 constexpr std::uint32_t None = 0xFFFFFFFFu;
+struct ModelBlas {
+  std::uint32_t solid = None, see = None;
+};
+// AURORA_RT_SCENE_STATIC=1. A list as it stands in one model, and what has been proved of it: its translation doesn't change from frame to frame.
+enum class ListState : std::uint8_t { New, Seen, Proved, Keep };
+struct ListOcc {
+  std::uint32_t mesh, first, verts;  // the list's triangles in the mesh's vertices
+};
+struct ListInfo {
+  std::uint32_t model = 0, index = 0;
+  std::vector<ListOcc> occ;
+  std::atomic<ListState> state{ListState::New};
+  std::uint8_t seen = 0;
+  float extent = 0.f;
+};
+struct ListGroup {
+  std::uint64_t key = 0;
+  std::uint32_t first = 0, count = 0;
+};
+// Why lists stay as draws, for the report
+struct KeepCount {
+  std::uint32_t copy = 0, additive = 0, sky = 0, glow = 0, overWorld = 0, coords = 0, classDiffers = 0, sizeDiffers = 0, material = 0, moved = 0, ofMesh = 0, moving = 0;
+  std::uint64_t auditFails = 0;
+};
 struct KeyHit {
   std::uint32_t model;  // in placementsOf
   std::uint32_t mesh;   // in meshes, when this list belongs to the level the scene holds; else None
@@ -58,17 +97,59 @@ struct Scene {
   std::vector<GpuMesh> fromFile;  // meshes as the files alone say: a later file that changes nothing changes no scene
   // what the frames have learned from draws: a mesh's colour by the rays' own rule, once it has been drawn. match() holds a lock for it.
   std::vector<std::uint8_t> learned;
+  // AURORA_RT_SCENE_STATIC=1
+  std::vector<ModelBlas> modelBlas;
+  std::unique_ptr<ListInfo[]> lists;
+  std::uint32_t listCount = 0;
+  std::vector<ListGroup> table;  // open addressed by key; key 0: empty
+  std::uint32_t tableMask = 0;
+  std::vector<std::vector<std::uint32_t>> meshLists;
+  std::vector<std::uint32_t> meshMaterial;  // in staticDraws, or None
+  std::vector<GpuDraw> staticDraws;         // firstStage: in staticStages
+  std::vector<StageRec> staticStages;
+  std::vector<std::array<std::uint8_t, 4>> meshCoords;  // each mesh's texture coordinate sets as the attributes hold them: 0, 1, or 255
+  std::vector<WorldAttr> attrs;  // as long as the positions; written only by the rules, under match's lock
+  std::mutex pendingLock;
+  std::vector<std::pair<std::uint32_t, std::uint32_t>> pending;  // attributes the GPU doesn't have yet: first, count
+  KeepCount kept;
 };
 
 bool on() noexcept;
+bool static_on() noexcept;  // AURORA_RT_SCENE_STATIC=1, with the scene
 // From the reader, on its thread, for files the game is reading (never the disc walk's). Bytes unpacked.
 void add_course(const std::vector<std::uint8_t>& whole);
 void add_file(const char* path, const std::vector<std::uint8_t>& whole);
 // The scene as it stands, or null. Any thread.
 std::shared_ptr<Scene> current();
 
+// A placement drawn this frame: at which level, by which matrix: the draws' own
+struct DrawnPair {
+  std::uint32_t placed, model;
+  float m[12];
+};
+// What the stream knows of one view (a projection) of this frame, before anything is translated
+struct StreamView {
+  std::array<int, 2> key{};
+  bool known = false, lastValid = false;
+  float view[12]{}, inverse[12]{}, lastM[12]{};
+  std::uint32_t lastModel = 0, lastPlaced = 0;
+  std::uint64_t vertices = 0;
+  std::uint32_t skipped = 0;
+  float largest = 0.f;
+  std::vector<DrawnPair> drawn;
+  struct Vote {
+    float view[12];
+    std::uint32_t placed, agree;
+  };
+  std::vector<Vote> votes;
+};
 struct Frame {
   std::shared_ptr<Scene> scene;
+  StreamView stream[4];
+  std::uint32_t streamViews = 0;
+  std::vector<DrawnPair> pairs;  // the main view's, one of each
+  std::vector<std::uint8_t> drop;
+  std::uint32_t staticBase = 0, skipped = 0, proved = 0;
   bool known = false;  // the camera was found: scene's instances go in the rays this frame
   float view[12]{};    // world to this frame's view space
   std::vector<std::uint8_t> drawn;  // a byte for each of scene->placed
@@ -81,6 +162,11 @@ struct Frame {
 // The rules thread, once for each frame in the frame's order or not: the camera, what was drawn. proj0, proj5: the main view's.
 void match(const DrawRec* draws, std::uint32_t count, const Vertex* verts, const float (*texMeans)[4], std::uint32_t texCount,
            float proj0, float proj5, Frame& out);
+// From the stream, before a draw is translated. Static placement, proved list, and this draw needs no translation: true. m: its one matrix.
+void stream_reset(Frame& f);
+bool stream_skip(Frame& f, Scene& sc, std::uint32_t prim, std::uint32_t count, const std::uint8_t* bytes, std::size_t used, const float m[12], const float proj[16], std::uint32_t triVerts, std::uint32_t tick);
+// The rules thread, AURORA_RT_SCENE_STATIC=1: as match, and learns the draws it sees; fr gets the static draws after its own, fr's assemble_frame takes out.drop.
+void match_static(const DrawRec* draws, std::uint32_t count, const Vertex* verts, const float (*texMeans)[4], std::uint32_t texCount, float proj0, float proj5, aurora::gx::rt::Frame& fr, Frame& out);
 // The same hash on the same bytes as the file's lists: FNV's start, then 64-bit words
 inline std::uint64_t list_key(std::uint32_t prim, std::uint32_t count, const std::uint8_t* bytes, std::size_t used, std::uint64_t* state = nullptr) {
   std::uint64_t h = 0xcbf29ce484222325ull ^ (static_cast<std::uint64_t>(prim) << 32 | count);
@@ -90,9 +176,8 @@ inline std::uint64_t list_key(std::uint32_t prim, std::uint32_t count, const std
   };
   std::size_t at = 0;
   for (; at + 8 <= used; at += 8) {
-    std::uint64_t w = 0;
-    for (int i = 0; i < 8; ++i)
-      w |= static_cast<std::uint64_t>(bytes[at + i]) << (i * 8);
+    std::uint64_t w;
+    std::memcpy(&w, bytes + at, 8);  // little-endian hosts only, as everything here
     mix(w);
   }
   std::uint64_t w = 0;

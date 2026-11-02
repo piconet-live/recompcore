@@ -54,8 +54,14 @@ static const uint MaskSolid = 1, MaskSky = 2, MaskSee = 4, MaskSeen = MaskSolid 
 // A hit knows its mesh by the instance's id and the geometry's index; element 0 holds the frame's facts: colour.x 1 shows the scene (a test), cls a draw whose fog far hits take.
 static const uint MaskWorld = 8, MaskWorldSee = 16, WorldId = 0x800000;
 static const uint MaskRaySolid = MaskSolid | MaskWorld, MaskRaySeen = MaskSeen | MaskWorld | MaskWorldSee;
-struct WorldMesh { float4 colour; uint cls; uint3 pad; };
+// AURORA_RT_SCENE_STATIC=1: a placement the game drew has these too, so primary rays see it, at the level and matrix the game drew it by; its id has WorldDrawn. Element 0's draw: where the static draws begin.
+static const uint MaskWorldDrawn = 32, MaskWorldDrawnSee = 64, WorldDrawn = 0x400000, WorldMask = 0x3FFFFF;
+static const uint MaskPrimary = MaskSeen | MaskWorldDrawn | MaskWorldDrawnSee;
+static const uint NoDraw = 0xFFFFFFFFu;
+struct WorldMesh { float4 colour; uint cls; uint draw; uint first; uint flags; };
 StructuredBuffer<WorldMesh> World : register(t11);
+struct WorldAttr { float3 pos; uint nrm; uint ras; float2 uv[2]; };
+StructuredBuffer<WorldAttr> WorldAttrs : register(t12);
 ConstantBuffer<Params> P : register(b0);
 RaytracingAccelerationStructure Scene : register(t0);
 StructuredBuffer<Vertex> Verts : register(t1);
@@ -129,6 +135,34 @@ Hit fetch(uint prim, float2 bary) {
   h.rate = 0;
   h.foot = 0;
   return h;
+}
+WorldMesh world_mesh(uint inst, uint geo) { return World[(inst & WorldMask) + geo]; }
+float4 ras_of(uint r) { return float4(r & 255, (r >> 8) & 255, (r >> 16) & 255, r >> 24) / 255.0; }
+float3 nrm_of(uint n) {
+  float2 e = float2(float(n & 0xFFFF) - 32768.0, float(n >> 16) - 32768.0) / 32767.0;
+  float3 v = float3(e, 1 - abs(e.x) - abs(e.y));
+  if (v.z < 0) v.xy = (1 - abs(v.yx)) * float2(v.x >= 0 ? 1 : -1, v.y >= 0 ? 1 : -1);
+  return v;
+}
+// A scene triangle as a draw of it was translated: the same Hit a draw gives, so the same shade() reads it. False: no draw of this mesh or triangle yet.
+bool world_fetch(WorldMesh m, uint prim, float2 bary, float3x4 o2w, out Hit h) {
+  h = (Hit)0;
+  if (m.draw == NoDraw) return false;
+  WorldAttr a = WorldAttrs[m.first + prim * 3], b = WorldAttrs[m.first + prim * 3 + 1], c = WorldAttrs[m.first + prim * 3 + 2];
+  if (a.nrm == 0 || b.nrm == 0 || c.nrm == 0) return false;
+  float3 w = float3(1 - bary.x - bary.y, bary.x, bary.y);
+  h.pos = mul(o2w, float4(a.pos * w.x + b.pos * w.y + c.pos * w.z, 1));
+  float3 n = a.nrm == NoDraw ? 0.xxx : nrm_of(a.nrm) * w.x + nrm_of(b.nrm) * w.y + nrm_of(c.nrm) * w.z;
+  if (dot(n, n) < 1e-6) n = cross(b.pos - a.pos, c.pos - a.pos);
+  h.nrm = normalize(mul((float3x3)o2w, n));
+  h.ras = ras_of(a.ras) * w.x + ras_of(b.ras) * w.y + ras_of(c.ras) * w.z;
+  for (int i = 0; i < 2; ++i) {
+    h.uv[i] = a.uv[i] * w.x + b.uv[i] * w.y + c.uv[i] * w.z;
+    float2 e1 = b.uv[i] - a.uv[i], e2 = c.uv[i] - a.uv[i];
+    h.rate[i] = sqrt(abs(e1.x * e2.y - e1.y * e2.x) / max(length(cross(b.pos - a.pos, c.pos - a.pos)), 1e-6));
+  }
+  h.draw = World[0].draw + m.draw;
+  return true;
 }
 // How fast each set of texture coordinates runs across this triangle, per unit of world: what a pixel's footprint needs to pick a texture level
 float4 uv_rates(uint prim) {
@@ -223,9 +257,17 @@ float3 trace_reflection(float3 org, float3 dir, float maxLodScale) {
     q.Proceed();
     if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) { sum += through * (P.miss + sky_along(dir, 2.0)); break; }
     float t = q.CommittedRayT();
+    Hit h;
+    bool have = false;
     if (q.CommittedInstanceID() >= WorldId) {
-      WorldMesh m = World[(q.CommittedInstanceID() & (WorldId - 1)) + q.CommittedGeometryIndex()];
+      WorldMesh m = world_mesh(q.CommittedInstanceID(), q.CommittedGeometryIndex());
       tmin = t + 0.02;
+      have = world_fetch(m, q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), q.CommittedObjectToWorld3x4(), h);
+      // the game drew this placement but not by this triangle, or by a draw still in the rays
+      if (!have && (q.CommittedInstanceID() & WorldDrawn) != 0) continue;
+    }
+    if (q.CommittedInstanceID() >= WorldId && !have) {
+      WorldMesh m = world_mesh(q.CommittedInstanceID(), q.CommittedGeometryIndex());
       if (m.cls == 3) continue;
       float3 wc = m.colour.rgb;
       if (World[0].cls != 0xFFFFFFFFu) wc = fogged(Draws[World[0].cls], org + dir * t, wc);
@@ -234,7 +276,7 @@ float3 trace_reflection(float3 org, float3 dir, float maxLodScale) {
       sum += through * wc;
       break;
     }
-    Hit h = fetch(q.CommittedInstanceID() + q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
+    if (!have) h = fetch(q.CommittedInstanceID() + q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
     Draw d = Draws[h.draw];
     tmin = t + 0.02;
     if (d.cls == 3) continue;
@@ -331,8 +373,15 @@ void light_rays(float3 pos, float3 N, float dist, float2 xi, out float open, out
       float4 c = 0;
       uint cls;
       if (q.CommittedInstanceID() >= WorldId) {
-        WorldMesh m = World[(q.CommittedInstanceID() & (WorldId - 1)) + q.CommittedGeometryIndex()];
-        cls = m.cls, c = m.colour;
+        WorldMesh m = world_mesh(q.CommittedInstanceID(), q.CommittedGeometryIndex());
+        Hit wh;
+        if (world_fetch(m, q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), q.CommittedObjectToWorld3x4(), wh)) {
+          cls = Draws[wh.draw].cls;
+          if (cls != 3) c = shade(wh, 3.0);
+        } else {
+          if ((q.CommittedInstanceID() & WorldDrawn) != 0) continue;
+          cls = m.cls, c = m.colour;
+        }
       } else {
         Hit h = fetch(q.CommittedInstanceID() + q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
         cls = Draws[h.draw].cls;
@@ -369,9 +418,13 @@ float sun_term(float3 pos, float3 N, float dist) {
     if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) return ndl;
     float t = q.CommittedRayT();
     if (q.CommittedInstanceID() >= WorldId) {
-      WorldMesh m = World[(q.CommittedInstanceID() & (WorldId - 1)) + q.CommittedGeometryIndex()];
+      WorldMesh m = world_mesh(q.CommittedInstanceID(), q.CommittedGeometryIndex());
       tmin = t + 0.02;
-      if (m.cls == 0 || (m.cls == 1 && m.colour.a >= 0.5)) return 0;
+      Hit wh;
+      const bool known = world_fetch(m, q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), q.CommittedObjectToWorld3x4(), wh);
+      if (!known && (q.CommittedInstanceID() & WorldDrawn) != 0) continue;
+      if (m.cls == 0) return 0;
+      if (m.cls == 1 && (known ? Draws[wh.draw].cls == 0 || shade(wh, 2.0).a >= 0.5 : m.colour.a >= 0.5)) return 0;
       continue;
     }
     Hit h = fetch(q.CommittedInstanceID() + q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
@@ -419,7 +472,7 @@ void main(uint3 id : SV_DispatchThreadID) {
       sq.TraceRayInline(Scene, RAY_FLAG_NONE, MaskWorld | MaskWorldSee, sr);
       sq.Proceed();
       if (sq.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
-        WorldMesh m = World[(sq.CommittedInstanceID() & (WorldId - 1)) + sq.CommittedGeometryIndex()];
+        WorldMesh m = world_mesh(sq.CommittedInstanceID(), sq.CommittedGeometryIndex());
         float3 shown = m.colour.rgb * (0.6 + 0.4 * frac(sq.CommittedPrimitiveIndex() * 0.37));
         Out[id.xy] = float4(lerp(0.xxx, shown - raster, 0.75), sq.CommittedRayT());
         return;
@@ -428,11 +481,19 @@ void main(uint3 id : SV_DispatchThreadID) {
     for (int i = 0; i < 8; ++i) {
       RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
       RayDesc ray; ray.Origin = 0; ray.Direction = v; ray.TMin = tmin; ray.TMax = 100000;
-      q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskSeen, ray);
+      q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskPrimary, ray);
       q.Proceed();
       if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) break;
       float t = q.CommittedRayT();
-      Hit h = fetch(q.CommittedInstanceID() + q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
+      Hit h;
+      const bool worldHit = q.CommittedInstanceID() >= WorldId;
+      if (worldHit) {
+        WorldMesh wm = world_mesh(q.CommittedInstanceID(), q.CommittedGeometryIndex());
+        // a part still drawn: its draw is in the rays; a part never drawn: the raster has nothing of it here
+        if (!world_fetch(wm, q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), q.CommittedObjectToWorld3x4(), h)) { tmin = t + 0.02; continue; }
+      } else {
+        h = fetch(q.CommittedInstanceID() + q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
+      }
       Draw d = Draws[h.draw];
       if (P.mode == 7) { dbg = float3(h.draw & 255, (h.draw >> 8) & 255, 1) / 255.0; break; }
       if (d.cls >= 2) { tmin = t + 0.02; continue; }
@@ -453,7 +514,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         // The material rule (AURORA_RT_LOOK=2, signalled by a negative wet): one rule for every surface, from this draw's own layer and texture. The raster keeps
         // the game's own reflection layers here, so it is the rays-off picture: same game, better lit. A low Fresnel base, and light only where a reflection is brighter than the surface.
         uint prim = q.CommittedInstanceID() + q.CommittedPrimitiveIndex();
-        h.rate = uv_rates(prim);
+        if (!worldHit) h.rate = uv_rates(prim);
         // a pixel's width at this hit, longer along a grazing view: the texture level the raster's own filtering would pick, so shine doesn't crawl
         h.foot = t * 2 / max(abs(P.pScale.y) * P.size.y, 1) / sqrt(max(cosv, 0.05));
         float3 own = shade(h, 0).rgb;
@@ -571,20 +632,29 @@ void light_pass(uint3 id : SV_DispatchThreadID) {
   for (int i = 0; i < 8; ++i) {
     RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
     RayDesc ray; ray.Origin = 0; ray.Direction = v; ray.TMin = tmin; ray.TMax = 100000;
-    q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskSeen, ray);
+    q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskPrimary, ray);
     q.Proceed();
     if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) break;
     float t = q.CommittedRayT();
     uint prim = q.CommittedInstanceID() + q.CommittedPrimitiveIndex();
     float2 bary = q.CommittedTriangleBarycentrics();
-    Hit h = fetch(prim, bary);
+    Hit h;
+    const bool worldHit = q.CommittedInstanceID() >= WorldId;
+    if (worldHit) {
+      WorldMesh wm = world_mesh(q.CommittedInstanceID(), q.CommittedGeometryIndex());
+      if (!world_fetch(wm, q.CommittedPrimitiveIndex(), bary, q.CommittedObjectToWorld3x4(), h)) { tmin = t + 0.02; continue; }
+    } else {
+      h = fetch(prim, bary);
+    }
     Draw d = Draws[h.draw];
     if (d.cls >= 2) { tmin = t + 0.02; continue; }
     if (d.cls == 1 && d.strength <= 0 && shade(h, 0).a < 0.5) { tmin = t + 0.02; continue; }
     float3 N = h.nrm;
     if (dot(N, v) > 0) N = -N;
     float3 w = float3(1 - bary.x - bary.y, bary.x, bary.y);
-    prevAt = PrevPos[prim * 3] * w.x + PrevPos[prim * 3 + 1] * w.y + PrevPos[prim * 3 + 2] * w.z;
+    // a static surface moves only with the camera
+    prevAt = worldHit ? float3(dot(DP.cam[0], float4(h.pos, 1)), dot(DP.cam[1], float4(h.pos, 1)), dot(DP.cam[2], float4(h.pos, 1)))
+                      : PrevPos[prim * 3] * w.x + PrevPos[prim * 3 + 1] * w.y + PrevPos[prim * 3 + 2] * w.z;
     prevZ = -prevAt.z;
     // a draw outside the depth is drawn over the world: it stays sharp
     smear = (d.highlight & 4) != 0 ? 0 : 1;

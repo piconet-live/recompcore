@@ -56,7 +56,7 @@ struct MotionResult {
 class MotionTracker {
 public:
   // prevPos: three floats a vertex, in the same order as verts (d.firstVertex). Called once a frame, in frame order; an older frame arriving late gets known = false.
-  void step(const DrawRec* draws, std::uint32_t count, const Vertex* verts, std::uint64_t copy, std::vector<float>& prevPos, MotionResult& out) {
+  void step(const DrawRec* draws, std::uint32_t count, const Vertex* verts, std::uint64_t copy, std::vector<float>& prevPos, MotionResult& out, const Rigid* given = nullptr) {
     std::uint32_t total = 0;
     for (std::uint32_t i = 0; i < count; ++i)
       total = std::max(total, draws[i].firstVertex + draws[i].vertices);
@@ -64,7 +64,9 @@ public:
     rigid_identity(out.prevFromCur);
     out.known = false, out.agreeing = 0.f, out.matched = 0.f;
     const bool inOrder = copy > m_copy;
-    if (inOrder && !m_last.empty())
+    if (inOrder && given != nullptr) {
+      out.prevFromCur = *given, out.known = true, out.agreeing = 1.f;
+    } else if (inOrder && !m_last.empty())
       find_camera(draws, count, out);
     std::uint64_t own = 0, all = 0;
     for (std::uint32_t i = 0; i < count; ++i) {

@@ -233,11 +233,13 @@ struct Decoded {
   float colour[3]{};
   u64 colourCount = 0;
   std::vector<u64> keys;
+  std::vector<std::pair<u32, u32>> keyAt;  // each key's first vertex and vertices in positions
 };
 // A mesh's lists: its triangles, its colours' mean, and each primitive's key
 void decode_lists(const std::vector<u8>& d, const MeshAt& m, const Form& f, Decoded& out) {
   out.positions.clear();
   out.keys.clear();
+  out.keyAt.clear();
   out.colour[0] = out.colour[1] = out.colour[2] = 0, out.colourCount = 0;
   const float k = 1.f / (1 << 13);
   const auto position = [&](const u8* v, float p[3]) {
@@ -263,6 +265,7 @@ void decode_lists(const std::vector<u8>& d, const MeshAt& m, const Form& f, Deco
       if (p + 3 + bytes > end)
         break;
       out.keys.push_back(list_key(prim, count, v, bytes));
+      const u32 keyFirst = static_cast<u32>(out.positions.size() / 3);
       const auto tri = [&](u32 a, u32 b, u32 c) {
         float x[3];
         for (const u32 i : {a, b, c}) {
@@ -279,6 +282,7 @@ void decode_lists(const std::vector<u8>& d, const MeshAt& m, const Form& f, Deco
       else
         for (u32 i = 1; i + 1 < count; ++i)
           tri(0, i, i + 1);
+      out.keyAt.emplace_back(keyFirst, static_cast<u32>(out.positions.size() / 3) - keyFirst);
       if (f.colour)
         for (u32 i = 0; i < count; ++i) {
           const u8* cv = v + size_t(i) * f.stride + f.colourAt;
@@ -308,6 +312,47 @@ void multiply(const float a[12], const float b[12], float out[12]) {
   }
 }
 
+// Each key with its lists, one for each model that holds it; a flat table the stream asks once a draw
+template <class Occs>
+void make_table(Scene& sc, Occs& occs) {
+  std::sort(occs.begin(), occs.end(), [](const auto& a, const auto& b) { return a.key != b.key ? a.key < b.key : a.model < b.model; });
+  u32 lists = 0, groups = 0;
+  for (size_t i = 0; i < occs.size(); ++i) {
+    groups += i == 0 || occs[i].key != occs[i - 1].key ? 1 : 0;
+    lists += i == 0 || occs[i].key != occs[i - 1].key || occs[i].model != occs[i - 1].model ? 1 : 0;
+  }
+  sc.lists.reset(new ListInfo[std::max(lists, 1u)]);
+  sc.listCount = lists;
+  u32 size = 1024;
+  while (size < groups * 2)
+    size *= 2;
+  sc.table.assign(size, ListGroup{});
+  sc.tableMask = size - 1;
+  sc.meshLists.assign(sc.meshes.size(), {});
+  sc.meshMaterial.assign(sc.meshes.size(), None);
+  sc.meshCoords.assign(sc.meshes.size(), {255, 255, 255, 255});
+  sc.attrs.assign(sc.positions.size() / 3, WorldAttr{});
+  u32 at = 0;
+  for (size_t i = 0; i < occs.size();) {
+    const u64 key = occs[i].key;
+    u32 slot = static_cast<u32>(key >> 20) & sc.tableMask;
+    while (sc.table[slot].key != 0)
+      slot = (slot + 1) & sc.tableMask;
+    ListGroup& g = sc.table[slot];
+    g.key = key, g.first = at;
+    while (i < occs.size() && occs[i].key == key) {
+      ListInfo& L = sc.lists[at];
+      L.model = occs[i].model, L.index = at;
+      const u32 model = L.model;
+      for (; i < occs.size() && occs[i].key == key && occs[i].model == model; ++i) {
+        L.occ.push_back(occs[i].at);
+        sc.meshLists[occs[i].at.mesh].push_back(at);
+      }
+      ++at, ++g.count;
+    }
+  }
+}
+
 // Course file and model files together, under the lock. A placement that animates (the file gives it a clip and no fixed matrix) moves: it
 // reaches rays only when drawn. Each object's level with the most triangles goes in the scene; the draws of all levels are known.
 std::shared_ptr<Scene> resolve() {
@@ -328,6 +373,13 @@ std::shared_ptr<Scene> resolve() {
   std::map<std::string, Built> built;
   std::vector<MeshAt> meshes;
   Decoded dec;
+  // every list as it stands in a model, for the table below
+  struct Occ {
+    u64 key;
+    u32 model;
+    ListOcc at;
+  };
+  std::vector<Occ> occs;
   // one model once: its keys, and its triangles when the scene holds it (want)
   const auto model_of = [&](const std::string& name, bool want) -> Built* {
     auto [it, fresh] = built.try_emplace(name);
@@ -336,6 +388,7 @@ std::shared_ptr<Scene> resolve() {
       b.model = static_cast<u32>(scene->placementsOf.size());
       scene->placementsOf.emplace_back();
       scene->primitivesOf.push_back(0);
+      scene->modelBlas.emplace_back();
     }
     const auto found = s_models.find(name);
     if (found == s_models.end())
@@ -350,7 +403,11 @@ std::shared_ptr<Scene> resolve() {
     Blas solid{static_cast<u32>(scene->geometries.size()), 0, 0}, see{};
     std::vector<Geometry> seeGeometries;
     std::vector<GpuMesh> solidMeshes, seeMeshes;
-    std::vector<std::vector<u64>> solidKeys, seeKeys;
+    struct KeyList {
+      std::vector<u64> keys;
+      std::vector<std::pair<u32, u32>> at;
+    };
+    std::vector<KeyList> solidKeys, seeKeys;
     b.triangles = 0;
     for (const MeshAt& m : meshes) {
       Form f;
@@ -368,6 +425,7 @@ std::shared_ptr<Scene> resolve() {
       if (!want || dec.positions.empty())
         continue;
       GpuMesh g{};
+      g.draw = None;
       float vm[3] = {1, 1, 1};
       if (dec.colourCount != 0)
         for (int c = 0; c < 3; ++c)
@@ -375,29 +433,33 @@ std::shared_ptr<Scene> resolve() {
       mesh_colour(file, at.at, m, at.textures, vm, g.colour);
       g.cls = mesh_class(m);
       const Geometry geo{static_cast<u32>(scene->positions.size() / 3), static_cast<u32>(dec.positions.size() / 3)};
+      g.first = geo.firstVertex;
       scene->positions.insert(scene->positions.end(), dec.positions.begin(), dec.positions.end());
       b.triangles += geo.vertices / 3;
       if (g.cls == 0) {
         scene->geometries.push_back(geo);
         solidMeshes.push_back(g);
-        solidKeys.push_back(dec.keys);
+        solidKeys.push_back({dec.keys, dec.keyAt});
       } else {
         seeGeometries.push_back(geo);
         seeMeshes.push_back(g);
-        seeKeys.push_back(dec.keys);
+        seeKeys.push_back({dec.keys, dec.keyAt});
       }
     }
     b.done = true;
     if (!want)
       return &b;
-    const auto keep = [&](const std::vector<GpuMesh>& ms, const std::vector<std::vector<u64>>& keys) {
+    const auto keep = [&](const std::vector<GpuMesh>& ms, const std::vector<KeyList>& keys) {
       const u32 first = static_cast<u32>(scene->meshes.size());
       for (size_t i = 0; i < ms.size(); ++i) {
         scene->meshes.push_back(ms[i]);
-        for (const u64 key : keys[i])
+        for (size_t q = 0; q < keys[i].keys.size(); ++q) {
+          const u64 key = keys[i].keys[q];
           for (KeyHit& hit : scene->keys[key])
             if (hit.model == b.model)
               hit.mesh = first + static_cast<u32>(i);
+          occs.push_back({key, b.model, {first + static_cast<u32>(i), keys[i].at[q].first, keys[i].at[q].second}});
+        }
       }
       return first;
     };
@@ -415,6 +477,7 @@ std::shared_ptr<Scene> resolve() {
       b.see = static_cast<u32>(scene->blases.size());
       scene->blases.push_back(see);
     }
+    scene->modelBlas[b.model] = {b.solid, b.see};
     return &b;
   };
   for (u32 i = 0; i < count; ++i) {
@@ -465,17 +528,19 @@ std::shared_ptr<Scene> resolve() {
       ++scene->unresolved;
       continue;
     }
-    placed.solid = top->solid, placed.see = top->see;
+    placed.solid = top->solid, placed.see = top->see, placed.top = top->model;
     scene->placed.push_back(placed);
     scene->trianglesPlaced += top->triangles;
     for (const std::string& name : names)
-      if (const Built* b = model_of(name, false); b != nullptr)
+      if (const Built* b = model_of(name, static_on()); b != nullptr)
         scene->placementsOf[b->model].push_back({placed.world[3], index});
   }
   for (auto& list2 : scene->placementsOf)
     std::sort(list2.begin(), list2.end(), [](const PlacedAt& a, const PlacedAt& b) { return a.x < b.x; });
   scene->triangles = scene->positions.size() / 9;
   scene->fromFile = scene->meshes;
+  if (static_on())
+    make_table(*scene, occs);
   scene->learned.assign(scene->meshes.size(), 0);
   scene->loadMs = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
   std::fprintf(stderr, "[rt] scene: %zu placed, %u move, %u names no file holds, %zu models' structures, %zu meshes, %llu triangles (%llu placed), %u meshes declined, %.0f ms\n",
@@ -516,6 +581,31 @@ void changed() {
   s_wake.notify_all();
 }
 
+const ListGroup* find_group(const Scene& sc, u64 key) {
+  if (sc.table.empty())
+    return nullptr;
+  u32 slot = static_cast<u32>(key >> 20) & sc.tableMask;
+  while (sc.table[slot].key != 0) {
+    if (sc.table[slot].key == key)
+      return &sc.table[slot];
+    slot = (slot + 1) & sc.tableMask;
+  }
+  return nullptr;
+}
+// Where the file places this model at this world matrix, if it does
+u32 placed_at(const Scene& sc, u32 model, const float world[12]) {
+  const auto& where = sc.placementsOf[model];
+  auto at = std::lower_bound(where.begin(), where.end(), world[3] - 0.5f, [](const PlacedAt& a, float x) { return a.x < x; });
+  for (; at != where.end() && at->x <= world[3] + 0.5f; ++at) {
+    const Placed& p = sc.placed[at->placed];
+    float diff = 0.f;
+    for (int k = 0; k < 12; ++k)
+      diff = std::max(diff, std::fabs(world[k] - p.world[k]) / ((k % 4) == 3 ? 16.f : 1.f));
+    if (diff < 0.03f)
+      return at->placed;
+  }
+  return None;
+}
 bool same_view(const float a[12], const float b[12]) {
   Rigid x, y;
   std::memcpy(x.m, a, 48), std::memcpy(y.m, b, 48);
@@ -543,6 +633,13 @@ bool on() noexcept {
   static const bool v = [] {
     const char* e = std::getenv("AURORA_RT_SCENE");
     return e != nullptr && e[0] == '1';
+  }();
+  return v;
+}
+bool static_on() noexcept {
+  static const bool v = [] {
+    const char* e = std::getenv("AURORA_RT_SCENE_STATIC");
+    return e != nullptr && e[0] == '1' && on();
   }();
   return v;
 }
@@ -717,6 +814,415 @@ void match(const DrawRec* draws, u32 count, const Vertex* verts, const float (*t
     for (size_t i = 0; i < partCount.size(); ++i)
       if (partModel[i] != None && partCount[i] < sc.primitivesOf[partModel[i]])
         ++out.partial;
+  }
+  out.colours.resize(sc.meshes.size() + 1);
+  if (!sc.meshes.empty())
+    std::memcpy(out.colours.data() + 1, sc.meshes.data(), sc.meshes.size() * sizeof(GpuMesh));
+  out.matchMs = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+}
+
+// ---- AURORA_RT_SCENE_STATIC=1: the static track without per-frame translation. A draw of a list the file places, at the place the file says, after its translation has been
+// seen to stay the same, isn't translated: the scene holds its triangles, every level of them, with the attributes and material its own translation gave the first time.
+namespace {
+// Tuned: how many frames a list's translation must match before it is skipped; one list in this many is checked again each frame, by letting its draw through; how many views a frame can agree on; how far numbers may stray
+constexpr u32 ProofFrames = 3, AuditEvery = 512, VotesToKnow = 3;
+constexpr float CoordsEps = 1.f / 512.f;
+constexpr int RasEps = 2;
+constexpr float NormalCos = 0.999f;
+
+void note_view(StreamView& v, const float view[12]) {
+  std::memcpy(v.view, view, 48);
+  invert(view, v.inverse);
+  v.known = true;
+  v.votes.clear();
+}
+// A list placed few times says where the view is, for each place. Three different placements that agree: that's the view.
+void vote(StreamView& v, const Scene& sc, const ListInfo& L, const float m[12]) {
+  const auto& where = sc.placementsOf[L.model];
+  if (where.size() > 8)
+    return;
+  for (const PlacedAt& w : where) {
+    StreamView::Vote n;
+    multiply(m, sc.placed[w.placed].inverse, n.view);
+    if (!rigid_enough(n.view))
+      continue;
+    n.placed = w.placed, n.agree = 1;
+    bool joined = false;
+    for (StreamView::Vote& o : v.votes)
+      if (same_view(o.view, n.view)) {
+        joined = true;
+        if (o.placed != n.placed) {
+          o.placed = n.placed;
+          if (++o.agree >= VotesToKnow) {
+            float view[12];
+            std::memcpy(view, o.view, 48);
+            note_view(v, view);
+            return;
+          }
+        }
+        break;
+      }
+    if (!joined && v.votes.size() < 256)
+      v.votes.push_back(n);
+  }
+}
+} // namespace
+
+void stream_reset(Frame& f) {
+  for (u32 i = 0; i < f.streamViews; ++i) {
+    StreamView& v = f.stream[i];
+    v.known = v.lastValid = false, v.vertices = 0, v.skipped = 0, v.largest = 0.f;
+    v.drawn.clear(), v.votes.clear();
+  }
+  f.streamViews = 0;
+}
+
+bool stream_skip(Frame& f, Scene& sc, u32 prim, u32 count, const u8* bytes, size_t used, const float m[12], const float proj[16], u32 triVerts, u32 tick) {
+  const ListGroup* g = find_group(sc, list_key(prim, count, bytes, used));
+  if (g == nullptr)
+    return false;
+  const std::array<int, 2> key{static_cast<int>(proj[0] * 1000), static_cast<int>(proj[5] * 1000)};
+  StreamView* v = nullptr;
+  for (u32 i = 0; i < f.streamViews; ++i)
+    if (f.stream[i].key == key)
+      v = &f.stream[i];
+  if (v == nullptr) {
+    if (f.streamViews == 4)
+      return false;
+    v = &f.stream[f.streamViews++];
+    v->key = key;
+  }
+  if (!v->known) {
+    if (count < 16)
+      return false;
+    for (u32 i = 0; i < g->count && !v->known; ++i)
+      vote(*v, sc, sc.lists[g->first + i], m);
+    return false;
+  }
+  const ListInfo* L = nullptr;
+  if (v->lastValid && std::memcmp(m, v->lastM, 48) == 0)
+    for (u32 i = 0; i < g->count; ++i)
+      if (sc.lists[g->first + i].model == v->lastModel)
+        L = &sc.lists[g->first + i];
+  if (L == nullptr) {
+    float world[12];
+    multiply(v->inverse, m, world);
+    for (u32 i = 0; i < g->count && L == nullptr; ++i) {
+      const ListInfo& o = sc.lists[g->first + i];
+      const u32 p = placed_at(sc, o.model, world);
+      if (p != None) {
+        L = &o;
+        v->lastValid = true, v->lastModel = o.model, v->lastPlaced = p;
+        std::memcpy(v->lastM, m, 48);
+        DrawnPair pair{p, o.model, {}};
+        std::memcpy(pair.m, m, 48);
+        v->drawn.push_back(pair);
+      }
+    }
+    if (L == nullptr)
+      return false;
+  }
+  if (L->state.load(std::memory_order_relaxed) != ListState::Proved || ((tick + L->index) % AuditEvery) == 0)
+    return false;
+  v->vertices += triVerts, ++v->skipped;
+  v->largest = std::max(v->largest, L->extent);
+  return true;
+}
+
+namespace {
+struct Material {
+  GpuDraw draw;
+  std::vector<StageRec> stages;
+  std::array<u8, 4> coords{255, 255, 255, 255};
+};
+// A draw's material as the rays read it, without what they never read (stale registers, a reflection layer's fields, a K colour no stage picks): those change without the surface changing.
+bool material_of(const DrawRec& d, const GpuDraw& from, Material& out) {
+  out.draw = from;
+  out.draw.firstStage = 0;
+  out.stages.assign(d.stage, d.stage + from.stages);
+  out.coords = {255, 255, 255, 255};
+  bool reads[4]{};
+  u8 next = 0;
+  for (StageRec& s : out.stages) {
+    if (s.reflection != 0) {
+      const u32 r = s.reflection;
+      s = StageRec{};
+      s.reflection = r;
+      s.tex = None;
+      continue;
+    }
+    if (s.tex != None) {
+      if (s.tc >= 4)
+        return false;
+      if (out.coords[s.tc] == 255) {
+        if (next == 2)
+          return false;
+        out.coords[s.tc] = next++;
+      }
+      s.tc = out.coords[s.tc];
+    } else {
+      s.tc = 0;
+    }
+    for (const u32 a : {s.ca, s.cb, s.cc, s.cd})
+      if (a < 8)
+        reads[a / 2] = true;
+    for (const u32 a : {s.aa, s.ab, s.ac, s.ad})
+      if (a < 4)
+        reads[a] = true;
+    const bool konst = s.ca == 14 || s.cb == 14 || s.cc == 14 || s.cd == 14, konstA = s.aa == 6 || s.ab == 6 || s.ac == 6 || s.ad == 6;
+    if (!konst)
+      s.k[0] = s.k[1] = s.k[2] = 0.f, s.kc = 0;
+    if (!konstA)
+      s.k[3] = 0.f, s.ka = 0;
+  }
+  for (int r = 0; r < 4; ++r)
+    if (!reads[r])
+      std::memset(out.draw.regs[r], 0, sizeof out.draw.regs[r]);
+  if (out.draw.fogType == 0)
+    std::memset(out.draw.fog, 0, sizeof out.draw.fog), std::memset(out.draw.fogColour, 0, sizeof out.draw.fogColour);
+  return true;
+}
+bool same_material(const Scene& sc, u32 index, const Material& m) {
+  const GpuDraw& o = sc.staticDraws[index];
+  GpuDraw a = o, b = m.draw;
+  a.firstStage = b.firstStage = 0;
+  if (std::memcmp(&a, &b, sizeof a) != 0)
+    return false;
+  return std::memcmp(sc.staticStages.data() + o.firstStage, m.stages.data(), sizeof(StageRec) * m.stages.size()) == 0;
+}
+// The list's vertices in its model's space, with the matrix the draw was drawn by
+void attrs_of(const Vertex* v, u32 count, const float m[12], const DrawRec& d, const std::array<u8, 4>& coords, std::vector<WorldAttr>& out) {
+  out.resize(count);
+  for (u32 i = 0; i < count; ++i) {
+    const Vertex& a = v[i];
+    WorldAttr& o = out[i];
+    o.pos[0] = o.pos[1] = o.pos[2] = 0.f;
+    if (d.hasNormal) {
+      // the matrix is rigid: its transpose takes a normal back
+      float n[3];
+      for (int c = 0; c < 3; ++c)
+        n[c] = m[c] * a.nrm[0] + m[4 + c] * a.nrm[1] + m[8 + c] * a.nrm[2];
+      const float s = std::fabs(n[0]) + std::fabs(n[1]) + std::fabs(n[2]);
+      float x = s > 0 ? n[0] / s : 0.f, y = s > 0 ? n[1] / s : 0.f;
+      if (n[2] < 0) {
+        const float px = (1 - std::fabs(y)) * (x >= 0 ? 1.f : -1.f), py = (1 - std::fabs(x)) * (y >= 0 ? 1.f : -1.f);
+        x = px, y = py;
+      }
+      const u32 ix = static_cast<u32>(std::clamp(static_cast<int>(std::lround(x * 32767.f)) + 32768, 0, 65534));
+      const u32 iy = static_cast<u32>(std::clamp(static_cast<int>(std::lround(y * 32767.f)) + 32768, 0, 65534));
+      o.nrm = ix | iy << 16;
+    } else {
+      o.nrm = 0xFFFFFFFFu;
+    }
+    u32 ras = 0;
+    for (int c = 0; c < 4; ++c)
+      ras |= static_cast<u32>(std::clamp(static_cast<int>(std::lround(a.ras[c] * 255.f)), 0, 255)) << (c * 8);
+    o.ras = ras;
+    o.uv[0][0] = o.uv[0][1] = o.uv[1][0] = o.uv[1][1] = 0.f;
+    for (int t = 0; t < 4; ++t)
+      if (coords[t] != 255)
+        o.uv[coords[t]][0] = a.uv[t][0], o.uv[coords[t]][1] = a.uv[t][1];
+  }
+}
+bool same_attrs(const WorldAttr* a, const WorldAttr* b, u32 count) {
+  for (u32 i = 0; i < count; ++i) {
+    if (a[i].nrm != b[i].nrm) {
+      if (a[i].nrm == 0xFFFFFFFFu || b[i].nrm == 0xFFFFFFFFu)
+        return false;
+      // as vectors: the octahedron's edge joins far-apart codes
+      const auto vec = [](u32 n, float v[3]) {
+        const float x = (static_cast<int>(n & 0xFFFF) - 32768) / 32767.f, y = (static_cast<int>(n >> 16) - 32768) / 32767.f;
+        v[0] = x, v[1] = y, v[2] = 1 - std::fabs(x) - std::fabs(y);
+        if (v[2] < 0) {
+          v[0] = (1 - std::fabs(y)) * (x >= 0 ? 1.f : -1.f);
+          v[1] = (1 - std::fabs(x)) * (y >= 0 ? 1.f : -1.f);
+        }
+        const float l = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+        v[0] /= l, v[1] /= l, v[2] /= l;
+      };
+      float p[3], q[3];
+      vec(a[i].nrm, p), vec(b[i].nrm, q);
+      if (p[0] * q[0] + p[1] * q[1] + p[2] * q[2] < NormalCos)
+        return false;
+    }
+    for (int c = 0; c < 4; ++c)
+      if (std::abs(static_cast<int>(a[i].ras >> (c * 8) & 255) - static_cast<int>(b[i].ras >> (c * 8) & 255)) > RasEps)
+        return false;
+    for (int t = 0; t < 2; ++t)
+      for (int c = 0; c < 2; ++c)
+        if (std::fabs(a[i].uv[t][c] - b[i].uv[t][c]) > CoordsEps)
+          return false;
+  }
+  return true;
+}
+// This list stays as draws: its triangles in the scene go back to knowing nothing, so a ray at a placement the game drew passes them for the draw, and elsewhere sees the mesh's flat colour
+void keep_list(Scene& sc, ListInfo& L) {
+  L.state.store(ListState::Keep, std::memory_order_relaxed);
+  if (L.seen == 0)
+    return;
+  for (const ListOcc& o : L.occ) {
+    const u32 at = sc.meshes[o.mesh].first + o.first;
+    for (u32 k = 0; k < o.verts; ++k)
+      sc.attrs[at + k].nrm = 0;
+    std::lock_guard l{sc.pendingLock};
+    sc.pending.emplace_back(at, o.verts);
+  }
+}
+// This draw of a list in a file's place, translated. True: the scene now holds it, and the rays don't need the draw.
+bool observe(Scene& sc, ListInfo& L, u32 i, const DrawRec& d, const Vertex* verts, const float (*texMeans)[4], u32 texCount, const rt::Frame& fr) {
+  const GpuDraw& g = fr.draws[i];
+  const auto keep = [&](u32& why) {
+    ++why;
+    keep_list(sc, L);
+    return false;
+  };
+  if (L.occ.empty())
+    return keep(sc.kept.sizeDiffers);
+  if (d.samplesCopy != 0)
+    return keep(sc.kept.copy);
+  if (g.cls == 2)
+    return keep(sc.kept.additive);
+  if (fr.is_sky(i))
+    return keep(sc.kept.sky);
+  if ((g.highlight & 2) != 0)
+    return keep(sc.kept.glow);
+  if ((g.highlight & 4) != 0)
+    return keep(sc.kept.overWorld);
+  static thread_local Material mat;
+  if (!material_of(d, g, mat))
+    return keep(sc.kept.coords);
+  static thread_local std::vector<WorldAttr> now;
+  for (const ListOcc& o : L.occ) {
+    // a solid draw of a list the file calls see-through stays fine: rays read the draw's class. The other way shadow rays would stop at something see-through.
+    if (sc.meshes[o.mesh].cls == 0 && g.cls != 0)
+      return keep(sc.kept.classDiffers);
+    if (o.verts != d.vertices)
+      return keep(sc.kept.sizeDiffers);
+    if (sc.meshMaterial[o.mesh] != None && (sc.meshCoords[o.mesh] != mat.coords || !same_material(sc, sc.meshMaterial[o.mesh], mat)))
+      return keep(L.seen >= ProofFrames ? sc.kept.moving : sc.kept.material);
+  }
+  attrs_of(verts + d.firstVertex, d.vertices, d.motionMtx, d, mat.coords, now);
+  if (L.seen == 0) {
+    float colour[4];
+    draw_colour(d, verts, texMeans, texCount, colour);
+    for (const ListOcc& o : L.occ) {
+      const u32 at = sc.meshes[o.mesh].first + o.first;
+      if (sc.meshMaterial[o.mesh] == None) {
+        GpuDraw one = mat.draw;
+        one.firstStage = static_cast<u32>(sc.staticStages.size());
+        sc.staticStages.insert(sc.staticStages.end(), mat.stages.begin(), mat.stages.end());
+        sc.meshMaterial[o.mesh] = static_cast<u32>(sc.staticDraws.size());
+        sc.meshCoords[o.mesh] = mat.coords;
+        sc.staticDraws.push_back(one);
+        sc.meshes[o.mesh].draw = sc.meshMaterial[o.mesh];
+        for (int a = 0; a < 4; ++a)
+          sc.meshes[o.mesh].colour[a] = std::clamp(colour[a], 0.f, 2.f);
+      }
+      for (u32 k = 0; k < d.vertices; ++k) {
+        WorldAttr a = now[k];
+        std::memcpy(a.pos, sc.positions.data() + size_t(sc.meshes[o.mesh].first + o.first + k) * 3, 12);
+        sc.attrs[at + k] = a;
+      }
+      std::lock_guard l{sc.pendingLock};
+      sc.pending.emplace_back(at, d.vertices);
+    }
+    L.extent = fr.extent[i];
+    L.seen = 1;
+    L.state.store(ListState::Seen, std::memory_order_relaxed);
+    return true;
+  }
+  const ListOcc& o = L.occ[0];
+  if (!same_attrs(sc.attrs.data() + sc.meshes[o.mesh].first + o.first, now.data(), d.vertices)) {
+    static int told = 0;
+    if (told < 12 && std::getenv("AURORA_RT_SCENE_WHY") != nullptr) {
+      ++told;
+      const WorldAttr& a = sc.attrs[sc.meshes[o.mesh].first + o.first];
+      const WorldAttr& b = now[0];
+      std::fprintf(stderr, "[rt] list changed: seen %u, %u verts, nrm %08x %08x ras %08x %08x uv %g,%g %g,%g / %g,%g %g,%g coords %u %u %u %u\n", L.seen, d.vertices, a.nrm, b.nrm, a.ras, b.ras, a.uv[0][0], a.uv[0][1], b.uv[0][0], b.uv[0][1], a.uv[1][0], a.uv[1][1], b.uv[1][0], b.uv[1][1], mat.coords[0], mat.coords[1], mat.coords[2], mat.coords[3]);
+    }
+    if (L.state.load(std::memory_order_relaxed) == ListState::Proved)
+      ++sc.kept.auditFails;
+    return keep(L.seen >= ProofFrames ? sc.kept.moving : sc.kept.moved);
+  }
+  if (L.seen < ProofFrames && ++L.seen == ProofFrames)
+    L.state.store(ListState::Proved, std::memory_order_relaxed);
+  return true;
+}
+std::mutex s_rulesOne;  // two frames' rules can overlap; what is learned stays in order
+} // namespace
+
+void match_static(const DrawRec* draws, u32 count, const Vertex* verts, const float (*texMeans)[4], u32 texCount, float proj0, float proj5, rt::Frame& fr, Frame& out) {
+  const auto t0 = Clock::now();
+  std::lock_guard held{s_rulesOne};
+  out.known = false;
+  out.fogDraw = None;
+  out.draws = out.matched = out.moved = out.drawnCount = out.partial = 0;
+  out.skipped = 0;
+  out.drop.assign(count, 0);
+  out.pairs.clear();
+  out.staticBase = static_cast<u32>(fr.draws.size());
+  if (!out.scene)
+    return;
+  Scene& sc = *out.scene;
+  out.drawn.assign(sc.placed.size(), 0);
+  const std::array<int, 2> key{static_cast<int>(proj0 * 1000), static_cast<int>(proj5 * 1000)};
+  const StreamView* v = nullptr;
+  for (u32 i = 0; i < out.streamViews; ++i)
+    if (out.stream[i].key == key && out.stream[i].known)
+      v = &out.stream[i];
+  if (v != nullptr) {
+    out.known = true;
+    std::memcpy(out.view, v->view, 48);
+    out.pairs = v->drawn;
+    out.skipped = v->skipped;
+    u32 fogVerts = 0;
+    for (u32 i = 0; i < count; ++i) {
+      const DrawRec& d = draws[i];
+      if (d.projType != 0 || d.vertices == 0 || static_cast<int>(d.proj[0] * 1000) != key[0] || static_cast<int>(d.proj[5] * 1000) != key[1])
+        continue;
+      if (d.fogType != 0 && (d.fogType & 8) == 0 && d.vertices > fogVerts)
+        fogVerts = d.vertices, out.fogDraw = i;
+      if (d.sceneKey == 0 || d.motionSingle == 0)
+        continue;
+      const ListGroup* g = find_group(sc, d.sceneKey);
+      if (g == nullptr)
+        continue;
+      ++out.draws;
+      float world[12];
+      multiply(v->inverse, d.motionMtx, world);
+      bool found = false;
+      for (u32 n = 0; n < g->count && !found; ++n) {
+        ListInfo& L = sc.lists[g->first + n];
+        const u32 p = placed_at(sc, L.model, world);
+        if (p == None)
+          continue;
+        found = true;
+        DrawnPair pair{p, L.model, {}};
+        std::memcpy(pair.m, d.motionMtx, 48);
+        out.pairs.push_back(pair);
+        if (L.state.load(std::memory_order_relaxed) != ListState::Keep && observe(sc, L, i, d, verts, texMeans, texCount, fr))
+          out.drop[i] = 1;
+      }
+      if (found)
+        ++out.matched;
+      else
+        ++out.moved;
+    }
+    std::sort(out.pairs.begin(), out.pairs.end(), [](const DrawnPair& a, const DrawnPair& b) { return a.placed != b.placed ? a.placed < b.placed : a.model < b.model; });
+    out.pairs.erase(std::unique(out.pairs.begin(), out.pairs.end(), [](const DrawnPair& a, const DrawnPair& b) { return a.placed == b.placed && a.model == b.model; }), out.pairs.end());
+    for (const DrawnPair& p : out.pairs)
+      if (!out.drawn[p.placed]) {
+        out.drawn[p.placed] = 1;
+        ++out.drawnCount;
+      }
+    const u32 base = static_cast<u32>(fr.stages.size());
+    for (const GpuDraw& one : sc.staticDraws) {
+      if (out.fogDraw == None && one.fogType != 0 && (one.fogType & 8) == 0)
+        out.fogDraw = static_cast<u32>(fr.draws.size());
+      fr.draws.push_back(one);
+      fr.draws.back().firstStage += base;
+    }
+    fr.stages.insert(fr.stages.end(), sc.staticStages.begin(), sc.staticStages.end());
   }
   out.colours.resize(sc.meshes.size() + 1);
   if (!sc.meshes.empty())

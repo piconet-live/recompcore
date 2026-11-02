@@ -162,6 +162,11 @@ struct Tuning {
   const float (*texMeans)[4] = nullptr;
   std::uint32_t texCount = 0, maxGlows = 64, glowPerDraw = 0;  // glowPerDraw: most lights one draw may hold, 0 no limit
   float glowAddBright = 0.25f, glowBright = 0.75f, glowColourful = 0.4f;
+  // Draws the stream left out (AURORA_RT_SCENE_STATIC=1) still count in what the frame's main view and largest size are
+  std::uint32_t extraViews = 0;
+  std::array<int, 2> extraKey[4]{};
+  std::uint64_t extraVerts[4]{};
+  float largestFloor = 0.f;
 };
 struct Frame {
   std::vector<float> prevPos;       // each of verts in the last frame's view space, with motion data on (rt_motion.hpp)
@@ -177,6 +182,9 @@ struct Frame {
   std::uint32_t glowDraws = 0, glowPieces = 0, glowTopDraw = 0;  // glowTopDraw: lights held by the draw holding most
   const DrawRec* main = nullptr;
   std::uint32_t machineDraws = 0, reflective = 0;
+  std::vector<float> extent;  // each draw's size in the main view
+  float largest = 0.f;
+  bool is_sky(std::uint32_t i) const { return extent[i] > largest * 0.3f && draws[i].cls != 0 && draws[i].cls != 3; }
 };
 
 // The one rule for glowing surfaces, the big side of the one rule for lights: big (not a small light) in the main view, colour written,
@@ -287,6 +295,10 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
     // few distinct projections: a short list beats a map
     std::array<std::pair<std::array<int, 2>, std::uint64_t>, 16> seen{};
     std::uint32_t n = 0;
+    for (std::uint32_t e = 0; e < t.extraViews && e < 4; ++e) {
+      seen[n].first = t.extraKey[e], seen[n].second = t.extraVerts[e];
+      ++n;
+    }
     for (std::uint32_t i = 0; i < count; ++i) {
       if (draws[i].projType != 0)
         continue;
@@ -332,8 +344,9 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
     if (l.reach * l.reach >= t.machineLight)
       out.machineLights.push_back(l);
   out.draws.resize(count);
-  std::vector<float> extent(count, 0.f);
-  float largest = 0.f;
+  out.extent.assign(count, 0.f);
+  std::vector<float>& extent = out.extent;
+  float largest = t.largestFloor;
   for (std::uint32_t i = 0; i < count; ++i) {
     const DrawRec& d = draws[i];
     GpuDraw& g = out.draws[i];
@@ -397,16 +410,20 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
     extent[i] = std::max({mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]});
     largest = std::max(largest, extent[i]);
   }
-  const auto sky = [&](std::uint32_t i) { return extent[i] > largest * 0.3f && out.draws[i].cls != 0 && out.draws[i].cls != 3; };
+  out.largest = largest;
+  const auto sky = [&](std::uint32_t i) { return out.is_sky(i); };
   build_glows(draws, count, verts, t, extent, sky, out);
+}
+// The triangles the rays get: solid, what light passes through, sky. drop: a byte a draw, 1 where the static track already holds it (may be null).
+inline void assemble_frame(const DrawRec* draws, std::uint32_t count, const Vertex* verts, const std::uint8_t* drop, Frame& out) {
   for (int pass = 0; pass < 3; ++pass) {
     if (pass == 1)
       out.seeFirstVertex = static_cast<std::uint32_t>(out.verts.size());
     if (pass == 2)
       out.skyFirstVertex = static_cast<std::uint32_t>(out.verts.size());
     for (std::uint32_t i = 0; i < count; ++i) {
-      const int group = sky(i) ? 2 : out.draws[i].cls == 0 ? 0 : 1;
-      if (extent[i] <= 0.f || group != pass)
+      const int group = out.is_sky(i) ? 2 : out.draws[i].cls == 0 ? 0 : 1;
+      if (out.extent[i] <= 0.f || group != pass || (drop != nullptr && drop[i] != 0))
         continue;
       out.verts.insert(out.verts.end(), verts + draws[i].firstVertex, verts + draws[i].firstVertex + draws[i].vertices);
       out.spans.emplace_back(draws[i].firstVertex, draws[i].vertices);

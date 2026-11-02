@@ -95,7 +95,9 @@ struct Slot {
     u64 size = 0;
     void* map = nullptr;
   } verts, draws, stages, lights, glows, worldMeshes;
-  ComPtr<ID3D12Resource> blas[3], tlas, scratch, instances, constants;
+  ComPtr<ID3D12Resource> blas[3], tlas, scratch, instances, constants, attrUpload;
+  u64 attrUploadSize = 0;
+  void* attrUploadMap = nullptr;
   void* constantsMap = nullptr;
   Buf prevPos;
   u64 blasSize[3]{}, tlasSize = 0, scratchSize = 0;
@@ -148,7 +150,8 @@ struct State {
 
   // The whole track (AURORA_RT_SCENE=1): one structure for each model, made once
   std::shared_ptr<scene::Scene> worldScene;
-  ComPtr<ID3D12Resource> worldBlas;
+  ComPtr<ID3D12Resource> worldBlas, worldAttrs;
+  double worldSkipped = 0, worldDropped = 0;
   std::vector<u64> worldAt;
   u64 worldBytes = 0;
   double worldKnown = 0, worldDrawn = 0, worldInstances = 0, worldDraws = 0, worldMatched = 0, worldMoved = 0, worldMs = 0, worldPartial = 0;
@@ -302,8 +305,8 @@ void init_device() {
   r1[1].NumDescriptors = 2;
   r1[1].OffsetInDescriptorsFromTableStart = 8;
   r1[1].Flags = r1[0].Flags;
-  r1[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;  // t11: the whole track's meshes (rt_scene_live.inl)
-  r1[2].NumDescriptors = 1;
+  r1[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;  // t11, t12: the whole track's meshes and their attributes (rt_scene_live.inl)
+  r1[2].NumDescriptors = 2;
   r1[2].BaseShaderRegister = 11;
   r1[2].OffsetInDescriptorsFromTableStart = 10;
   r1[2].Flags = r1[0].Flags;
@@ -773,6 +776,7 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   srv_buffer(s.stages.gpu.Get(), static_cast<u32>(fr.stages.size()), sizeof(StageRec), base + 5);
   srv_buffer(s.glows.gpu.Get(), static_cast<u32>(fr.glows.size()), sizeof(GlowLight), base + 7);
   srv_buffer(s.worldMeshes.gpu.Get(), static_cast<u32>(std::max<size_t>(job.world.colours.size(), 1)), sizeof(scene::GpuMesh), base + 10);
+  srv_buffer(scene::static_on() && job.world.scene == g.worldScene ? g.worldAttrs.Get() : nullptr, g.worldScene ? static_cast<u32>(g.worldScene->attrs.size()) : 1, sizeof(scene::WorldAttr), base + 11);
   Params p{};
   p.size[0] = static_cast<float>(g.w), p.size[1] = static_cast<float>(g.h);
   p.rectWH[0] = 640.f, p.rectWH[1] = 528.f;  // the EFB as the snapshot holds it, all of it
