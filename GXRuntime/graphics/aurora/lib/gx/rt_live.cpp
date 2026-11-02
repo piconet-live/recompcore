@@ -479,6 +479,16 @@ bool before_setting() {
   }();
   return on;
 }
+// AURORA_RT_RULES_LATE=1 (off by default): the render worker waits for a frame's rules just before its rays run
+// (before_frame_submit), not at the ray task in the stream, so the rest of the frame is encoded while they finish. A frame the
+// rules then find has nothing for the rays shows the look alone over the game's picture, as a look-only frame does.
+bool rules_late() {
+  static const bool on = [] {
+    const char* v = std::getenv("AURORA_RT_RULES_LATE");
+    return v != nullptr && v[0] == '1';
+  }();
+  return on;
+}
 bool denoise_on() {
   static const bool on = [] {
     const char* v = std::getenv("AURORA_RT_DENOISE");
@@ -1342,25 +1352,34 @@ void task(const gfx::EncoderTaskContext& ctx, const wgpu::CommandEncoder& cmd, c
   const wgpu::Texture color = wgpu::Texture::Acquire(p.color);
   g.lastColor = color;
   g.haveTerm = false;
-  {
+  const bool late = rules_late() && !job->postOnly;  // (a look-only job's rules are already done)
+  if (!late) {
     gfx::stagelog::Scope t{"rules_wait", job->copy};
     job->rules.wait();
   }
   // not compiled yet: this frame keeps the game's own picture
-  g.drawThis = job->drawable && g.ready && !g.failed;
+  g.drawThis = (late || job->drawable) && g.ready && !g.failed;
+  // a job not kept for its rays is given back or dropped here: its rules must be done with it first
   if (!g.drawThis) {
+    if (late)
+      job->rules.wait();
     give_back(std::move(job));
     return;
   }
   make_targets(p.w, p.h, static_cast<wgpu::TextureFormat>(p.format));
-  if (g.failed)
+  if (g.failed) {
+    if (late)
+      job->rules.wait();
     return;
+  }
   const wgpu::TexelCopyTextureInfo src{.texture = color}, dst{.texture = g.input};
   const wgpu::Extent3D size{.width = p.w, .height = p.h, .depthOrArrayLayers = 1};
   cmd.CopyTextureToTexture(&src, &dst, &size);
   g.first = ctx.frameEncoder->Finish();
   *ctx.frameEncoder = webgpu::g_device.CreateCommandEncoder();
   g.haveTerm = !job->postOnly;
+  if (g.pending)  // (one its rays never ran for, with AURORA_RT_RULES_LATE perhaps still in its rules)
+    g.pending->rules.wait();
   g.pending = std::move(job);
 }
 
@@ -1538,6 +1557,19 @@ void before_frame_submit() {
   }
   if (!g.pending || g.failed)
     return;
+  if (rules_late()) {
+    {
+      gfx::stagelog::Scope t{"rules_wait", g.pending->copy};
+      g.pending->rules.wait();
+    }
+    if (!g.pending->drawable && !g.pending->postOnly) {
+      Job& j = *g.pending;
+      j.postOnly = true;
+      j.sunColour[0] = j.sunColour[1] = j.sunColour[2] = 0.f;
+      j.road = j.light = j.glow = j.calm = j.wet = 0;
+      g.haveTerm = false;
+    }
+  }
   begin_access(g.inputMem, g.input);
   if (g.before)
     begin_access(g.beforeMem, g.before);
