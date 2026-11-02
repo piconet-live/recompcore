@@ -754,6 +754,8 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   tin.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
   tin.NumDescs = instances;
   tin.InstanceDescs = s.instances->GetGPUVirtualAddress();
+  if (scene::static_on())
+    tin.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;  // hundreds of overlapping instances: rays pay far more than the build
   D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO pre{};
   g.dev->GetRaytracingAccelerationStructurePrebuildInfo(&tin, &pre);
   ensure(s.tlas, s.tlasSize, pre.ResultDataMaxSizeInBytes, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
