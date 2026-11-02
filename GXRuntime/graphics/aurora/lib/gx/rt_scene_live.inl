@@ -51,6 +51,54 @@ void world_build(Slot& s, const std::shared_ptr<scene::Scene>& sc) {
     total += (pre.ResultDataMaxSizeInBytes + 255) & ~u64(255);
     scratch += (pre.ScratchDataSizeInBytes + 255) & ~u64(255);
   }
+  // AURORA_RT_SCENE_MERGE=1: each kind's every placed mesh, its place a transform read once, at the build
+  std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> mergedGeos[2];
+  D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS mergedIn[2]{};
+  u64 mergedScratch[2]{};
+  g.worldMergedOn[0] = g.worldMergedOn[1] = false;
+  if (scene::merge_on() && !sc->placed.empty()) {
+    const u64 count = sc->merged[0].size() + sc->merged[1].size();
+    auto transforms = make_buffer(D3D12_HEAP_TYPE_UPLOAD, count * 48, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    if (g.failed)
+      return;
+    u8* tm = nullptr;
+    RT_HR(transforms->Map(0, nullptr, reinterpret_cast<void**>(&tm)));
+    s.keep.push_back(transforms);
+    u64 tAt = 0;
+    for (int kind = 0; kind < 2; ++kind) {
+      mergedGeos[kind].reserve(sc->merged[kind].size());
+      for (const scene::Scene::MergedGeo& mg : sc->merged[kind]) {
+        const scene::Geometry& from = sc->geometries[mg.geometry];
+        std::memcpy(tm + tAt * 48, sc->placed[mg.placed].world, 48);
+        D3D12_RAYTRACING_GEOMETRY_DESC d{};
+        d.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+        d.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+        d.Triangles.Transform3x4 = transforms->GetGPUVirtualAddress() + tAt * 48;
+        d.Triangles.VertexBuffer.StartAddress = base + u64(from.firstVertex) * 12;
+        d.Triangles.VertexBuffer.StrideInBytes = 12;
+        d.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+        d.Triangles.VertexCount = from.vertices;
+        mergedGeos[kind].push_back(d);
+        ++tAt;
+      }
+      if (mergedGeos[kind].empty())
+        continue;
+      auto& in = mergedIn[kind];
+      in.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+      in.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+      in.NumDescs = static_cast<UINT>(mergedGeos[kind].size());
+      in.pGeometryDescs = mergedGeos[kind].data();
+      in.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+      D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO pre{};
+      g.dev->GetRaytracingAccelerationStructurePrebuildInfo(&in, &pre);
+      g.worldMergedAt[kind] = total;
+      mergedScratch[kind] = scratch;
+      total += (pre.ResultDataMaxSizeInBytes + 255) & ~u64(255);
+      scratch += (pre.ScratchDataSizeInBytes + 255) & ~u64(255);
+      g.worldMergedOn[kind] = true;
+    }
+    transforms->Unmap(0, nullptr);
+  }
   g.worldBytes = total;
   if (scene::static_on()) {
     if (g.worldAttrs)
@@ -69,6 +117,14 @@ void world_build(Slot& s, const std::shared_ptr<scene::Scene>& sc) {
     d.ScratchAccelerationStructureData = scratchBuffer->GetGPUVirtualAddress() + scratchAt[b];
     s.cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
   }
+  for (int kind = 0; kind < 2; ++kind)
+    if (g.worldMergedOn[kind]) {
+      D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC d{};
+      d.Inputs = mergedIn[kind];
+      d.DestAccelerationStructureData = g.worldBlas->GetGPUVirtualAddress() + g.worldMergedAt[kind];
+      d.ScratchAccelerationStructureData = scratchBuffer->GetGPUVirtualAddress() + mergedScratch[kind];
+      s.cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
+    }
   D3D12_RESOURCE_BARRIER uav{};
   uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
   s.cl->ResourceBarrier(1, &uav);
@@ -149,12 +205,31 @@ void world_instances(Slot& s, Job& job, std::vector<D3D12_RAYTRACING_INSTANCE_DE
       d.AccelerationStructure = at + g.worldAt[blas];
       inst.push_back(d);
     };
+    const bool merged = g.worldMergedOn[0] || g.worldMergedOn[1];
     for (const scene::DrawnPair& q : w.pairs) {
       const scene::ModelBlas& b = sc.modelBlas[q.model];
-      put(b.solid, q.m, 8 | 32, 0x400000u);
-      put(b.see, q.m, 16 | 64, 0x400000u);
+      put(b.solid, q.m, merged ? 32 : 8 | 32, 0x400000u);
+      put(b.see, q.m, merged ? 64 : 16 | 64, 0x400000u);
     }
-    for (size_t i = 0; i < sc.placed.size(); ++i) {
+    if (merged) {
+      // What light and reflections see: the whole track, placed by the camera. A hit tells its placed mesh by the geometry; primary rays still meet only the pairs above, the game's level and matrix.
+      u32 firstElement = static_cast<u32>(sc.meshes.size()) + 1;
+      for (int kind = 0; kind < 2; ++kind) {
+        if (g.worldMergedOn[kind]) {
+          D3D12_RAYTRACING_INSTANCE_DESC d{};
+          std::memcpy(d.Transform, w.view, 48);
+          d.InstanceMask = kind == 0 ? 8 : 16;
+          d.InstanceID = 0x800000u | firstElement;
+          d.AccelerationStructure = at + g.worldMergedAt[kind];
+          inst.push_back(d);
+        }
+        firstElement += static_cast<u32>(sc.merged[kind].size());
+      }
+      g.worldInstances += static_cast<double>(inst.size());
+      return;
+    }
+    static const bool noUndrawn = std::getenv("AURORA_TEST_NO_UNDRAWN") != nullptr;
+    for (size_t i = 0; i < sc.placed.size() && !noUndrawn; ++i) {
       if (w.drawn[i])
         continue;
       const scene::Placed& p = sc.placed[i];

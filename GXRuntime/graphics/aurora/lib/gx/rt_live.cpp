@@ -157,6 +157,8 @@ struct State {
   ComPtr<ID3D12Resource> worldBlas, worldAttrs;
   double worldSkipped = 0, worldDropped = 0;
   std::vector<u64> worldAt;
+  u64 worldMergedAt[2]{};
+  bool worldMergedOn[2]{};
   u64 worldBytes = 0;
   double worldKnown = 0, worldDrawn = 0, worldInstances = 0, worldDraws = 0, worldMatched = 0, worldMoved = 0, worldMs = 0, worldPartial = 0;
   std::unique_ptr<Job> pending;

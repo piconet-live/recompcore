@@ -541,6 +541,16 @@ std::shared_ptr<Scene> resolve() {
   scene->fromFile = scene->meshes;
   if (static_on())
     make_table(*scene, occs);
+  if (merge_on())
+    for (u32 p = 0; p < scene->placed.size(); ++p)
+      for (int kind = 0; kind < 2; ++kind) {
+        const u32 b = kind == 0 ? scene->placed[p].solid : scene->placed[p].see;
+        if (b == None)
+          continue;
+        const Blas& blas = scene->blases[b];
+        for (u32 k = 0; k < blas.geometries; ++k)
+          scene->merged[kind].push_back({blas.firstMesh + k, blas.firstGeometry + k, p});
+      }
   scene->learned.assign(scene->meshes.size(), 0);
   scene->loadMs = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
   std::fprintf(stderr, "[rt] scene: %zu placed, %u move, %u names no file holds, %zu models' structures, %zu meshes, %llu triangles (%llu placed), %u meshes declined, %.0f ms\n",
@@ -644,6 +654,13 @@ bool static_on() noexcept {
   return v;
 }
 
+bool merge_on() noexcept {
+  static const bool v = [] {
+    const char* e = std::getenv("AURORA_RT_SCENE_MERGE");
+    return e != nullptr && e[0] == '1' && static_on();
+  }();
+  return v;
+}
 void add_course(const std::vector<u8>& whole) {
   if (!on())
     return;
@@ -1243,9 +1260,18 @@ void match_static(const DrawRec* draws, u32 count, const Vertex* verts, const fl
     }
     fr.stages.insert(fr.stages.end(), sc.staticStages.begin(), sc.staticStages.end());
   }
-  out.colours.resize(sc.meshes.size() + 1);
+  const size_t firstMerged = sc.meshes.size() + 1;
+  out.colours.resize(firstMerged + sc.merged[0].size() + sc.merged[1].size());
   if (!sc.meshes.empty())
     std::memcpy(out.colours.data() + 1, sc.meshes.data(), sc.meshes.size() * sizeof(GpuMesh));
   out.matchMs = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 }
 } // namespace aurora::gx::rt::scene
+  // Each placed mesh of the merged structures, as its mesh, and flags 1 when the game drew that placement this frame: its lists still drawn are in the rays by their draws
+  size_t at = firstMerged;
+  for (const auto& kind : sc.merged)
+    for (const Scene::MergedGeo& g : kind) {
+      out.colours[at] = sc.meshes[g.mesh];
+      out.colours[at].flags = !out.drawn.empty() && out.drawn[g.placed] ? 1 : 0;
+      ++at;
+    }

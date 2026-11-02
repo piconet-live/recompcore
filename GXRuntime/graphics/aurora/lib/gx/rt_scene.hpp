@@ -113,10 +113,16 @@ struct Scene {
   std::vector<std::pair<std::uint32_t, std::uint32_t>> pending;  // attributes the GPU doesn't have yet: first, count
   KeepCount kept;
 };
+  // AURORA_RT_SCENE_MERGE=1: every static placement's largest level in one structure for what light and reflections see, solid and see-through apart, a geometry for each placed mesh. Built once, in the world's space.
+  struct MergedGeo {
+    std::uint32_t mesh, geometry, placed;
+  };
+  std::vector<MergedGeo> merged[2];
 
 bool on() noexcept;
 bool static_on() noexcept;  // AURORA_RT_SCENE_STATIC=1, with the scene
 // From the reader, on its thread, for files the game is reading (never the disc walk's). Bytes unpacked.
+bool merge_on() noexcept;   // AURORA_RT_SCENE_MERGE=1, with the static track
 void add_course(const std::vector<std::uint8_t>& whole);
 void add_file(const char* path, const std::vector<std::uint8_t>& whole);
 // The scene as it stands, or null. Any thread.

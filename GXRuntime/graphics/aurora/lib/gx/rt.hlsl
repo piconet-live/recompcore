@@ -264,7 +264,8 @@ float3 trace_reflection(float3 org, float3 dir, float maxLodScale) {
       tmin = t + 0.02;
       have = world_fetch(m, q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), q.CommittedObjectToWorld3x4(), h);
       // the game drew this placement but not by this triangle, or by a draw still in the rays
-      if (!have && (q.CommittedInstanceID() & WorldDrawn) != 0) continue;
+      if (!have && ((q.CommittedInstanceID() & WorldDrawn) != 0 || m.flags != 0)) continue;
+      if (have) h.pos = org + dir * t;  // for fog alone; a merged structure's own transform isn't the instance's
     }
     if (q.CommittedInstanceID() >= WorldId && !have) {
       WorldMesh m = world_mesh(q.CommittedInstanceID(), q.CommittedGeometryIndex());
@@ -379,7 +380,7 @@ void light_rays(float3 pos, float3 N, float dist, float2 xi, out float open, out
           cls = Draws[wh.draw].cls;
           if (cls != 3) c = shade(wh, 3.0);
         } else {
-          if ((q.CommittedInstanceID() & WorldDrawn) != 0) continue;
+          if ((q.CommittedInstanceID() & WorldDrawn) != 0 || m.flags != 0) continue;
           cls = m.cls, c = m.colour;
         }
       } else {
@@ -422,7 +423,7 @@ float sun_term(float3 pos, float3 N, float dist) {
       tmin = t + 0.02;
       Hit wh;
       const bool known = world_fetch(m, q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), q.CommittedObjectToWorld3x4(), wh);
-      if (!known && (q.CommittedInstanceID() & WorldDrawn) != 0) continue;
+      if (!known && ((q.CommittedInstanceID() & WorldDrawn) != 0 || m.flags != 0)) continue;
       // the draw's own class once it was drawn: a mesh the file calls solid can be drawn blended
       const uint wc = known ? Draws[wh.draw].cls : m.cls;
       if (wc == 0) return 0;
