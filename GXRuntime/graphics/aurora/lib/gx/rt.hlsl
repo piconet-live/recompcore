@@ -271,6 +271,7 @@ float3 trace_reflection(float3 org, float3 dir, float maxLodScale) {
     if (q.CommittedInstanceID() >= WorldId) {
       WorldMesh m = world_mesh(q.CommittedInstanceID(), q.CommittedGeometryIndex());
       tmin = t + 0.02;
+      if (m.cls == 3) continue;  // the scene's backdrop (AURORA_RT_BACKDROP_SKIP): rays pass it, whatever draw of it was learned
       have = world_fetch(m, q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), q.CommittedObjectToWorld3x4(), h);
       if (have) h.pos = org + dir * t;  // for fog alone; a merged structure's own transform isn't the instance's
       // the game drew this placement but not by this triangle, or by a draw still in the rays
@@ -384,8 +385,12 @@ float layer_through(float3 org, float3 dir, float tMin, float tMax, float level)
   RayDesc ray; ray.Origin = org; ray.Direction = dir; ray.TMin = tMin; ray.TMax = tMax;
   q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskLayer, ray);
   float through = 1;
-  while (q.Proceed())
+  while (q.Proceed()) {
+    // layers are the frame's own draws. A world mesh is never one (no world instance carries MaskLayer), and the scene's backdrop (class 3,
+    // AURORA_RT_BACKDROP_SKIP) above all is passed here as every other ray kind passes it: it never covers what lies behind it
+    if (q.CandidateInstanceID() >= WorldId) continue;
     through *= 1 - saturate(shade(fetch(q.CandidateInstanceID() + q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics()), level).a);
+  }
   return through;
 }
 // What the rays bring a surface: how open it is, what it sees as bounce, what it sees of the sky. xi: the first ray's place in the hemisphere, the rest follow by a fixed sequence.
@@ -413,6 +418,7 @@ void light_rays(float3 pos, float3 N, float dist, float2 xi, out float open, out
       uint cls;
       if (q.CommittedInstanceID() >= WorldId) {
         WorldMesh m = world_mesh(q.CommittedInstanceID(), q.CommittedGeometryIndex());
+        if (m.cls == 3) continue;  // the scene's backdrop: rays pass it
         Hit wh;
         if (world_fetch(m, q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), q.CommittedObjectToWorld3x4(), wh)) {
           cls = Draws[wh.draw].cls;
@@ -461,6 +467,8 @@ float sun_term(float3 pos, float3 N, float dist) {
     if (q.CommittedInstanceID() >= WorldId) {
       WorldMesh m = world_mesh(q.CommittedInstanceID(), q.CommittedGeometryIndex());
       tmin = t + 0.02;
+      // the scene's backdrop: rays pass it. Before the draw's class: a backdrop the game draws is drawn see-through but opaque, and would stop the sun
+      if (m.cls == 3) continue;
       Hit wh;
       const bool known = world_fetch(m, q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), q.CommittedObjectToWorld3x4(), wh);
       if (!known && ((q.CommittedInstanceID() & WorldDrawn) != 0 || m.flags != 0)) continue;
@@ -579,6 +587,7 @@ void main(uint3 id : SV_DispatchThreadID) {
       const bool worldHit = q.CommittedInstanceID() >= WorldId;
       if (worldHit) {
         WorldMesh wm = world_mesh(q.CommittedInstanceID(), q.CommittedGeometryIndex());
+        if (wm.cls == 3) { tmin = t + 0.02; continue; }  // the scene's backdrop: the raster has it as the game drew it, rays pass it
         // a part still drawn: its draw is in the rays; a part never drawn: the raster has nothing of it here
         if (!world_fetch(wm, q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), q.CommittedObjectToWorld3x4(), h)) { tmin = t + 0.02; if (pair_gap_on()) gapAt = t; continue; }
       } else {
@@ -751,6 +760,7 @@ void light_pass(uint3 id : SV_DispatchThreadID) {
     const bool worldHit = q.CommittedInstanceID() >= WorldId;
     if (worldHit) {
       WorldMesh wm = world_mesh(q.CommittedInstanceID(), q.CommittedGeometryIndex());
+      if (wm.cls == 3) { tmin = t + 0.02; continue; }  // the scene's backdrop: rays pass it
       if (!world_fetch(wm, q.CommittedPrimitiveIndex(), bary, q.CommittedObjectToWorld3x4(), h)) { tmin = t + 0.02; if (pair_gap_on()) gapAt = t; continue; }
     } else {
       h = fetch(prim, bary);

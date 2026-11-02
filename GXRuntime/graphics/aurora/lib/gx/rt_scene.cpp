@@ -480,6 +480,7 @@ std::shared_ptr<Scene> resolve() {
     scene->modelBlas[b.model] = {b.solid, b.see};
     return &b;
   };
+  std::vector<std::string> placedNames;  // each placement's largest level's model name, for AURORA_RT_BACKDROP_SKIP's report
   for (u32 i = 0; i < count; ++i) {
     const u8* p = d.data() + list + i * 0x40;
     const u32 object = be32(p + 8), clip = be32(p + 0x30), matrix = be32(p + 0x3C);
@@ -530,6 +531,7 @@ std::shared_ptr<Scene> resolve() {
     }
     placed.solid = top->solid, placed.see = top->see, placed.top = top->model;
     scene->placed.push_back(placed);
+    placedNames.push_back(best);
     scene->trianglesPlaced += top->triangles;
     for (const std::string& name : names)
       if (const Built* b = model_of(name, static_on()); b != nullptr)
@@ -538,6 +540,88 @@ std::shared_ptr<Scene> resolve() {
   for (auto& list2 : scene->placementsOf)
     std::sort(list2.begin(), list2.end(), [](const PlacedAt& a, const PlacedAt& b) { return a.x < b.x; });
   scene->triangles = scene->positions.size() / 9;
+  // AURORA_RT_BACKDROP_SKIP=1 (off by default): a mesh whose box holds every other placement of the course, around and above, and which roofs the course (straight
+  // up from the middle of everything else, it is there) is its backdrop: a sky or horizon shell the camera is always inside. The game draws it as background; in
+  // the whole-track world it would stop every sun and sky ray. Class 3: every ray passes it, whatever draw of it the frames learn. A ring of walls or mountains
+  // has no roof and stays. One rule from the course's own geometry, the same on every course.
+  if (const char* v = std::getenv("AURORA_RT_BACKDROP_SKIP"); v != nullptr && v[0] == '1') {
+    struct Box { float lo[3]{1e30f, 1e30f, 1e30f}, hi[3]{-1e30f, -1e30f, -1e30f}; };
+    std::vector<Box> meshBox(scene->meshes.size());
+    std::vector<std::vector<u32>> placedMeshes(scene->placed.size()), placedGeos(scene->placed.size());
+    for (u32 p = 0; p < scene->placed.size(); ++p)
+      for (const u32 which : {scene->placed[p].solid, scene->placed[p].see}) {
+        if (which == None)
+          continue;
+        const Blas& bl = scene->blases[which];
+        for (u32 k = 0; k < bl.geometries; ++k) {
+          const Geometry& ge = scene->geometries[bl.firstGeometry + k];
+          Box& bx = meshBox[bl.firstMesh + k];
+          placedMeshes[p].push_back(bl.firstMesh + k), placedGeos[p].push_back(bl.firstGeometry + k);
+          for (u32 vv = 0; vv < ge.vertices; ++vv) {
+            const float* q = &scene->positions[size_t(ge.firstVertex + vv) * 3];
+            for (int ax = 0; ax < 3; ++ax) {
+              const float* w = &scene->placed[p].world[ax * 4];
+              const float x = w[0] * q[0] + w[1] * q[1] + w[2] * q[2] + w[3];
+              bx.lo[ax] = std::min(bx.lo[ax], x), bx.hi[ax] = std::max(bx.hi[ax], x);
+            }
+          }
+        }
+      }
+    u32 backdrops = 0;
+    for (u32 p = 0; p < scene->placed.size(); ++p)
+      for (size_t pm = 0; pm < placedMeshes[p].size(); ++pm) {
+        const u32 m = placedMeshes[p][pm];
+        const Box& b = meshBox[m];
+        bool holds = true;
+        for (u32 o = 0; o < scene->placed.size() && holds; ++o)
+          for (const u32 om : placedMeshes[o]) {
+            if (om == m)
+              continue;
+            const Box& c = meshBox[om];
+            // around in both ground axes and above: x and z inside, its top higher
+            holds = holds && c.lo[0] >= b.lo[0] && c.hi[0] <= b.hi[0] && c.lo[2] >= b.lo[2] && c.hi[2] <= b.hi[2] && c.hi[1] <= b.hi[1];
+          }
+        if (!holds || scene->meshes[m].cls == 3)
+          continue;
+        // the roof: everything else's box, its middle at its top; a ray straight up from there meets this mesh
+        Box rest;
+        for (u32 o = 0; o < scene->placed.size(); ++o)
+          for (const u32 om : placedMeshes[o])
+            if (om != m)
+              for (int ax = 0; ax < 3; ++ax)
+                rest.lo[ax] = std::min(rest.lo[ax], meshBox[om].lo[ax]), rest.hi[ax] = std::max(rest.hi[ax], meshBox[om].hi[ax]);
+        const float ox = (rest.lo[0] + rest.hi[0]) * 0.5f, oy = rest.hi[1], oz = (rest.lo[2] + rest.hi[2]) * 0.5f;
+        bool roofed = false;
+        const Geometry& ge = scene->geometries[placedGeos[p][pm]];
+        const float* w = scene->placed[p].world;
+        for (u32 tri = 0; tri + 2 < ge.vertices && !roofed; tri += 3) {
+          float c[3][3];
+          for (int k = 0; k < 3; ++k) {
+            const float* q = &scene->positions[size_t(ge.firstVertex + tri + k) * 3];
+            for (int ax = 0; ax < 3; ++ax)
+              c[k][ax] = w[ax * 4] * q[0] + w[ax * 4 + 1] * q[1] + w[ax * 4 + 2] * q[2] + w[ax * 4 + 3];
+          }
+          // the triangle seen from above: the point inside it, by its barycentrics in x and z, and the triangle there above the point
+          const float d = (c[1][0] - c[0][0]) * (c[2][2] - c[0][2]) - (c[2][0] - c[0][0]) * (c[1][2] - c[0][2]);
+          if (std::abs(d) < 1e-6f)
+            continue;
+          const float u = ((ox - c[0][0]) * (c[2][2] - c[0][2]) - (c[2][0] - c[0][0]) * (oz - c[0][2])) / d;
+          const float vb = ((c[1][0] - c[0][0]) * (oz - c[0][2]) - (ox - c[0][0]) * (c[1][2] - c[0][2])) / d;
+          if (u < 0 || vb < 0 || u + vb > 1)
+            continue;
+          roofed = c[0][1] + u * (c[1][1] - c[0][1]) + vb * (c[2][1] - c[0][1]) > oy;
+        }
+        if (!roofed) {
+          std::fprintf(stderr, "[rt] scene: mesh %u of %s holds the course but has no roof over it: stays\n", m, p < placedNames.size() ? placedNames[p].c_str() : "?");
+          continue;
+        }
+        scene->meshes[m].cls = 3, ++backdrops;
+        std::fprintf(stderr, "[rt] scene: mesh %u of %s holds the whole course and roofs it (x %.0f..%.0f y %.0f..%.0f z %.0f..%.0f): backdrop, rays pass it\n", m,
+                     p < placedNames.size() ? placedNames[p].c_str() : "?", b.lo[0], b.hi[0], b.lo[1], b.hi[1], b.lo[2], b.hi[2]);
+      }
+    if (backdrops == 0)
+      std::fprintf(stderr, "[rt] scene: no mesh holds the whole course\n");
+  }
   scene->fromFile = scene->meshes;
   if (static_on())
     make_table(*scene, occs);
