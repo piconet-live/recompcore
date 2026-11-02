@@ -621,6 +621,27 @@ std::shared_ptr<Scene> resolve() {
       }
     if (backdrops == 0)
       std::fprintf(stderr, "[rt] scene: no mesh holds the whole course\n");
+    // AURORA_RT_BACKDROP_SHEETS=1 (off by default), with the above: the see-through meshes of the backdrop's own placement (the model's translucent lists:
+    // cloud and dust sheets hung in its sky) are backdrop too, class 3. They blend by texture alpha and write depth, so they are no layer; each list of them is
+    // smaller than the frame's sky rule asks (a share of the largest draw), so the frames learned them as see-through surfaces and a camera ray stopped on the
+    // world copy wherever the texel's alpha reached 0.5, and lit it as a surface facing down: brown cut-outs of the clouds. Now every ray passes them as it
+    // passes the shell; the raster keeps them as the game drew them.
+    if (const char* sv = std::getenv("AURORA_RT_BACKDROP_SHEETS"); sv != nullptr && sv[0] == '1' && backdrops != 0)
+      for (u32 p = 0; p < scene->placed.size(); ++p) {
+        bool holdsBackdrop = false;
+        for (const u32 m : placedMeshes[p])
+          holdsBackdrop = holdsBackdrop || scene->meshes[m].cls == 3;
+        if (!holdsBackdrop || scene->placed[p].see == None)
+          continue;
+        const Blas& bl = scene->blases[scene->placed[p].see];
+        for (u32 k = 0; k < bl.geometries; ++k) {
+          const u32 m = bl.firstMesh + k;
+          if (scene->meshes[m].cls == 3)
+            continue;
+          scene->meshes[m].cls = 3;
+          std::fprintf(stderr, "[rt] scene: mesh %u of %s, see-through, in the backdrop's own placement: backdrop, rays pass it\n", m, p < placedNames.size() ? placedNames[p].c_str() : "?");
+        }
+      }
   }
   scene->fromFile = scene->meshes;
   if (static_on())
