@@ -250,9 +250,15 @@ struct State {
   std::size_t bytes_waiting = 0;  // (under lock)
   float next_between = 0;         // the GPU thread's: aurora_present_frame_between's, for the next frame
   std::uint64_t next_position = 0;  // the GPU thread's: aurora_present_frame_at's
-  // AURORA_REDRAW: the newest request (under lock), and what became of them
-  std::shared_ptr<aurora::gx::redraw::Request> redraw_request;
-  std::uint64_t redraw_position = 0;
+  // AURORA_REDRAW: the requests not yet taken, oldest first, each with the stream's position when it came (under lock), and
+  // what became of them. More than one: a request is made at its step's start, before that step's list is drawn, and a true
+  // frame is shown about 20 ms after its tick, past the next step's request (c37, 30 racers, 240); one slot lost the older.
+  struct RedrawWaiting {
+    std::shared_ptr<aurora::gx::redraw::Request> request;
+    std::uint64_t position = 0;
+  };
+  std::deque<RedrawWaiting> redraw_requests;
+  static constexpr std::size_t kRedrawMostWaiting = 4;
   std::atomic<std::uint64_t> redraw_generation{0};
   std::atomic<std::uint64_t> redraw_drawn{0}, redraw_stale{0};
   std::uint64_t redraw_asked = 0, redraw_busy = 0, redraw_passed = 0, redraw_no_request = 0, redraw_far = 0, redraw_old = 0;
@@ -628,19 +634,19 @@ void run() {
         const auto now = Clock::now();
         if (!redraw_for) {
           // (the read position moves by whole passes of the FIFO, so a frame's can be a little past what was written at the tick)
-          if (s->redraw_request && s->redraw_position + kRedrawMostBurstsAfterCopy < redraw_frame_position) {
-            s->redraw_request.reset();  // a frame's before this one
+          while (!s->redraw_requests.empty() && s->redraw_requests.front().position + kRedrawMostBurstsAfterCopy < redraw_frame_position) {
+            s->redraw_requests.pop_front();  // a frame's before this one
             ++s->redraw_old;
           }
-          if (s->redraw_request) {
-            if (s->redraw_position > redraw_frame_position + kRedrawMostBurstsAfterCopy) {
+          if (!s->redraw_requests.empty()) {
+            if (s->redraw_requests.front().position > redraw_frame_position + kRedrawMostBurstsAfterCopy) {
               // made after a list whose copy is still on its way: it waits for that frame
               ++s->redraw_far;
               redraw_frame = false;
               continue;
             }
-            redraw_for = std::move(s->redraw_request);
-            s->redraw_request.reset();
+            redraw_for = std::move(s->redraw_requests.front().request);
+            s->redraw_requests.pop_front();
             redraw_next = 0;
             ++s->redraw_asked;
           } else {
@@ -1018,8 +1024,11 @@ void aurora_present_redraw(const AuroraRedrawRequest* request) {
   }
   {
     std::lock_guard g{s->lock};
-    s->redraw_request = std::move(q);
-    s->redraw_position = request->position;
+    if (s->redraw_requests.size() >= State::kRedrawMostWaiting) {
+      s->redraw_requests.pop_front();
+      ++s->redraw_old;
+    }
+    s->redraw_requests.push_back({std::move(q), request->position});
   }
   s->wake.notify_all();
 }
