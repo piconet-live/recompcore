@@ -580,6 +580,27 @@ Up up_at(int2 c, float dist, float3 N) {
 #ifndef GATE_LEVEL
 #define GATE_LEVEL 0
 #endif
+// GATE_MIN (AURORA_RT_GATE_MIN=<r> picture pixels, 0 by default: off): the gate compares the surface's own colour with the darkest the raster shows
+// within r pixels around, not the one pixel. A glow drawn over a surface is bright across its area, so the darkest around stays far above the surface;
+// a sharp texture's single bright grains (the game's LOD bias and the sampler's anisotropy, grains finer than the rays' own read) have darker grains
+// beside them, and the gate stays open there. Only the picture is read: any course, any texture. A glow's own edge loses r pixels to our light, and
+// a glow not much wider than 2r+1 pixels loses part of its own: on c25 r=2 cleared the road's bright patches but dimmed the lit tunnel pillars'
+// slots; r=1 cost them less and cleared about half the grains. Not yet the rule to ship: a mean over the area, not the darkest, is the next try.
+#ifndef GATE_MIN
+#define GATE_MIN 0
+#endif
+static const int GateMin = (int)(GATE_MIN + 0.5);
+// the raster's luminance at picture pixel c (Before when it holds the picture from before the last blends), the darkest within r around
+float darkest_seen(int2 c, float2 rasterDim, int r) {
+  float least = 1e9;
+  const int2 top = int2(P.size) - 1;
+  for (int y = -r; y <= r; ++y)
+    for (int x = -r; x <= r; ++x) {
+      const int2 p = clamp(c + int2(x, y), int2(0, 0), top);
+      least = min(least, lum((P.stableShine & 2) != 0 ? Before[p].rgb : Raster[int2((p + 0.5) * rasterDim / P.size)].rgb));
+    }
+  return least;
+}
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
   float2 rasterDim;
@@ -678,7 +699,8 @@ void main(uint3 id : SV_DispatchThreadID) {
           hr.stretch = 1 / max(cosv, 0.05);
           gateL = lum(shade(hr, 0, false, true).rgb);
         }
-        float bareM = 1 - smoothstep(0.15, 0.45, lum((P.stableShine & 2) != 0 ? Before[id.xy].rgb : raster) - gateL);
+        const float seenL = GateMin > 0 ? darkest_seen(id.xy, rasterDim, GateMin) : lum((P.stableShine & 2) != 0 ? Before[id.xy].rgb : raster);
+        float bareM = 1 - smoothstep(0.15, 0.45, seenL - gateL);
         if (P.lightGain > 0 && (d.highlight & 4) == 0) light += engine_light(h.pos, N) * P.lightGain * bareM;
         if (P.glowGain > 0 && (d.highlight & 6) == 0) light += glow_light(h.pos, N) * P.glowGain * bareM;
         if (P.glowShow != 0 && (d.highlight & 2) != 0) { sum = float3(1, -1, 1); light = 0; break; }
