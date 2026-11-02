@@ -541,6 +541,16 @@ std::shared_ptr<Scene> resolve() {
   scene->fromFile = scene->meshes;
   if (static_on())
     make_table(*scene, occs);
+  if (merge_on())
+    for (u32 p = 0; p < scene->placed.size(); ++p)
+      for (int kind = 0; kind < 2; ++kind) {
+        const u32 b = kind == 0 ? scene->placed[p].solid : scene->placed[p].see;
+        if (b == None)
+          continue;
+        const Blas& blas = scene->blases[b];
+        for (u32 k = 0; k < blas.geometries; ++k)
+          scene->merged[kind].push_back({blas.firstMesh + k, blas.firstGeometry + k, p});
+      }
   scene->learned.assign(scene->meshes.size(), 0);
   scene->loadMs = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
   std::fprintf(stderr, "[rt] scene: %zu placed, %u move, %u names no file holds, %zu models' structures, %zu meshes, %llu triangles (%llu placed), %u meshes declined, %.0f ms\n",
@@ -644,6 +654,13 @@ bool static_on() noexcept {
   return v;
 }
 
+bool merge_on() noexcept {
+  static const bool v = [] {
+    const char* e = std::getenv("AURORA_RT_SCENE_MERGE");
+    return e != nullptr && e[0] == '1' && static_on();
+  }();
+  return v;
+}
 void add_course(const std::vector<u8>& whole) {
   if (!on())
     return;
@@ -877,7 +894,7 @@ void stream_reset(Frame& f) {
   f.streamViews = 0;
 }
 
-bool stream_skip(Frame& f, Scene& sc, u32 prim, u32 count, const u8* bytes, size_t used, const float m[12], const float proj[16], u32 triVerts, u32 tick) {
+bool stream_skip(Frame& f, Scene& sc, u32 prim, u32 count, const u8* bytes, size_t used, const float m[12], const float proj[16], u32 triVerts, u32 tick, u64 stateKey) {
   const ListGroup* g = find_group(sc, list_key(prim, count, bytes, used));
   if (g == nullptr)
     return false;
@@ -922,7 +939,8 @@ bool stream_skip(Frame& f, Scene& sc, u32 prim, u32 count, const u8* bytes, size
     if (L == nullptr)
       return false;
   }
-  if (L->state.load(std::memory_order_relaxed) != ListState::Proved || ((tick + L->index) % AuditEvery) == 0)
+  // the state's key differs: translated now, and observe() takes the list out at once
+  if (L->state.load(std::memory_order_relaxed) != ListState::Proved || L->stateKey != stateKey || ((tick + L->index) % AuditEvery) == 0)
     return false;
   v->vertices += triVerts, ++v->skipped;
   v->largest = std::max(v->largest, L->extent);
@@ -993,15 +1011,23 @@ bool same_material(const Scene& sc, u32 index, const Material& m) {
 // The list's vertices in its model's space, with the matrix the draw was drawn by
 void attrs_of(const Vertex* v, u32 count, const float m[12], const DrawRec& d, const std::array<u8, 4>& coords, std::vector<WorldAttr>& out) {
   out.resize(count);
+  // The file's own normal direction, by undoing the draw's normal matrix: the same for every placement however scaled
+  const float* q = d.nrmMtx;
+  const float inv[9] = {q[4] * q[8] - q[5] * q[7], q[2] * q[7] - q[1] * q[8], q[1] * q[5] - q[2] * q[4],
+                        q[5] * q[6] - q[3] * q[8], q[0] * q[8] - q[2] * q[6], q[2] * q[3] - q[0] * q[5],
+                        q[3] * q[7] - q[4] * q[6], q[1] * q[6] - q[0] * q[7], q[0] * q[4] - q[1] * q[3]};
+  (void)m;
   for (u32 i = 0; i < count; ++i) {
     const Vertex& a = v[i];
     WorldAttr& o = out[i];
     o.pos[0] = o.pos[1] = o.pos[2] = 0.f;
     if (d.hasNormal) {
-      // the matrix is rigid: its transpose takes a normal back
       float n[3];
       for (int c = 0; c < 3; ++c)
-        n[c] = m[c] * a.nrm[0] + m[4 + c] * a.nrm[1] + m[8 + c] * a.nrm[2];
+        n[c] = inv[c * 3] * a.nrm[0] + inv[c * 3 + 1] * a.nrm[1] + inv[c * 3 + 2] * a.nrm[2];
+      const float nl = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+      if (nl > 0)
+        n[0] /= nl, n[1] /= nl, n[2] /= nl;
       const float s = std::fabs(n[0]) + std::fabs(n[1]) + std::fabs(n[2]);
       float x = s > 0 ? n[0] / s : 0.f, y = s > 0 ? n[1] / s : 0.f;
       if (n[2] < 0) {
@@ -1094,8 +1120,21 @@ bool observe(Scene& sc, ListInfo& L, u32 i, const DrawRec& d, const Vertex* vert
   static thread_local std::vector<WorldAttr> now;
   for (const ListOcc& o : L.occ) {
     // a solid draw of a list the file calls see-through stays fine: rays read the draw's class. The other way shadow rays would stop at something see-through.
-    if (sc.meshes[o.mesh].cls == 0 && g.cls != 0)
+    if (sc.meshes[o.mesh].cls == 0 && g.cls != 0) {
+      static int told = 0;
+      if ((told++ % 37) == 0 && std::getenv("AURORA_RT_SCENE_WHY") != nullptr) {
+        float least = 1.f;
+        for (u32 k = 0; k < d.vertices; ++k)
+          least = std::min(least, verts[d.firstVertex + k].ras[3]);
+        std::fprintf(stderr, "[rt] class differs: cls %u blend %u %u %u verts %u ras-alpha-least %.3f stages %u:", g.cls, d.blendMode, d.blendSrc, d.blendDst, d.vertices, least, g.stages);
+        for (u32 q = 0; q < g.stages; ++q) {
+          const StageRec& t = d.stage[q];
+          std::fprintf(stderr, " [a %u %u %u %u ka %.2f texA %.3f refl %u]", t.aa, t.ab, t.ac, t.ad, t.k[3], t.tex != None && t.tex < texCount ? texMeans[t.tex][3] : -1.f, t.reflection);
+        }
+        std::fprintf(stderr, "\n");
+      }
       return keep(sc.kept.classDiffers);
+    }
     if (o.verts != d.vertices)
       return keep(sc.kept.sizeDiffers);
     if (sc.meshMaterial[o.mesh] != None && (sc.meshCoords[o.mesh] != mat.coords || !same_material(sc, sc.meshMaterial[o.mesh], mat)))
@@ -1127,21 +1166,40 @@ bool observe(Scene& sc, ListInfo& L, u32 i, const DrawRec& d, const Vertex* vert
       sc.pending.emplace_back(at, d.vertices);
     }
     L.extent = fr.extent[i];
+    L.stateKey = d.stateKey;
     L.seen = 1;
     L.state.store(ListState::Seen, std::memory_order_relaxed);
     return true;
   }
+  if (d.stateKey != L.stateKey) {
+    ++sc.kept.stateMoved;
+    return keep(L.seen >= ProofFrames ? sc.kept.moving : sc.kept.moved);
+  }
   const ListOcc& o = L.occ[0];
   if (!same_attrs(sc.attrs.data() + sc.meshes[o.mesh].first + o.first, now.data(), d.vertices)) {
     static int told = 0;
-    if (told < 12 && std::getenv("AURORA_RT_SCENE_WHY") != nullptr) {
-      ++told;
-      const WorldAttr& a = sc.attrs[sc.meshes[o.mesh].first + o.first];
-      const WorldAttr& b = now[0];
-      std::fprintf(stderr, "[rt] list changed: seen %u, %u verts, nrm %08x %08x ras %08x %08x uv %g,%g %g,%g / %g,%g %g,%g coords %u %u %u %u\n", L.seen, d.vertices, a.nrm, b.nrm, a.ras, b.ras, a.uv[0][0], a.uv[0][1], b.uv[0][0], b.uv[0][1], a.uv[1][0], a.uv[1][1], b.uv[1][0], b.uv[1][1], mat.coords[0], mat.coords[1], mat.coords[2], mat.coords[3]);
+    if ((told++ % 41) == 0 && std::getenv("AURORA_RT_SCENE_WHY") != nullptr) {
+      const WorldAttr* A = sc.attrs.data() + sc.meshes[o.mesh].first + o.first;
+      u32 k = 0;
+      while (k + 1 < d.vertices && same_attrs(A + k, now.data() + k, 1))
+        ++k;
+      const WorldAttr& a = A[k];
+      const WorldAttr& b = now[k];
+      const float* mm = d.motionMtx;
+      std::fprintf(stderr, "[rt] scale %.3f %.3f %.3f placed-of-model %zu ", std::sqrt(mm[0] * mm[0] + mm[4] * mm[4] + mm[8] * mm[8]), std::sqrt(mm[1] * mm[1] + mm[5] * mm[5] + mm[9] * mm[9]), std::sqrt(mm[2] * mm[2] + mm[6] * mm[6] + mm[10] * mm[10]), sc.placementsOf[L.model].size());
+      std::fprintf(stderr, "[rt] list changed: seen %u, was %u, at %u of %u verts, nrm %08x %08x ras %08x %08x uv %g,%g %g,%g / %g,%g %g,%g coords %u %u %u %u blend %u %u %u stages %u texgen-tc0 %u\n", L.seen, unsigned(L.state.load()), k, d.vertices, a.nrm, b.nrm, a.ras, b.ras, a.uv[0][0], a.uv[0][1], b.uv[0][0], b.uv[0][1], a.uv[1][0], a.uv[1][1], b.uv[1][0], b.uv[1][1], mat.coords[0], mat.coords[1], mat.coords[2], mat.coords[3], d.blendMode, d.blendSrc, d.blendDst, g.stages, d.stage[0].tc);
     }
-    if (L.state.load(std::memory_order_relaxed) == ListState::Proved)
+    if (L.state.load(std::memory_order_relaxed) == ListState::Proved) {
       ++sc.kept.auditFails;
+      // what moved, for the report
+      const WorldAttr* A = sc.attrs.data() + sc.meshes[o.mesh].first + o.first;
+      for (u32 k = 0; k < d.vertices; ++k)
+        if (!same_attrs(A + k, now.data() + k, 1)) {
+          const bool colour = (A[k].ras ^ now[k].ras) != 0, coordsMoved = std::memcmp(A[k].uv, now[k].uv, sizeof A[k].uv) != 0;
+          ++(colour ? sc.kept.auditColour : coordsMoved ? sc.kept.auditCoords : sc.kept.auditNormal);
+          break;
+        }
+    }
     return keep(L.seen >= ProofFrames ? sc.kept.moving : sc.kept.moved);
   }
   if (L.seen < ProofFrames && ++L.seen == ProofFrames)
@@ -1200,7 +1258,8 @@ void match_static(const DrawRec* draws, u32 count, const Vertex* verts, const fl
         DrawnPair pair{p, L.model, {}};
         std::memcpy(pair.m, d.motionMtx, 48);
         out.pairs.push_back(pair);
-        if (L.state.load(std::memory_order_relaxed) != ListState::Keep && observe(sc, L, i, d, verts, texMeans, texCount, fr))
+        // A draw mid-fade stays a draw this frame: it says nothing of the list, which fades by the state the draw is drawn with, not by its bytes
+        if (d.fading == 0 && L.state.load(std::memory_order_relaxed) != ListState::Keep && observe(sc, L, i, d, verts, texMeans, texCount, fr))
           out.drop[i] = 1;
       }
       if (found)
@@ -1224,9 +1283,18 @@ void match_static(const DrawRec* draws, u32 count, const Vertex* verts, const fl
     }
     fr.stages.insert(fr.stages.end(), sc.staticStages.begin(), sc.staticStages.end());
   }
-  out.colours.resize(sc.meshes.size() + 1);
+  const size_t firstMerged = sc.meshes.size() + 1;
+  out.colours.resize(firstMerged + sc.merged[0].size() + sc.merged[1].size());
   if (!sc.meshes.empty())
     std::memcpy(out.colours.data() + 1, sc.meshes.data(), sc.meshes.size() * sizeof(GpuMesh));
+  // Each placed mesh of the merged structures, as its mesh, and flags 1 when the game drew that placement this frame: its lists still drawn are in the rays by their draws
+  size_t at = firstMerged;
+  for (const auto& kind : sc.merged)
+    for (const Scene::MergedGeo& g : kind) {
+      out.colours[at] = sc.meshes[g.mesh];
+      out.colours[at].flags = !out.drawn.empty() && out.drawn[g.placed] ? 1 : 0;
+      ++at;
+    }
   out.matchMs = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 }
 } // namespace aurora::gx::rt::scene

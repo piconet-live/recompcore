@@ -45,6 +45,7 @@ struct Params {
   float wet;
   uint lightRays;    // the surface's light from rays, this many a pixel; 0 off
   float skyGain, lightReach, bounce, visFloor;
+  uint stableShine;  // bit 0 stable shine, bit 1 Before holds a picture
 };
 struct Light { float3 pos; float3 colour; float reach; };
 struct GlowLight { float3 pos; float area; float3 colour; float radius; };
@@ -67,6 +68,7 @@ RaytracingAccelerationStructure Scene : register(t0);
 StructuredBuffer<Vertex> Verts : register(t1);
 StructuredBuffer<Draw> Draws : register(t2);
 Texture2D<float4> Raster : register(t3);
+Texture2D<float4> Before : register(t13);  // AURORA_RT_BEFORE_BLENDS=1: the picture before the frame's last blended draws; Raster again if there was no such moment
 StructuredBuffer<Light> Lights : register(t4);
 StructuredBuffer<Stage> Stages : register(t5);
 RWTexture2D<float4> Out : register(u0);
@@ -81,6 +83,8 @@ struct DenoiseParams {
   float4 cam[3];    // this frame's view space to the last frame's
   float alphaLeast, phiNormal, phiDepth, phiLight;
   uint step, reset, denoised, show;
+  float litScale;  // full pixels to a light pixel; half 1: light, sun and reflections at half resolution (AURORA_RT_HALF=1), brought up by full-resolution depth and normal
+  uint half;
 };
 ConstantBuffer<DenoiseParams> DP : register(b2);
 StructuredBuffer<float3> PrevPos : register(t10);
@@ -94,6 +98,7 @@ RWTexture2D<float4> OldSky : register(u10);
 RWTexture2D<float4> OldMoments : register(u11);
 RWTexture2D<float4> WriteOpen : register(u12);
 RWTexture2D<float4> WriteSky : register(u13);
+RWTexture2D<float4> WriteRefl : register(u15);  // half: what the mirror ray saw, a 1; a 0 where the surface doesn't shine
 RWTexture2D<float4> WriteMoments : register(u14);  // mean, mean of squares, frames of history, 0
 
 uint rng_next(inout uint s) { s = s * 747796405u + 2891336453u; uint w = ((s >> ((s >> 28) + 4)) ^ s) * 277803737u; return (w >> 22) ^ w; }
@@ -154,7 +159,9 @@ bool world_fetch(WorldMesh m, uint prim, float2 bary, float3x4 o2w, out Hit h) {
   h.pos = mul(o2w, float4(a.pos * w.x + b.pos * w.y + c.pos * w.z, 1));
   float3 n = a.nrm == NoDraw ? 0.xxx : nrm_of(a.nrm) * w.x + nrm_of(b.nrm) * w.y + nrm_of(c.nrm) * w.z;
   if (dot(n, n) < 1e-6) n = cross(b.pos - a.pos, c.pos - a.pos);
-  h.nrm = normalize(mul((float3x3)o2w, n));
+  // by the placement's cofactors, so a scaled placement's normals stay normal; a rigid one's are its rotation
+  float3 c0 = o2w._m00_m10_m20, c1 = o2w._m01_m11_m21, c2 = o2w._m02_m12_m22;
+  h.nrm = normalize(cross(c1, c2) * n.x + cross(c2, c0) * n.y + cross(c0, c1) * n.z);
   h.ras = ras_of(a.ras) * w.x + ras_of(b.ras) * w.y + ras_of(c.ras) * w.z;
   for (int i = 0; i < 2; ++i) {
     h.uv[i] = a.uv[i] * w.x + b.uv[i] * w.y + c.uv[i] * w.z;
@@ -263,8 +270,9 @@ float3 trace_reflection(float3 org, float3 dir, float maxLodScale) {
       WorldMesh m = world_mesh(q.CommittedInstanceID(), q.CommittedGeometryIndex());
       tmin = t + 0.02;
       have = world_fetch(m, q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), q.CommittedObjectToWorld3x4(), h);
+      if (have) h.pos = org + dir * t;  // for fog alone; a merged structure's own transform isn't the instance's
       // the game drew this placement but not by this triangle, or by a draw still in the rays
-      if (!have && (q.CommittedInstanceID() & WorldDrawn) != 0) continue;
+      if (!have && ((q.CommittedInstanceID() & WorldDrawn) != 0 || m.flags != 0)) continue;
     }
     if (q.CommittedInstanceID() >= WorldId && !have) {
       WorldMesh m = world_mesh(q.CommittedInstanceID(), q.CommittedGeometryIndex());
@@ -379,7 +387,7 @@ void light_rays(float3 pos, float3 N, float dist, float2 xi, out float open, out
           cls = Draws[wh.draw].cls;
           if (cls != 3) c = shade(wh, 3.0);
         } else {
-          if ((q.CommittedInstanceID() & WorldDrawn) != 0) continue;
+          if ((q.CommittedInstanceID() & WorldDrawn) != 0 || m.flags != 0) continue;
           cls = m.cls, c = m.colour;
         }
       } else {
@@ -422,9 +430,11 @@ float sun_term(float3 pos, float3 N, float dist) {
       tmin = t + 0.02;
       Hit wh;
       const bool known = world_fetch(m, q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), q.CommittedObjectToWorld3x4(), wh);
-      if (!known && (q.CommittedInstanceID() & WorldDrawn) != 0) continue;
-      if (m.cls == 0) return 0;
-      if (m.cls == 1 && (known ? Draws[wh.draw].cls == 0 || shade(wh, 2.0).a >= 0.5 : m.colour.a >= 0.5)) return 0;
+      if (!known && ((q.CommittedInstanceID() & WorldDrawn) != 0 || m.flags != 0)) continue;
+      // the draw's own class once it was drawn: a mesh the file calls solid can be drawn blended
+      const uint wc = known ? Draws[wh.draw].cls : m.cls;
+      if (wc == 0) return 0;
+      if (wc == 1 && (known ? shade(wh, 2.0).a >= 0.5 : m.colour.a >= 0.5)) return 0;
       continue;
     }
     Hit h = fetch(q.CommittedInstanceID() + q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
@@ -450,7 +460,46 @@ static const float MatGapLow = 0.45, MatGapHigh = 0.95; // own brightness agains
 static const float MatMatte = 0.2, MatPale = 0.1;      // how far Fresnel rises at a grazing view: any surface, and more if pale
 static const float MatLayerRise = 0.6;                  // how far Fresnel rises on a full reflection layer: the layer is already the game's own shine
 static const float MatMetal = 0.15;                      // base reflectance a full reflection layer adds to 0.04
+// AURORA_RT_SHINE_STABLE=1, tuned: the gap test reads the texture this many levels softer, so a dimple's lit rim doesn't take shine a pixel at a time; a reflection adds at most this share of the surface's own brightness (with a floor, so dark road still shows neon)
+static const float MatShineSofter = 1.5, MatAddMost = 0.8, MatAddFloor = 0.25;
+static const float MatReflLeast = 0.06;                  // AURORA_RT_HALF=1, tuned: no mirror ray on a surface that would take less of it than this
 static const float MatMetalDim = 0.7;                   // how much of the surface a full layer gives up to its reflection, never all: no black chrome
+float2 oct_of(float3 n) {
+  float2 p = n.xy / (abs(n.x) + abs(n.y) + abs(n.z));
+  return n.z >= 0 ? p : (1 - abs(p.yx)) * float2(p.x >= 0 ? 1 : -1, p.y >= 0 ? 1 : -1);
+}
+float3 normal_of(float2 e) {
+  float3 n = float3(e, 1 - abs(e.x) - abs(e.y));
+  if (n.z < 0) n.xy = (1 - abs(n.yx)) * float2(n.x >= 0 ? 1 : -1, n.y >= 0 ? 1 : -1);
+  return normalize(n);
+}
+// Half resolution's four light pixels around a full pixel, each by nearness and by how much it is the same surface: this pixel's distance and normal against theirs. Tuned: 2% of the distance, normal power 16.
+struct Up { int2 p[4]; float w[4]; };
+Up up_at(int2 c, float dist, float3 N) {
+  Up u;
+  float2 f = (c + 0.5) / DP.litScale - 0.5;
+  int2 b = int2(floor(f));
+  float2 fr = f - b;
+  uint w0, h0;
+  Guide.GetDimensions(w0, h0);
+  float sum = 0;
+  int best = 0;
+  float bestW = -1;
+  for (int k = 0; k < 4; ++k) {
+    int2 o = int2(k & 1, k >> 1);
+    u.p[k] = clamp(b + o, int2(0, 0), int2(w0 - 1, h0 - 1));
+    float4 g = Guide[u.p[k]];
+    float near = (o.x ? fr.x : 1 - fr.x) * (o.y ? fr.y : 1 - fr.y) + 1e-3;
+    float same = g.z > 0 ? exp(-abs(g.z - dist) / (dist * 0.02 + 0.05)) * pow(saturate(dot(normal_of(g.xy), N)), 16) : 0;
+    u.w[k] = near * same;
+    sum += u.w[k];
+    if (same > bestW) bestW = same, best = k;
+  }
+  if (sum < 1e-4) { for (int k = 0; k < 4; ++k) u.w[k] = k == best ? 1 : 0; sum = 1; }
+  for (int k = 0; k < 4; ++k) u.w[k] /= sum;
+  return u;
+}
+#define UP_READ(tex, u) (tex[u.p[0]] * u.w[0] + tex[u.p[1]] * u.w[1] + tex[u.p[2]] * u.w[2] + tex[u.p[3]] * u.w[3])
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
   float2 rasterDim;
@@ -523,7 +572,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         float3 around = shade(h, 4).rgb;
         float ownL = lum(own), aroundL = lum(around);
         // darker than the texture around it (a gap in a grating, a seam): no shine there
-        float shine = smoothstep(MatGapLow, MatGapHigh, ownL / max(aroundL, 0.02));
+        float shine = smoothstep(MatGapLow, MatGapHigh, ((P.stableShine & 1) != 0 ? lum(shade(h, MatShineSofter).rgb) : ownL) / max(aroundL, 0.02));
         // bright and unsaturated, on the whole: its texture reads as specular
         float most = max(around.r, max(around.g, around.b)), least = min(around.r, min(around.g, around.b));
         float pale = smoothstep(0.5, 0.9, most) * (1 - saturate((most - least) / max(most, 0.02)));
@@ -531,15 +580,21 @@ void main(uint3 id : SV_DispatchThreadID) {
         float gloss = lerp(MatMatte + MatPale * pale, MatLayerRise, layer);
         float f0 = 0.04 + MatMetal * layer;
         float fr = (f0 + max(gloss - f0, 0) * pow(1 - cosv, 5)) * shine;
-        float bareM = 1 - smoothstep(0.15, 0.45, lum(raster) - ownL);
+        float bareM = 1 - smoothstep(0.15, 0.45, lum((P.stableShine & 2) != 0 ? Before[id.xy].rgb : raster) - ownL);
         if (P.lightGain > 0 && (d.highlight & 4) == 0) light += engine_light(h.pos, N) * P.lightGain * bareM;
         if (P.glowGain > 0 && (d.highlight & 6) == 0) light += glow_light(h.pos, N) * P.glowGain * bareM;
         if (P.glowShow != 0 && (d.highlight & 2) != 0) { sum = float3(1, -1, 1); light = 0; break; }
         if (P.lightRays > 0 && (d.highlight & 6) == 0) {
           float3 f;
           if (DP.denoised != 0) {
+            if (DP.half != 0) {
+              Up u = up_at(id.xy, -h.pos.z, N);
+              float4 a = UP_READ(ReadOpen, u), b = UP_READ(ReadSky, u);
+              f = lit_factor(a.a, a.rgb, b.rgb, max(UP_READ(Guide, u).w, 0));
+            } else {
             float4 a = ReadOpen[id.xy], b = ReadSky[id.xy];
             f = lit_factor(a.a, a.rgb, b.rgb, Guide[id.xy].w);
+            }
           } else {
             float open; float3 bounce, skySeen;
             light_rays(h.pos, N, t, float2(rnd(seed), rnd(seed)), open, bounce, skySeen);
@@ -548,16 +603,24 @@ void main(uint3 id : SV_DispatchThreadID) {
           light += (f - 1) * bareM;
         }
         if (P.mode == 2) { dbg += fr.xxx; break; }
-        if (fr > 0.002) {
+        if (DP.half != 0 ? fr > MatReflLeast : fr > 0.002) {
+          float3 seen;
+          if (DP.half != 0) {
+            Up u = up_at(id.xy, -h.pos.z, N);
+            float4 s = UP_READ(WriteRefl, u);
+            seen = s.a > 0.01 ? s.rgb / s.a : raster;
+          } else {
           float3 R = reflect(v, N);
-          float3 seen = trace_reflection(h.pos + N * 0.03, R, 8.0 / max(P.size.y, 1) * 512.0 / 4.0);
+          seen = trace_reflection(h.pos + N * 0.03, R, 8.0 / max(P.size.y, 1) * 512.0 / 4.0);
           seen = min(seen, 2.0);
+          }
           // with light from rays the surface under the reflection is the one lit by them, or a shaded face goes dark and takes the reflection's colour
           float3 under = P.lightRays > 0 ? raster * max(1 + light, 0) : raster;
           float3 tint = lerp(1.xxx, own / max(most, 0.05), 0.5 * layer);
           float3 lit = max(seen - under, 0);
           float3 metal = tint * seen - MatMetalDim * under;
           term = fr * lerp(lit, metal, layer) * bareM;
+          if ((P.stableShine & 1) != 0) term = min(term, max(lum(under), MatAddFloor) * MatAddMost);
         }
         break;
       }
@@ -598,7 +661,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
     sum += term;
   }
-  if (P.mode == 8) { Out[id.xy] = float4(sum + raster * light, hitDepth); return; }
+  // own light falls on the surface: on what lies under the last blended effects, not on them. They are drawn over as they are.
+  if (P.mode == 8) { Out[id.xy] = float4(sum + ((P.stableShine & 2) != 0 ? Before[id.xy].rgb : raster) * light, hitDepth); return; }
   if (P.mode >= 6) { Out[id.xy] = float4(dbg, 1); return; }
   if (P.mode >= 2) { Out[id.xy] = float4(dbg / P.spp, 1); return; }
   float3 refl = sum / P.spp;
@@ -606,20 +670,12 @@ void main(uint3 id : SV_DispatchThreadID) {
   Out[id.xy] = float4(P.mode == 1 ? refl + lit : raster + refl + lit, 1);
 }
 
-float2 oct_of(float3 n) {
-  float2 p = n.xy / (abs(n.x) + abs(n.y) + abs(n.z));
-  return n.z >= 0 ? p : (1 - abs(p.yx)) * float2(p.x >= 0 ? 1 : -1, p.y >= 0 ? 1 : -1);
-}
-float3 normal_of(float2 e) {
-  float3 n = float3(e, 1 - abs(e.x) - abs(e.y));
-  if (n.z < 0) n.xy = (1 - abs(n.yx)) * float2(n.x >= 0 ? 1 : -1, n.y >= 0 ? 1 : -1);
-  return normalize(n);
-}
 float noise_at(float2 p) { return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715)))); }
 // The first pass of light across frames: where each pixel's surface is, where it was, the sun, and the rays' raw light
 [numthreads(8, 8, 1)]
 void light_pass(uint3 id : SV_DispatchThreadID) {
-  float2 px = id.xy + 0.5;
+  float2 px = (id.xy + 0.5) * DP.litScale;
+  if (DP.half != 0) WriteRefl[id.xy] = 0;
   float2 efb = P.rectXY + px / P.size * P.rectWH;
   float2 ndc = float2((efb.x - P.vpXY.x) / P.vpWH.x * 2 - 1, 1 - (efb.y - P.vpXY.y) / P.vpWH.y * 2);
   float3 v = normalize(float3((ndc + P.pOffset) / P.pScale, -1));
@@ -669,6 +725,23 @@ void light_pass(uint3 id : SV_DispatchThreadID) {
       ReadSky[id.xy] = float4(skySeen, 0);
       sunV = sun_term(h.pos, N, t);
     }
+    // At half resolution the mirror ray goes here too, from this hit: the primary ray isn't paid twice, and only surfaces with shine pay at all. As main's rule.
+    if (DP.half != 0 && (d.highlight & 6) == 0) {
+      if (!worldHit) h.rate = uv_rates(prim);
+      float cosv = saturate(-dot(N, v));
+      h.foot = t * 2 / max(abs(P.pScale.y) * P.size.y, 1) / sqrt(max(cosv, 0.05));
+      float ownS = lum(shade(h, (P.stableShine & 1) != 0 ? MatShineSofter : 0).rgb);
+      float3 around = shade(h, 4).rgb;
+      float shine = smoothstep(MatGapLow, MatGapHigh, ownS / max(lum(around), 0.02));
+      float most = max(around.r, max(around.g, around.b)), least = min(around.r, min(around.g, around.b));
+      float pale = smoothstep(0.5, 0.9, most) * (1 - saturate((most - least) / max(most, 0.02)));
+      float layer = saturate(d.strength);
+      float gloss = lerp(MatMatte + MatPale * pale, MatLayerRise, layer);
+      float f0 = 0.04 + MatMetal * layer;
+      float fr = (f0 + max(gloss - f0, 0) * pow(1 - cosv, 5)) * shine;
+      if (fr > MatReflLeast)
+        WriteRefl[id.xy] = float4(min(trace_reflection(h.pos + N * 0.03, reflect(v, N), 8.0 / max(P.size.y, 1) * 512.0 / 4.0 * DP.litScale), 2.0), 1);
+    }
     Guide[id.xy] = float4(oct_of(N), -h.pos.z, sunV);
     break;
   }
@@ -676,7 +749,7 @@ void light_pass(uint3 id : SV_DispatchThreadID) {
   float2 pn = DP.prevScale * (prevAt.xy / max(-prevAt.z, 1e-3)) - DP.prevOffset;
   float2 pe = float2((pn.x + 1) * 0.5 * DP.prevVpWH.x + DP.prevVpXY.x, (1 - pn.y) * 0.5 * DP.prevVpWH.y + DP.prevVpXY.y);
   float2 pp2 = (pe - P.rectXY) / P.rectWH * P.size;
-  Motion[id.xy] = float4(pp2 - px, prevZ, smear);
+  Motion[id.xy] = float4((pp2 - px) / DP.litScale, prevZ, smear);
 }
 // A surface's light as last frame left it: what lands on the same surface there, by where it was (bilinear, each of the four kept only if it is the same surface).
 // History is short at this game's speed, so a pixel with little of it lets atrous blur it harder. Tuned: 1% + the local slope in distance, normal 0.7, alphaLeast.
@@ -794,27 +867,6 @@ RWTexture2D<float> Expo : register(u3);
 SamplerState Edge : register(s1);
 
 float3 term_of(Texture2D<float4> from, int2 c) {
-  uint fw, fh, rw, rh;
-  from.GetDimensions(fw, fh);
-  Raster.GetDimensions(rw, rh);
-  if (fw != rw) {
-    // half-size rays: four taps of the term, weighted by how alike the full-size picture is there and here (tuned: 8)
-    const float2 k = float2(rw, rh) / float2(fw, fh);
-    const float2 h = (c + 0.5) / k - 0.5;
-    const int2 i = int2(floor(h));
-    const float2 f = h - i;
-    const float here = lum(Raster[c].rgb);
-    float3 sum = 0;
-    float weight = 0;
-    for (int y = 0; y < 2; ++y)
-      for (int x = 0; x < 2; ++x) {
-        const int2 t = clamp(i + int2(x, y), 0, int2(fw, fh) - 1);
-        const float w = (x ? f.x : 1 - f.x) * (y ? f.y : 1 - f.y) * exp(-8 * abs(here - lum(Raster[int2((t + 0.5) * k)].rgb))) + 1e-4;
-        sum += from[t].rgb * w;
-        weight += w;
-      }
-    return sum / weight;
-  }
   float4 mid = from[c];
   float3 sum = mid.rgb;
   float weight = 1;

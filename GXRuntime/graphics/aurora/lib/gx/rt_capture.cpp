@@ -35,6 +35,7 @@ bool g_neutral = false;
 bool g_gameLightOff = false;
 bool g_noVertexColour = false;
 bool g_gameLit[2]{};
+float g_ambientWarmth = 0.f;
 bool g_capturing = false;
 bool g_noHud = false;
 bool g_live = false;
@@ -216,6 +217,8 @@ void start() noexcept {
     s_at = std::strtoull(at, nullptr, 10);
   if (const char* v = std::getenv("AURORA_RT_GAME_LIGHT"); v != nullptr && v[0] == '0')
     g_gameLightOff = true;
+  if (const char* v = std::getenv("AURORA_RT_AMBIENT_WARMTH"))
+    g_ambientWarmth = static_cast<float>(std::atof(v));
   if (const char* v = std::getenv("AURORA_RT_DENOISE"); v != nullptr && v[0] == '1')
     s_motionOn = true;
   // with our own light: the rays' shadows stand in for the game's. AURORA_RT_GAME_SHADOW=1 keeps the game's
@@ -231,9 +234,12 @@ void start() noexcept {
   g_noHud = noHud != nullptr && noHud[0] == '1';
   if (const char* at = std::getenv("AURORA_RT_CAPTURE_COPY"))
     s_atCopy = std::strtoull(at, nullptr, 10);
-  g_capturing = g_live || (!s_path.empty() && s_at == 0 && s_atCopy == 0);
+  // the live pass captures from the first frame after its compile is done, see frame_end
+  g_capturing = !g_live && !s_path.empty() && s_at == 0 && s_atCopy == 0;
 #if defined(AURORA_RT_LIVE)
   g_hook = g_live || live::look_on();
+  if (g_hook)
+    live::start_compile();
 #endif
   // AURORA_RT_LOOK=1, the overhaul look: reflections you can't miss. Each number can still be set by its own switch below. All tuned by eye.
   if (const char* v = std::getenv("AURORA_RT_LOOK"); v != nullptr && v[0] == '1') {
@@ -301,6 +307,7 @@ struct Packet {
   GXPrimitive prim;
   u16 vtxCount;
   u32 samplesCopy;
+  std::uint64_t stateKey;
   u32 rawOffset, rawBytes, stagesOffset, mtxOffset, mtxCount, lightsOffset;
   decltype(GXState::proj) proj;
   decltype(GXState::logicalViewport) logicalViewport;
@@ -342,6 +349,68 @@ u32 triangle_vertices(GXPrimitive prim, u32 n) {
   }
 }
 
+// AURORA_RT_SCENE_FADE=0: a fading draw counts against its list as before, to compare
+static const bool s_fadeAsDraw = [] {
+  const char* v = std::getenv("AURORA_RT_SCENE_FADE");
+  return v == nullptr || v[0] != '0';
+}();
+// What the translation of a proved list reads besides its bytes, read only as the draw's own stages read it: registers no stage reads go stale without the surface changing.
+// Texture matrices, the texture by its data, the colours a stage or channel takes from a register. No vertex data, no per-frame table: some dozens of words a draw, and most draws have no matrix.
+static std::uint64_t state_key() noexcept {
+  const auto& st = g_gxState;
+  std::uint64_t h = 0xcbf29ce484222325ull;
+  const auto mix = [&h](std::uint64_t w) {
+    h = (h ^ w) * 0x9E3779B97F4A7C15ull;
+    h ^= h >> 29;
+  };
+  const auto words = [&mix](const void* p, size_t bytes) {
+    const auto* u = static_cast<const std::uint32_t*>(p);
+    for (size_t i = 0; i < bytes / 4; ++i)
+      mix(u[i]);
+  };
+  const u32 gens = std::min<u32>(st.numTexGens, MaxUv);
+  mix(gens);
+  for (u32 t = 0; t < gens; ++t) {
+    const auto& g = st.tcgs[t];
+    if (g.mtx != GX_IDENTITY && g.mtx >= GX_TEXMTX0 && (g.mtx - GX_TEXMTX0) / 3 < MaxTexMtx && g.src != GX_TG_NRM)
+      words(&st.texMtxs[(g.mtx - GX_TEXMTX0) / 3], sizeof(st.texMtxs[0]));
+    if (g.postMtx != GX_PTIDENTITY && g.postMtx >= GX_PTTEXMTX0 && (g.postMtx - GX_PTTEXMTX0) / 3 < MaxPTTexMtx && g.src != GX_TG_NRM)
+      words(&st.ptTexMtxs[(g.postMtx - GX_PTTEXMTX0) / 3], sizeof(st.ptTexMtxs[0]));
+  }
+  const u32 stages = std::min<u32>(st.numTevStages, 16u);
+  bool reads[4]{}, readsRas = false;
+  u32 chan = 0;
+  for (u32 i = 0; i < stages; ++i) {
+    const TevStage& s = st.tevStages[i];
+    readsRas = readsRas || s.colorPass.a == GX_CC_RASC || s.colorPass.b == GX_CC_RASC || s.colorPass.c == GX_CC_RASC || s.colorPass.d == GX_CC_RASC || s.colorPass.a == GX_CC_RASA || s.colorPass.b == GX_CC_RASA || s.colorPass.c == GX_CC_RASA || s.colorPass.d == GX_CC_RASA;
+    if (s.channelId == GX_COLOR1A1 || s.channelId == GX_COLOR1 || s.channelId == GX_ALPHA1)
+      chan = 1;
+    // a reflection layer's own fields, as material_of leaves them out
+    if (is_reflection_stage(s, st.tcgs))
+      continue;
+    if (s.texMapId != GX_TEXMAP_NULL && s.texMapId < MaxTextures)
+      mix(reinterpret_cast<std::uintptr_t>(st.textures[s.texMapId].texObj.data));
+    for (const auto a : {s.colorPass.a, s.colorPass.b, s.colorPass.c, s.colorPass.d})
+      if (a < GX_CC_TEXC)
+        reads[a / 2] = true;
+    for (const auto a : {s.alphaPass.a, s.alphaPass.b, s.alphaPass.c, s.alphaPass.d})
+      if (a < GX_CA_TEXA)
+        reads[a] = true;
+    const auto& pc = s.colorPass;
+    if (pc.a == GX_CC_KONST || pc.b == GX_CC_KONST || pc.c == GX_CC_KONST || pc.d == GX_CC_KONST) {
+      mix(s.kcSel);
+      if (s.kcSel >= GX_TEV_KCSEL_K0)
+        words(&st.kcolors[(s.kcSel - GX_TEV_KCSEL_K0) & 3], 12);
+    }
+  }
+  for (int r = 0; r < 4; ++r)
+    if (reads[r])
+      words(&st.colorRegs[r], 12);
+  const auto& cc = st.colorChannelConfig[GX_COLOR0 + chan];
+  if (readsRas && cc.matSrc != GX_SRC_VTX)
+    words(&st.colorChannelState[GX_COLOR0 + chan].matColor, 12);
+  return h | 1;
+}
 // Anywhere, in any order: the packet says where its draw and triangles go
 void translate(const Packet& st, DrawRec& d, Vertex* outVerts) noexcept {
   const auto* base = reinterpret_cast<const u8*>(&st);
@@ -361,6 +430,7 @@ void translate(const Packet& st, DrawRec& d, Vertex* outVerts) noexcept {
   d.projType = st.projType;
   d.stages = st.numTevStages;
   d.samplesCopy = st.samplesCopy;
+  d.stateKey = st.stateKey;
   d.blendMode = st.blendMode, d.blendSrc = st.blendFacSrc, d.blendDst = st.blendFacDst;
   d.depthUpdate = st.depthUpdate, d.depthCompare = st.depthCompare, d.cull = st.cullMode, d.colorUpdate = st.colorUpdate;
   d.prim = prim, d.vtxCount = vtxCount;
@@ -456,9 +526,17 @@ void translate(const Packet& st, DrawRec& d, Vertex* outVerts) noexcept {
       const Vec4<float>* rows[3] = {&m.m0, &m.m1, &m.m2};
       for (int r = 0; r < 3; ++r)
         d.motionMtx[r * 4] = rows[r]->x(), d.motionMtx[r * 4 + 1] = rows[r]->y(), d.motionMtx[r * 4 + 2] = rows[r]->z(), d.motionMtx[r * 4 + 3] = rows[r]->w();
+      const auto& n = pnMtx[0].nrm;
+      const Vec4<float>* nrows[3] = {&n.m0, &n.m1, &n.m2};
+      for (int r = 0; r < 3; ++r)
+        d.nrmMtx[r * 3] = nrows[r]->x(), d.nrmMtx[r * 3 + 1] = nrows[r]->y(), d.nrmMtx[r * 3 + 2] = nrows[r]->z();
     }
   }
   d.lit = st.colorChannelConfig[GX_COLOR0 + chan].lightingEnabled;
+  {
+    const auto& cc = st.colorChannelConfig[GX_ALPHA0 + chan];
+    d.fading = s_fadeAsDraw && cc.matSrc != GX_SRC_VTX && !cc.lightingEnabled && st.colorChannelState[GX_ALPHA0 + chan].matColor[3] < 0.99f ? 1 : 0;
+  }
 
   const auto read_vertex = [&](const u8* v) {
     Vertex out{};
@@ -1160,6 +1238,7 @@ void note_draw(const u16 vtxCount) noexcept {
                static_cast<unsigned long long>(s_copyNow), int(st.projType), int(st.blendMode), int(st.blendFacSrc), int(st.blendFacDst), int(st.depthUpdate), int(st.depthCompare), int(st.depthFunc),
                int(st.colorUpdate), int(st.alphaUpdate), int(samples_copy()), st.numTevStages, st.numTexGens, vtxCount, int(st.cullMode), int(is_game_shadow()), st.numTevStages > 0 && st.tevStages[0].texMapId < MaxTextures ? st.textures[st.tevStages[0].texMapId].texObj.data : nullptr, m.pos.m0.w(), m.pos.m1.w(), m.pos.m2.w());
 }
+static std::uint64_t s_stateKeyNow = 0;  // this draw's, while it's captured: on the stream's thread
 static void make_packet(u8* room, const size_t size, const u32 stages, const u32 mtxCount, const bool lit, GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
                         const u8* vertices, const u32 rawBytes, u32 drawSlot, u32 vertSlot, u32 drawIndex, u32 firstVertex, u32 epoch) noexcept {
   auto& st = g_gxState;
@@ -1209,9 +1288,20 @@ static void make_packet(u8* room, const size_t size, const u32 stages, const u32
   at += lit ? sizeof(Light) * GX::MaxLights : 0;
   p.rawOffset = static_cast<u32>(at), p.rawBytes = rawBytes;
   p.samplesCopy = samples_copy() ? 1 : 0;
+  p.stateKey = s_stateKeyNow;
   std::memcpy(room + at, vertices, rawBytes);
 }
 
+// As translate's d.fading, from the stream's state: the channel the stages read is the first, or the second if a stage asks for it
+static bool draw_fading() noexcept {
+  const auto& st = g_gxState;
+  u32 chan = 0;
+  for (u32 i = 0; i < std::min<u32>(st.numTevStages, 16u); ++i)
+    if (st.tevStages[i].channelId == GX_COLOR1A1 || st.tevStages[i].channelId == GX_COLOR1 || st.tevStages[i].channelId == GX_ALPHA1)
+      chan = 1;
+  const auto& cc = st.colorChannelConfig[GX_ALPHA0 + chan];
+  return s_fadeAsDraw && cc.matSrc != GX_SRC_VTX && !cc.lightingEnabled && st.colorChannelState[GX_ALPHA0 + chan].matColor[3] < 0.99f;
+}
 void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertices, size_t rawBytes) noexcept {
   auto& st = g_gxState;
   // lines only for what they light: sparks are additive lines and strips, and no ray ever hits a line
@@ -1240,15 +1330,16 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
   }
 #endif
 #if defined(AURORA_RT_LIVE)
+  s_stateKeyNow = g_live && scene::static_on() ? state_key() : 0;
   // AURORA_RT_SCENE_STATIC=1: a draw the static scene holds, proved the same, costs its bytes' hash here and nothing further on. Additive and no-depth passes always go on: a second pass over the same list isn't the surface.
-  if (g_live && scene::static_on() && (prim == GX_TRIANGLES || prim == GX_TRIANGLESTRIP || prim == GX_TRIANGLEFAN) && vtxCount >= 3 && st.vtxDesc[GX_VA_PNMTXIDX] == GX_NONE && st.vtxDesc[GX_VA_POS] == GX_DIRECT && st.depthUpdate && st.depthCompare && st.colorUpdate && !(st.blendMode == 1 && st.blendFacDst == 1)) {
+  if (g_live && scene::static_on() && (prim == GX_TRIANGLES || prim == GX_TRIANGLESTRIP || prim == GX_TRIANGLEFAN) && vtxCount >= 3 && st.vtxDesc[GX_VA_PNMTXIDX] == GX_NONE && st.vtxDesc[GX_VA_POS] == GX_DIRECT && st.depthUpdate && st.depthCompare && st.colorUpdate && !(st.blendMode == 1 && st.blendFacDst == 1) && !draw_fading()) {
     ensure_job();
     if (scene::Scene* sc = s_job->world.scene.get()) {
       const auto& mtx = st.pnMtx[std::min<u32>(st.currentPnMtx, MaxPnMtx - 1)].pos;
       float m[12] = {mtx.m0.x(), mtx.m0.y(), mtx.m0.z(), mtx.m0.w(), mtx.m1.x(), mtx.m1.y(), mtx.m1.z(), mtx.m1.w(), mtx.m2.x(), mtx.m2.y(), mtx.m2.z(), mtx.m2.w()};
       float proj[16];
       std::memcpy(proj, &st.proj, sizeof proj);
-      if (scene::stream_skip(s_job->world, *sc, prim, vtxCount, vertices, rawBytes, m, proj, triangle_vertices(prim, vtxCount), s_rulesTick)) {
+      if (scene::stream_skip(s_job->world, *sc, prim, vtxCount, vertices, rawBytes, m, proj, triangle_vertices(prim, vtxCount), s_rulesTick, s_stateKeyNow)) {
         s_captureMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - liveStart).count();
         return;
       }
@@ -1368,6 +1459,8 @@ static void send_rays() noexcept {
 }
 #endif
 
+static u32 s_zNow = 0, s_zLast = 0;
+static bool s_beforeTaken = false;
 void before_draw() noexcept {
 #if defined(AURORA_RT_LIVE)
   // AURORA_RT_LIGHTFACTS: where the frame's orthographic draws fall against the scene
@@ -1383,6 +1476,16 @@ void before_draw() noexcept {
   if (g_gxState.projType == GX_PERSPECTIVE) {
     s_seenPerspective = true;
     ++s_viewDraws;
+    // AURORA_RT_BEFORE_BLENDS=1: the frame's last blended draws come after its last depth-writing draw; last frame's count of those says when
+    static const bool beforeOn = live::before_on();
+    if (beforeOn && g_capturing) {
+      if (g_gxState.depthUpdate)
+        ++s_zNow;
+      else if (!s_beforeTaken && s_zLast > 0 && s_zNow >= s_zLast) {
+        s_beforeTaken = true;
+        live::snapshot_before();
+      }
+    }
   } else if (s_seenPerspective)
     send_rays();
 #endif
@@ -1391,6 +1494,7 @@ void before_draw() noexcept {
 void efb_cleared() noexcept {
   if (!g_hook || s_rayed)
     return;
+  s_zNow = 0, s_beforeTaken = false;
 #if defined(AURORA_RT_LIVE)
   forget_draws();
 #endif
@@ -1417,11 +1521,12 @@ void frame_end() noexcept {
   if (g_hook) {
     if (s_seenPerspective)
       send_rays();
+    s_zLast = s_zNow, s_zNow = 0, s_beforeTaken = false;
     s_rayed = false;
     s_seenPerspective = false;
     forget_draws();
     s_viewDraws = 0;
-    g_capturing = g_live && !live::failed();
+    g_capturing = g_live && !live::failed() && live::ready();
     return;
   }
 #endif

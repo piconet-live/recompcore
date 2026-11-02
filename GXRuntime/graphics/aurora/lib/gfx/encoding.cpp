@@ -32,7 +32,7 @@ using webgpu::g_device;
 using webgpu::g_queue;
 
 void (*g_beforeFrameSubmit)() = nullptr;
-void (*g_betweenTask)(wgpu::CommandEncoder& cmd) = nullptr;
+void (*g_betweenTask)(wgpu::CommandEncoder& cmd, EncoderTaskId type) = nullptr;
 void (*g_afterFrameSubmit)() = nullptr;
 
 namespace {
@@ -464,7 +464,7 @@ void encode_op_again(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameO
     break;
   case FrameOpType::EncoderTask:
     if (g_betweenTask != nullptr) {
-      g_betweenTask(cmd);
+      g_betweenTask(cmd, op.encoderTask != nullptr ? op.encoderTask->type : InvalidEncoderTask);
     }
     break;
   default:

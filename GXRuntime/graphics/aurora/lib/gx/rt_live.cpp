@@ -18,13 +18,16 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <future>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "../webgpu/gpu.hpp"
@@ -64,9 +67,10 @@ struct Params {
   // AURORA_RT_LIGHTING=1: the surface's light from rays (rt.hlsl lighting()). rays 0: off
   u32 lightRays;
   float skyGain, lightReach, bounce, visFloor;
+  u32 stableShine;  // bit 0: AURORA_RT_SHINE_STABLE=1; bit 1: t13 holds the picture from before the last blends. The root signature has no room for more words
 };
 
-constexpr u32 Frames = 3, SlotDescriptors = 12, MaxTextures = 8192, PostLevels = 6;
+constexpr u32 Frames = 3, SlotDescriptors = 13, MaxTextures = 8192, PostLevels = 6;
 // As rt.hlsl's PostParams
 struct PostParams {
   float texel[2], range, bloom, dt, grade;
@@ -82,8 +86,10 @@ struct DenoiseParams {
   float cam[3][4];
   float alphaLeast, phiNormal, phiDepth, phiLight;
   u32 step, reset, denoised, show;
+  float litScale;  // full pixels to a light pixel: 2 with AURORA_RT_HALF=1
+  u32 half;
 };
-constexpr u32 DenoiseSteps = 8, DenoiseViews = 12, DenoiseIterations = 4;
+constexpr u32 DenoiseSteps = 8, DenoiseViews = 13, DenoiseIterations = 4;
 constexpr u32 ConstantStride = 256;
 constexpr u32 ViewBetweenTrue = PostFirst + PostDescriptors - BetweenDescriptors, ViewBetween = ViewBetweenTrue + 1;
 constexpr u32 ViewHdr = PostFirst, ViewDown = ViewHdr + 2, ViewUp = ViewDown + 2 * PostLevels, ViewExpo = ViewUp + 2 * (PostLevels - 1);
@@ -124,7 +130,8 @@ struct BetweenParams {
   BetweenMachine machine[30];
 };
 struct State {
-  bool failed = false, ready = false;
+  // ready: the compile thread has finished, everything below it is the render worker's from then on
+  std::atomic<bool> failed{false}, ready{false};
   ComPtr<ID3D12Device5> dev;
   ComPtr<ID3D12CommandQueue> queue;
   ComPtr<ID3D12Fence> fence;
@@ -144,7 +151,7 @@ struct State {
   double msBetweenGpu = 0, msBetweenCpu = 0;
   u64 betweenCount = 0, betweenGpuCount = 0;
   // Light across frames (AURORA_RT_DENOISE=1): textures for this frame and the last; a texture with its descriptors written per step
-  ComPtr<ID3D12Resource> guide[2], motion, noisyOpen, noisySky, histOpen[2], histSky[2], moments[2], tmpOpen[2], tmpSky[2];
+  ComPtr<ID3D12Resource> refl, guide[2], motion, noisyOpen, noisySky, histOpen[2], histSky[2], moments[2], tmpOpen[2], tmpSky[2];
   u32 flip = 0;
   float prevProj[16]{}, prevViewport[4]{};
   u64 lastLitCopy = 0;
@@ -164,9 +171,11 @@ struct State {
 
   u32 w = 0, h = 0;
   wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
-  ComPtr<ID3D12Resource> inputRes, outputRes, termRes;
-  wgpu::SharedTextureMemory inputMem, outputMem;
-  wgpu::Texture input, output;
+  ComPtr<ID3D12Resource> inputRes, outputRes, termRes, beforeRes;
+  wgpu::SharedTextureMemory inputMem, outputMem, beforeMem;
+  wgpu::Texture input, output, before;
+  bool beforeThis = false;
+  gfx::EncoderTaskId beforeTask = gfx::InvalidEncoderTask;
   wgpu::BindGroup bind;
   wgpu::RenderPipeline pipeline;
   u64 pipelineKey = 0;
@@ -179,6 +188,8 @@ struct State {
   ComPtr<ID3D12Resource> worldBlas, worldAttrs;
   double worldSkipped = 0, worldDropped = 0;
   std::vector<u64> worldAt;
+  u64 worldMergedAt[2]{};
+  bool worldMergedOn[2]{};
   u64 worldBytes = 0;
   double worldKnown = 0, worldDrawn = 0, worldInstances = 0, worldDraws = 0, worldMatched = 0, worldMoved = 0, worldMs = 0, worldPartial = 0;
   std::unique_ptr<Job> pending;
@@ -246,7 +257,12 @@ D3D12_GPU_DESCRIPTOR_HANDLE gpuh(u32 i) {
 
 // AURORA_RT_SHADER=<file>: the shader read from there instead of the build's own copy, to try a change without a build
 std::string s_shaderFile;
-ComPtr<IDxcBlob> compile(IDxcCompiler3* comp, const wchar_t* entry) {
+ComPtr<IDxcBlob> compile(const DxcCreateInstanceProc create, const wchar_t* entry) {
+  // a compiler for each entry: they run side by side, and one compiler is not for two threads. Below the game's threads.
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+  ComPtr<IDxcCompiler3> comp;
+  if (FAILED(create(CLSID_DxcCompiler, IID_PPV_ARGS(&comp))))
+    return nullptr;
   DxcBuffer src{kShader, sizeof kShader, DXC_CP_UTF8};
   if (!s_shaderFile.empty())
     src.Ptr = s_shaderFile.data(), src.Size = s_shaderFile.size();
@@ -268,7 +284,7 @@ ComPtr<IDxcBlob> compile(IDxcCompiler3* comp, const wchar_t* entry) {
   return out;
 }
 
-// On the render worker, once
+// On its own thread, once, from the start: the compile takes seconds, and nothing else waits for it. The frames show the game's own picture until g.ready.
 void init_device() {
   const auto t0 = std::chrono::steady_clock::now();
   if (webgpu::g_backendType != wgpu::BackendType::D3D12)
@@ -305,8 +321,7 @@ void init_device() {
   if (!dxc)
     return fail("no dxcompiler.dll");
   const auto create = reinterpret_cast<DxcCreateInstanceProc>(GetProcAddress(dxc, "DxcCreateInstance"));
-  ComPtr<IDxcCompiler3> comp;
-  if (!create || FAILED(create(CLSID_DxcCompiler, IID_PPV_ARGS(&comp))))
+  if (!create)
     return fail("no shader compiler");
   if (const char* path = std::getenv("AURORA_RT_SHADER"))
     if (FILE* f = std::fopen(path, "rb")) {
@@ -315,11 +330,12 @@ void init_device() {
         s_shaderFile.append(buf, n);
       std::fclose(f);
     }
-  auto traceCs = compile(comp.Get(), L"main"), composeCs = compile(comp.Get(), L"compose");
-  auto hdrCs = compile(comp.Get(), L"hdr_in"), downCs = compile(comp.Get(), L"bloom_down"), upCs = compile(comp.Get(), L"bloom_up"),
-       expoCs = compile(comp.Get(), L"exposure"), toneCs = compile(comp.Get(), L"tone");
-  auto warpCs = compile(comp.Get(), L"between_warp"), betweenHdrCs = compile(comp.Get(), L"between_hdr"), betweenComposeCs = compile(comp.Get(), L"between_compose");
-  auto lightCs = compile(comp.Get(), L"light_pass"), temporalCs = compile(comp.Get(), L"temporal"), atrousCs = compile(comp.Get(), L"atrous");
+  const auto start = [&](const wchar_t* entry) { return std::async(std::launch::async, compile, create, entry); };
+  auto traceF = start(L"main"), composeF = start(L"compose"), hdrF = start(L"hdr_in"), downF = start(L"bloom_down"), upF = start(L"bloom_up"), expoF = start(L"exposure"), toneF = start(L"tone"),
+       warpF = start(L"between_warp"), betweenHdrF = start(L"between_hdr"), betweenComposeF = start(L"between_compose"),
+       lightF = start(L"light_pass"), temporalF = start(L"temporal"), atrousF = start(L"atrous");
+  auto traceCs = traceF.get(), composeCs = composeF.get(), hdrCs = hdrF.get(), downCs = downF.get(), upCs = upF.get(), expoCs = expoF.get(), toneCs = toneF.get(), lightCs = lightF.get(), temporalCs = temporalF.get(), atrousCs = atrousF.get();
+  auto warpCs = warpF.get(), betweenHdrCs = betweenHdrF.get(), betweenComposeCs = betweenComposeF.get();
   if (!warpCs || !betweenHdrCs || !betweenComposeCs || !lightCs || !temporalCs || !atrousCs ||
       !traceCs || !composeCs || !hdrCs || !downCs || !upCs || !expoCs || !toneCs)
     return fail("the shader does not compile");
@@ -333,7 +349,7 @@ void init_device() {
   r1[1].OffsetInDescriptorsFromTableStart = 8;
   r1[1].Flags = r1[0].Flags;
   r1[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;  // t11, t12: the whole track's meshes and their attributes (rt_scene_live.inl)
-  r1[2].NumDescriptors = 2;
+  r1[2].NumDescriptors = 3;
   r1[2].BaseShaderRegister = 11;
   r1[2].OffsetInDescriptorsFromTableStart = 10;
   r1[2].Flags = r1[0].Flags;
@@ -422,9 +438,9 @@ void init_device() {
       std::fprintf(g.timeLog, "copy,build_ms,light_ms,denoise_ms,reflect_ms,compose_ms,tris,lights,uploads\n");
     }
   }
-  g.ready = true;
-  std::fprintf(stderr, "[rt] live pass ready on Dawn's device, %.0f ms\n",
+  std::fprintf(stderr, "[rt] live pass ready on Dawn's device, %.0f ms, beside the game\n",
                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+  g.ready = true;
 }
 
 ComPtr<ID3D12Resource> shared_texture(u32 w, u32 h, DXGI_FORMAT fmt, D3D12_RESOURCE_FLAGS flags, wgpu::SharedTextureMemory& mem, wgpu::Texture& tex) {
@@ -455,9 +471,23 @@ ComPtr<ID3D12Resource> shared_texture(u32 w, u32 h, DXGI_FORMAT fmt, D3D12_RESOU
   return r;
 }
 
+bool before_setting() {
+  static const bool on = [] {
+    const char* v = std::getenv("AURORA_RT_BEFORE_BLENDS");
+    return v != nullptr && v[0] == '1';
+  }();
+  return on;
+}
 bool denoise_on() {
   static const bool on = [] {
     const char* v = std::getenv("AURORA_RT_DENOISE");
+    return v != nullptr && v[0] == '1';
+  }();
+  return on;
+}
+bool half_on() {
+  static const bool on = [] {
+    const char* v = std::getenv("AURORA_RT_HALF");
     return v != nullptr && v[0] == '1';
   }();
   return on;
@@ -532,12 +562,12 @@ void make_targets(u32 w, u32 h, wgpu::TextureFormat format) {
     WaitForSingleObject(g.event, INFINITE);
   }
   g.w = w, g.h = h, g.format = format;
-  // AURORA_RT_HALF=1: rays and their light at half the picture's size each way, and made full-size at the composite
-  static const bool half = post_setting("AURORA_RT_HALF", 0.f) != 0.f;
-  g.rw = half ? std::max(w / 2, 1u) : w, g.rh = half ? std::max(h / 2, 1u) : h;
+  g.rw = w, g.rh = h;
   const DXGI_FORMAT dxgi = format == wgpu::TextureFormat::RGBA16Float ? DXGI_FORMAT_R16G16B16A16_FLOAT : format == wgpu::TextureFormat::BGRA8Unorm ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
   g.inputRes = shared_texture(w, h, dxgi, D3D12_RESOURCE_FLAG_NONE, g.inputMem, g.input);
   g.outputRes = shared_texture(w, h, output_format(), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, g.outputMem, g.output);
+  if (before_setting())
+    g.beforeRes = shared_texture(w, h, dxgi, D3D12_RESOURCE_FLAG_NONE, g.beforeMem, g.before);
   if (g.failed)
     return;
   D3D12_HEAP_PROPERTIES hp{};
@@ -559,6 +589,9 @@ void make_targets(u32 w, u32 h, wgpu::TextureFormat format) {
         fail("no texture for light across frames");
     };
     constexpr DXGI_FORMAT F16 = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    if (half_on())
+      d.Width = (w + 1) / 2, d.Height = (h + 1) / 2;
+    make(g.refl, F16);
     make(g.motion, F16), make(g.noisyOpen, F16), make(g.noisySky, F16);
     for (u32 i = 0; i < 2; ++i) {
       make(g.guide[i], DXGI_FORMAT_R32G32B32A32_FLOAT);
@@ -867,6 +900,8 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   p.lightShadow = shadow;
   p.bodyCalm = job.calm;
   p.wet = job.wet;
+  static const u32 stableShine = post_setting("AURORA_RT_SHINE_STABLE", 0.f) != 0.f ? 1 : 0;
+  p.stableShine = stableShine | (g.beforeThis ? 2u : 0u);
   p.skyFirst = fr.skyFirstVertex;
   p.glowCount = glowCount;
   p.glowGain = job.glow;
@@ -927,17 +962,19 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   ID3D12Resource* litOpen = nullptr;
   ID3D12Resource* litSky = nullptr;
   const u32 now = g.flip, old = g.flip ^ 1;
+  const u32 lightW = half_on() ? (g.w + 1) / 2 : g.w, lightH = half_on() ? (g.h + 1) / 2 : g.h;
+  dp.litScale = half_on() ? 2.f : 1.f, dp.half = half_on() ? 1 : 0;
   if (lit && p.lightRays > 0) {
     dp.denoised = 1;
-    bind({g.guide[now].Get(), g.motion.Get(), g.noisyOpen.Get(), g.noisySky.Get()});
+    bind({g.guide[now].Get(), g.motion.Get(), g.noisyOpen.Get(), g.noisySky.Get(), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, g.refl.Get()});
     cl->SetPipelineState(g.lightPass.Get());
-    cl->Dispatch((g.rw + 7) / 8, (g.rh + 7) / 8, 1);
+    cl->Dispatch((lightW + 7) / 8, (lightH + 7) / 8, 1);
     barrier();
     cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot + 2);
     bind({g.guide[now].Get(), g.motion.Get(), g.noisyOpen.Get(), g.noisySky.Get(), g.guide[old].Get(), g.histOpen[old].Get(), g.histSky[old].Get(), g.moments[old].Get(),
           g.tmpOpen[0].Get(), g.tmpSky[0].Get(), g.moments[now].Get()});
     cl->SetPipelineState(g.temporal.Get());
-    cl->Dispatch((g.rw + 7) / 8, (g.rh + 7) / 8, 1);
+    cl->Dispatch((lightW + 7) / 8, (lightH + 7) / 8, 1);
     barrier();
     // the first step's result is the next frame's history; then back and forth
     ID3D12Resource* fromO = g.tmpOpen[0].Get();
@@ -948,7 +985,7 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
       ID3D12Resource* toS = i == 0 ? g.histSky[now].Get() : g.tmpSky[i & 1].Get();
       dp.step = 1u << i;
       bind({g.guide[now].Get(), nullptr, fromO, fromS, nullptr, nullptr, nullptr, nullptr, toO, toS});
-      cl->Dispatch((g.rw + 7) / 8, (g.rh + 7) / 8, 1);
+      cl->Dispatch((lightW + 7) / 8, (lightH + 7) / 8, 1);
       barrier();
       fromO = toO, fromS = toS;
     }
@@ -965,7 +1002,7 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   dp.show = lit ? show : 0;
   // AURORA_RT_SHOW=4: the raw rays in the place of the smoothed
   if (show == 4 && lit) litOpen = g.noisyOpen.Get(), litSky = g.noisySky.Get();
-  bind({lit ? g.guide[now].Get() : nullptr, lit ? g.motion.Get() : nullptr, litOpen, litSky, nullptr, nullptr, nullptr, lit ? g.moments[now].Get() : nullptr});
+  bind({lit ? g.guide[now].Get() : nullptr, lit ? g.motion.Get() : nullptr, litOpen, litSky, nullptr, nullptr, nullptr, lit ? g.moments[now].Get() : nullptr, nullptr, nullptr, nullptr, lit ? g.refl.Get() : nullptr});
   cl->SetPipelineState(g.trace.Get());
   cl->Dispatch((g.rw + 7) / 8, (g.rh + 7) / 8, 1);
   barrier();
@@ -1202,6 +1239,7 @@ void run_rays(Job& job) {
     sv.Format = g.inputRes->GetDesc().Format;
     sv.Texture2D.MipLevels = 1;
     g.dev->CreateShaderResourceView(g.inputRes.Get(), &sv, cpuh(base + 3));
+    g.dev->CreateShaderResourceView(g.beforeThis ? g.beforeRes.Get() : g.inputRes.Get(), &sv, cpuh(base + 12));
     sv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     g.dev->CreateShaderResourceView(g.termRes.Get(), &sv, cpuh(base + 6));
     D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
@@ -1303,15 +1341,12 @@ void task(const gfx::EncoderTaskContext& ctx, const wgpu::CommandEncoder& cmd, c
   g.lastColor = color;
   g.haveTerm = false;
   job->rules.wait();
-  g.drawThis = job->drawable;
+  // not compiled yet: this frame keeps the game's own picture
+  g.drawThis = job->drawable && g.ready && !g.failed;
   if (!g.drawThis) {
     give_back(std::move(job));
     return;
   }
-  if (!g.ready && !g.failed)
-    init_device();
-  if (g.failed)
-    return;
   make_targets(p.w, p.h, static_cast<wgpu::TextureFormat>(p.format));
   if (g.failed)
     return;
@@ -1325,7 +1360,9 @@ void task(const gfx::EncoderTaskContext& ctx, const wgpu::CommandEncoder& cmd, c
 }
 
 // A picture between: the corrected raster goes to the same place the true frame's went
-void between_task(wgpu::CommandEncoder& cmd) {
+void between_task(wgpu::CommandEncoder& cmd, gfx::EncoderTaskId type) {
+  if (type != g.task)  // (the before-blends snapshot is the true frame's alone)
+    return;
   if (g.failed || !g.ready || !g.drawThis || !g.lastColor || !g.input || !g.termBetween)
     return;
   const wgpu::TexelCopyTextureInfo src{.texture = g.lastColor}, dst{.texture = g.input};
@@ -1334,6 +1371,21 @@ void between_task(wgpu::CommandEncoder& cmd) {
   g.first = cmd.Finish();
   cmd = webgpu::g_device.CreateCommandEncoder();
   g.pendingBetween = true;
+}
+
+void before_task(const gfx::EncoderTaskContext&, const wgpu::CommandEncoder& cmd, const void* payload, size_t, void*) {
+  TaskPayload p;
+  std::memcpy(&p, payload, sizeof p);
+  const wgpu::Texture color = wgpu::Texture::Acquire(p.color);
+  if (!g.ready || g.failed)
+    return;
+  make_targets(p.w, p.h, static_cast<wgpu::TextureFormat>(p.format));
+  if (g.failed || !g.before)
+    return;
+  const wgpu::TexelCopyTextureInfo src{.texture = color}, dst{.texture = g.before};
+  const wgpu::Extent3D size{.width = p.w, .height = p.h, .depthOrArrayLayers = 1};
+  cmd.CopyTextureToTexture(&src, &dst, &size);
+  g.beforeThis = true;
 }
 
 void draw(const gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass, const void*, size_t, void*) {
@@ -1396,6 +1448,20 @@ std::unique_ptr<Job> take_job() {
   auto job = std::move(s_pool.back());
   s_pool.pop_back();
   return job;
+}
+
+bool before_on() noexcept { return before_setting(); }
+void snapshot_before() {
+  if (g.failed || !g.ready)
+    return;
+  if (g.beforeTask == gfx::InvalidEncoderTask)
+    g.beforeTask = gfx::register_encoder_task_type({.label = "ray tracing: before blends", .callback = before_task});
+  const gx::fifo::HoldDrain hold;
+  gfx::ResolvedTargets targets;
+  if (!gfx::resolve_pass({.color = true}, targets) || !targets.colorTexture)
+    return;
+  TaskPayload p{nullptr, targets.colorTexture.MoveToCHandle(), targets.width, targets.height, static_cast<u32>(targets.colorFormat)};
+  gfx::push_encoder_task(g.beforeTask, &p, sizeof p);
 }
 
 bool submit_job(std::unique_ptr<Job> job) {
@@ -1468,10 +1534,15 @@ void before_frame_submit() {
   if (!g.pending || g.failed)
     return;
   begin_access(g.inputMem, g.input);
+  if (g.before)
+    begin_access(g.beforeMem, g.before);
   webgpu::g_queue.Submit(1, &g.first);
   g.first = {};
   end_access(g.inputMem, g.input);
+  if (g.before)
+    end_access(g.beforeMem, g.before);
   run_rays(*g.pending);
+  g.beforeThis = false;
   give_back(std::move(g.pending));
   begin_access(g.outputMem, g.output);
   g.outputOpen = true;
@@ -1483,6 +1554,10 @@ void after_frame_submit() {
   }
 }
 bool failed() noexcept { return g.failed; }
+bool ready() noexcept { return g.ready; }
+void start_compile() noexcept {
+  std::thread(init_device).detach();
+}
 bool look_on() noexcept { return post_on(); }
 void name_thread() noexcept { SetThreadDescription(GetCurrentThread(), L"Aurora RT"); }
 } // namespace aurora::gx::rt::live
