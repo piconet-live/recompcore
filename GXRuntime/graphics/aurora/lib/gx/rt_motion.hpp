@@ -91,10 +91,10 @@ public:
 private:
   struct Seen {
     std::uint64_t key;
-    std::uint32_t vertices, firstPos;
-    float mtx[12];
+    std::uint32_t vertices, firstPos, mtxAt;  // mtxAt: in m_mtx; small, as these get sorted
     bool single, used;
   };
+  std::vector<float> m_mtx;
   std::vector<Seen> m_last;
   std::vector<float> m_lastPos;
   std::uint64_t m_copy = 0;
@@ -104,13 +104,17 @@ private:
   };
   std::vector<Vote> m_votes;
 
-  std::pair<std::vector<Seen>::iterator, std::vector<Seen>::iterator> seen_as(std::uint64_t key) {
-    return std::equal_range(m_last.begin(), m_last.end(), key, Less{});
+  // A flat table by key: this runs once for each of thousands of draws, and sorting them was the cost. Records of one key are chained.
+  std::vector<std::uint32_t> m_table;  // index + 1 of the key's first record
+  std::vector<std::uint32_t> m_next;   // index + 1 of the next of the same key
+  std::uint32_t& slot(std::uint64_t key) {
+    const std::uint32_t mask = static_cast<std::uint32_t>(m_table.size()) - 1;
+    std::uint32_t at = static_cast<std::uint32_t>(key >> 20) & mask;
+    while (m_table[at] != 0 && m_last[m_table[at] - 1].key != key)
+      at = (at + 1) & mask;
+    return m_table[at];
   }
-  struct Less {
-    bool operator()(const Seen& a, std::uint64_t k) const { return a.key < k; }
-    bool operator()(std::uint64_t k, const Seen& a) const { return k < a.key; }
-  };
+  std::uint32_t first_of(std::uint64_t key) { return m_table.empty() ? 0 : slot(key); }
 
   // Every draw found once in both frames, one matrix for the whole draw, says how the view moved if that draw stood still. Most vertices agree on the camera.
   void find_camera(const DrawRec* draws, std::uint32_t count, MotionResult& out) {
@@ -118,13 +122,17 @@ private:
     std::uint64_t compared = 0;
     for (std::uint32_t i = 0; i < count; ++i) {
       const DrawRec& d = draws[i];
-      if (d.motionSingle == 0 || d.vertices == 0)
+      // the camera needs only some of the frame: bigger draws are enough and there are far fewer of them (tuned: 8 vertices)
+      if (d.motionSingle == 0 || d.vertices < 8)
         continue;
-      const auto [a, b] = seen_as(d.motionKey);
-      if (b - a != 1 || !a->single || a->vertices != d.vertices)
+      const std::uint32_t at = first_of(d.motionKey);
+      if (at == 0 || m_next[at - 1] != 0)
+        continue;
+      const Seen* a = &m_last[at - 1];
+      if (!a->single || a->vertices != d.vertices)
         continue;
       Vote v;
-      if (!rigid_a_over_b(a->mtx, d.motionMtx, v.move))
+      if (!rigid_a_over_b(m_mtx.data() + a->mtxAt, d.motionMtx, v.move))
         continue;
       v.weight = d.vertices;
       compared += d.vertices;
@@ -167,19 +175,23 @@ private:
   const Seen* best_match(const DrawRec& d, const Vertex* v, const Rigid& cam) {
     if (d.motionKey == 0)
       return nullptr;
-    const auto [a, b] = seen_as(d.motionKey);
     float expect[3];
     rigid_apply(cam, v[0].pos, expect);
     Seen* best = nullptr;
     float bestD = 1e30f;
-    for (auto it = a; it != b; ++it) {
+    // thousands of one list (sparks, one small quad): all near enough to the camera's motion, and searching them is the whole cost. Tuned: more machines than a race has.
+    int looked = 0;
+    for (std::uint32_t at = first_of(d.motionKey); at != 0 && looked < 64; at = m_next[at - 1], ++looked) {
+      Seen* it = &m_last[at - 1];
       if (it->used || it->vertices != d.vertices)
         continue;
       const float* p = m_lastPos.data() + size_t(it->firstPos) * 3;
       const float dd = (p[0] - expect[0]) * (p[0] - expect[0]) + (p[1] - expect[1]) * (p[1] - expect[1]) + (p[2] - expect[2]) * (p[2] - expect[2]);
       if (dd < bestD)
-        bestD = dd, best = &*it;
+        bestD = dd, best = it;
     }
+    if (looked == 64)
+      return nullptr;
     if (best != nullptr)
       best->used = true;
     return best;
@@ -187,6 +199,7 @@ private:
   void remember(const DrawRec* draws, std::uint32_t count, const Vertex* verts, std::uint64_t copy) {
     m_copy = copy;
     m_last.clear();
+    m_mtx.clear();
     m_last.reserve(count);
     std::uint32_t at = 0;
     for (std::uint32_t i = 0; i < count; ++i)
@@ -197,15 +210,25 @@ private:
       const DrawRec& d = draws[i];
       if (d.vertices == 0)
         continue;
-      Seen s{d.motionKey, d.vertices, at, {}, d.motionSingle != 0, false};
-      std::memcpy(s.mtx, d.motionMtx, sizeof s.mtx);
+      Seen s{d.motionKey, d.vertices, at, static_cast<std::uint32_t>(m_mtx.size()), d.motionSingle != 0, false};
+      if (s.single)
+        m_mtx.insert(m_mtx.end(), d.motionMtx, d.motionMtx + 12);
       m_last.push_back(s);
       const Vertex* v = verts + d.firstVertex;
       for (std::uint32_t k = 0; k < d.vertices; ++k)
         std::memcpy(m_lastPos.data() + size_t(at + k) * 3, v[k].pos, 12);
       at += d.vertices;
     }
-    std::sort(m_last.begin(), m_last.end(), [](const Seen& a, const Seen& b) { return a.key < b.key; });
+    std::uint32_t size = 1024;
+    while (size < m_last.size() * 2)
+      size *= 2;
+    m_table.assign(size, 0);
+    m_next.assign(m_last.size(), 0);
+    for (std::uint32_t i = static_cast<std::uint32_t>(m_last.size()); i-- > 0;) {
+      std::uint32_t& head = slot(m_last[i].key);
+      m_next[i] = head;
+      head = i + 1;
+    }
   }
 };
 } // namespace aurora::gx::rt

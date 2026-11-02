@@ -14,6 +14,8 @@ extern bool g_capturing;  // this frame's draws are being written (AURORA_RT_CAP
 // AURORA_RT_NO_HUD=1 (for the composite's mask): orthographic draws after the frame's first perspective draw are left out
 extern bool g_noHud;
 bool skip_draw() noexcept;
+extern bool g_noGameShadow;  // with own light: the game's machine shadow not drawn (AURORA_RT_GAME_SHADOW=1 keeps it)
+bool is_game_shadow() noexcept;
 void start() noexcept;  // reads the switches, once
 
 // A stage is a reflection layer when it adds or multiplies a texture looked up by the normal (a sphere map), with a

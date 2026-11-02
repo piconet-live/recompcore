@@ -9,6 +9,7 @@
 #include "../gfx/efb_readback.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cmath>
@@ -39,6 +40,7 @@ bool g_noHud = false;
 bool g_live = false;
 bool g_hook = false;
 static bool s_seenPerspective = false;
+bool g_noGameShadow = false;
 static bool s_motionOn = false;  // AURORA_RT_DENOISE=1: motion data from the draws (rt_motion.hpp)
 
 bool skip_draw() noexcept {
@@ -216,6 +218,13 @@ void start() noexcept {
     g_gameLightOff = true;
   if (const char* v = std::getenv("AURORA_RT_DENOISE"); v != nullptr && v[0] == '1')
     s_motionOn = true;
+  // with our own light: the rays' shadows stand in for the game's. AURORA_RT_GAME_SHADOW=1 keeps the game's
+  if (g_gameLightOff && std::getenv("AURORA_RT_LIGHTING") != nullptr) {
+    const char* v = std::getenv("AURORA_RT_GAME_SHADOW");
+    g_noGameShadow = v == nullptr || v[0] != '1';
+  }
+  if (std::getenv("AURORA_RT_MOTION_ONLY") != nullptr)  // the cost of the motion data alone
+    s_motionOn = true;
   if (const char* v = std::getenv("AURORA_RT_VERTEX_COLOUR"); v != nullptr && v[0] == '0')
     g_noVertexColour = true;
   const char* noHud = std::getenv("AURORA_RT_NO_HUD");
@@ -291,6 +300,7 @@ struct Packet {
   u32 drawSlot, vertSlot, drawIndex, firstVertex;
   GXPrimitive prim;
   u16 vtxCount;
+  u32 samplesCopy;
   u32 rawOffset, rawBytes, stagesOffset, mtxOffset, mtxCount, lightsOffset;
   decltype(GXState::proj) proj;
   decltype(GXState::logicalViewport) logicalViewport;
@@ -350,33 +360,7 @@ void translate(const Packet& st, DrawRec& d, Vertex* outVerts) noexcept {
   d.viewport[4] = vp.znear, d.viewport[5] = vp.zfar;
   d.projType = st.projType;
   d.stages = st.numTevStages;
-  if (s_motionOn) {
-    // the draw's own bytes and where its arrays are: the same list of the same model next frame has the same key
-    std::uint64_t h = 0xcbf29ce484222325ull ^ (static_cast<std::uint64_t>(prim) << 32 | vtxCount);
-    const auto mix = [&h](std::uint64_t w) {
-      h = (h ^ w) * 0x9E3779B97F4A7C15ull;
-      h ^= h >> 29;
-    };
-    size_t at = 0;
-    for (; at + 8 <= st.rawBytes; at += 8) {
-      std::uint64_t w;
-      std::memcpy(&w, vertices + at, 8);
-      mix(w);
-    }
-    std::uint64_t w = 0;
-    std::memcpy(&w, vertices + at, st.rawBytes - at);
-    mix(w);
-    for (const auto& a : st.arrays)
-      mix(reinterpret_cast<std::uintptr_t>(a.data));
-    d.motionKey = h | 1;
-    d.motionSingle = st.mtxCount == 1 ? 1 : 0;
-    if (st.mtxCount == 1) {
-      const auto& m = pnMtx[0].pos;
-      const Vec4<float>* rows[3] = {&m.m0, &m.m1, &m.m2};
-      for (int r = 0; r < 3; ++r)
-        d.motionMtx[r * 4] = rows[r]->x(), d.motionMtx[r * 4 + 1] = rows[r]->y(), d.motionMtx[r * 4 + 2] = rows[r]->z(), d.motionMtx[r * 4 + 3] = rows[r]->w();
-    }
-  }
+  d.samplesCopy = st.samplesCopy;
   d.blendMode = st.blendMode, d.blendSrc = st.blendFacSrc, d.blendDst = st.blendFacDst;
   d.depthUpdate = st.depthUpdate, d.depthCompare = st.depthCompare, d.cull = st.cullMode, d.colorUpdate = st.colorUpdate;
   d.prim = prim, d.vtxCount = vtxCount;
@@ -455,6 +439,33 @@ void translate(const Packet& st, DrawRec& d, Vertex* outVerts) noexcept {
       chan = 1;
       break;
     }
+  if (s_motionOn) {
+    // the draw's own bytes and where its arrays are: the same list of the same model next frame has the same key
+    std::uint64_t h = 0xcbf29ce484222325ull ^ (static_cast<std::uint64_t>(prim) << 32 | vtxCount);
+    const auto mix = [&h](std::uint64_t w) {
+      h = (h ^ w) * 0x9E3779B97F4A7C15ull;
+      h ^= h >> 29;
+    };
+    const size_t used = std::min<size_t>(st.rawBytes, size_t(stride) * vtxCount);
+    size_t at = 0;
+    for (; at + 8 <= used; at += 8) {
+      std::uint64_t w;
+      std::memcpy(&w, vertices + at, 8);
+      mix(w);
+    }
+    std::uint64_t w = 0;
+    std::memcpy(&w, vertices + at, used - at);
+    mix(w);
+    mix(reinterpret_cast<std::uintptr_t>(st.arrays[GX_VA_POS].data));
+    d.motionKey = h | 1;
+    d.motionSingle = st.mtxCount == 1 ? 1 : 0;
+    if (st.mtxCount == 1) {
+      const auto& m = pnMtx[0].pos;
+      const Vec4<float>* rows[3] = {&m.m0, &m.m1, &m.m2};
+      for (int r = 0; r < 3; ++r)
+        d.motionMtx[r * 4] = rows[r]->x(), d.motionMtx[r * 4 + 1] = rows[r]->y(), d.motionMtx[r * 4 + 2] = rows[r]->z(), d.motionMtx[r * 4 + 3] = rows[r]->w();
+    }
+  }
   d.lit = st.colorChannelConfig[GX_COLOR0 + chan].lightingEnabled;
 
   const auto read_vertex = [&](const u8* v) {
@@ -689,6 +700,11 @@ void log_facts(const live::Job& j, const Frame& f) {
   double nearN[3]{};
   for (u32 i = 0; i < j.drawCount; ++i) {
     const DrawRec& d = draws[i];
+    // what is drawn in the frame's list by another projection (a marker over the world, say)
+    if (d.vertices >= 3 && d.projType == 0 && (d.proj[0] != f.main->proj[0] || d.proj[5] != f.main->proj[5])) {
+      const float* m0 = verts[d.firstVertex].pos;
+      std::fprintf(s_facts, "X,%u,%g,%g,%u,%u,%u,%u,%u,%u,%g,%g,%g\n", i, d.proj[0], d.proj[5], d.blendSrc, d.blendDst, d.depthUpdate, d.depthCompare, d.vertices / 3, d.samplesCopy, m0[0], m0[1], m0[2]);
+    }
     if (d.vertices < 3 || d.projType != 0 || d.proj[0] != f.main->proj[0] || d.proj[5] != f.main->proj[5])
       continue;
     const LightNote& o = notes[i];
@@ -733,9 +749,9 @@ void log_facts(const live::Job& j, const Frame& f) {
     u32 tex = 0;
     for (u32 s = 0; s < std::min<u32>(d.stages, 16u); ++s)
       tex += d.stage[s].tex != UINT32_MAX && d.stage[s].map != GX_TEXMAP_NULL ? 1 : 0;
-    std::fprintf(s_facts, "D,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%.1f,%.1f,%.1f,%.1f,%u,%.5f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u\n", i, o.enabled, o.vtxColour, o.ambVtx, o.matVtx, o.mask, o.diffFn, o.readsRas, o.readsReg, d.blendMode, d.blendSrc, d.blendDst,
+    std::fprintf(s_facts, "D,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%.1f,%.1f,%.1f,%.1f,%u,%.5f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%u\n", i, o.enabled, o.vtxColour, o.ambVtx, o.matVtx, o.mask, o.diffFn, o.readsRas, o.readsReg, d.blendMode, d.blendSrc, d.blendDst,
                  d.depthUpdate, d.colorUpdate, machine ? 1 : 0, ext, (mn[0] + mx[0]) / 2, (mn[1] + mx[1]) / 2, (mn[2] + mx[2]) / 2, d.vertices / 3, solid, lumSum / dn, lo, hi, rgb[0] / dn, rgb[1] / dn, rgb[2] / dn, nx / len, ny / len,
-                 nz / len, tex, d.stages);
+                 nz / len, tex, d.stages, d.depthCompare, d.samplesCopy);
     for (u32 l = 0; l < 8; ++l)
       if ((o.mask >> l) & 1) {
         const auto key = std::make_tuple(l, static_cast<int>(o.pos[l][0]), static_cast<int>(o.pos[l][1]), static_cast<int>(o.pos[l][2]), static_cast<int>(o.col[l][0] * 255), static_cast<int>(o.col[l][1] * 255), static_cast<int>(o.col[l][2] * 255));
@@ -878,17 +894,40 @@ void run_rules(live::Job& j) {
     tuning.texMeans = s_texAvg;
     tuning.texCount = MostTexAvg;
   }
-  if (s_motionOn) {
-    static std::mutex lock;
-    static MotionTracker tracker;
-    static thread_local std::vector<float> prev;
-    {
-      std::lock_guard l{lock};
+  // Motion data beside the rules, not after them: the rules alone are near a frame's whole time on a busy course, and the picture waits for them
+  static std::vector<float> prev;
+  static std::mutex motionLock;  // two frames' rules can overlap
+  std::unique_lock motionHeld{motionLock, std::defer_lock};
+  std::thread motion;
+  static const bool hashOnly = [] {
+    const char* v = std::getenv("AURORA_RT_MOTION_ONLY");
+    return v != nullptr && v[0] == '2';
+  }();
+  if (s_motionOn)
+    motionHeld.lock();
+  if (s_motionOn && !hashOnly)
+    motion = std::thread([&j] {
+      static MotionTracker tracker;
+      const auto ts0 = std::chrono::steady_clock::now();
       tracker.step(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, j.copy, prev, j.motion);
-    }
-    tuning.prevPos = prev.data();
-  }
+      static double stepMs = 0;
+      static u32 stepN = 0;
+      stepMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts0).count();
+      if (++stepN == 300) {
+        std::fprintf(stderr, "[rt] motion step %.2f ms, %u draws, %zu verts\n", stepMs / stepN, j.drawCount, prev.size() / 3);
+        stepN = 0, stepMs = 0;
+      }
+    });
   build_frame(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, tuning, j.frame);
+  if (motion.joinable()) {
+    motion.join();
+    j.frame.prevPos.clear();
+    j.frame.prevPos.reserve(j.frame.verts.size() * 3);
+    for (const auto& [first, count] : j.frame.spans)
+      j.frame.prevPos.insert(j.frame.prevPos.end(), prev.data() + size_t(first) * 3, prev.data() + size_t(first + count) * 3);
+  }
+  if (motionHeld.owns_lock())
+    motionHeld.unlock();
   smooth_lights(j.frame);
   j.drawable = j.frame.main != nullptr && !j.frame.verts.empty();
   j.textures.clear();
@@ -1049,6 +1088,24 @@ u8* packet_room(size_t need) {
 #endif
 
 // The stream's part: copy what the draw reads, in order; the reading itself happens later
+// a stage reads a texture this frame's stream copied out of the EFB: its own data, nothing named
+static bool samples_copy() noexcept {
+  auto& st = g_gxState;
+  for (u32 i = 0; i < std::min<u32>(st.numTevStages, 16u); ++i) {
+    const u32 map = st.tevStages[i].texMapId;
+    if (map == GX_TEXMAP_NULL || map >= MaxTextures)
+      continue;
+    auto obj = st.textures[map].texObj;
+    if (st.copyTextures.find(obj.data) != st.copyTextures.end())
+      return true;
+  }
+  return false;
+}
+// The game's own machine shadow, from the draw alone: it lays a copy of the picture on the road, blended by what the picture's alpha holds, and writes no depth. No rule by model or course. Rays stand in for it.
+bool is_game_shadow() noexcept {
+  const auto& st = g_gxState;
+  return st.blendMode == 1 && st.blendFacDst == 6 && !st.depthUpdate && samples_copy();
+}
 static void make_packet(u8* room, const size_t size, const u32 stages, const u32 mtxCount, const bool lit, GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
                         const u8* vertices, const u32 rawBytes, u32 drawSlot, u32 vertSlot, u32 drawIndex, u32 firstVertex, u32 epoch) noexcept {
   auto& st = g_gxState;
@@ -1097,6 +1154,7 @@ static void make_packet(u8* room, const size_t size, const u32 stages, const u32
     std::memcpy(room + at, st.lights.data(), sizeof(Light) * GX::MaxLights);
   at += lit ? sizeof(Light) * GX::MaxLights : 0;
   p.rawOffset = static_cast<u32>(at), p.rawBytes = rawBytes;
+  p.samplesCopy = samples_copy() ? 1 : 0;
   std::memcpy(room + at, vertices, rawBytes);
 }
 
@@ -1239,6 +1297,14 @@ static void send_rays() noexcept {
 
 void before_draw() noexcept {
 #if defined(AURORA_RT_LIVE)
+  // AURORA_RT_LIGHTFACTS: where the frame's orthographic draws fall against the scene
+  if (s_facts != nullptr && g_gxState.projType != GX_PERSPECTIVE) {
+    static u64 before = 0, beforeDepth = 0, after = 0, afterDepth = 0, n = 0;
+    (s_seenPerspective ? after : before) += 1;
+    (s_seenPerspective ? afterDepth : beforeDepth) += g_gxState.depthUpdate ? 1 : 0;
+    if (++n % 20000 == 0)
+      std::fprintf(stderr, "[rt] orthographic draws: before the scene %llu (write depth %llu), after %llu (write depth %llu)\n", static_cast<unsigned long long>(before), static_cast<unsigned long long>(beforeDepth), static_cast<unsigned long long>(after), static_cast<unsigned long long>(afterDepth));
+  }
   if (s_rayed)
     return;
   if (g_gxState.projType == GX_PERSPECTIVE) {
