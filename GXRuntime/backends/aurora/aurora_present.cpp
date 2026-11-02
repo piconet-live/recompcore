@@ -727,6 +727,17 @@ void run() {
           const auto done = Clock::now();
           if (shoot) {
             save_shot("between");
+            // AURORA_REDRAW_BUNDLES_CHECK=1 (a test): the same picture again the other way (render bundles or each draw encoded), to its
+            // own file: the two must be the same
+            // (2: the same way again, a control: what differs between two draws of one picture by one way)
+            if (const char* v = std::getenv("AURORA_REDRAW_BUNDLES_CHECK"); v != nullptr && (v[0] == '1' || v[0] == '2')) {
+              const bool was = aurora::gx::redraw::bundles();
+              aurora::gx::redraw::set_bundles(v[0] == '1' ? !was : was);
+              aurora_request_framebuffer_readback();
+              aurora::gx::redraw::draw_picture(*request, index);
+              save_shot(v[0] == '2' ? "again" : was ? "direct" : "bundled");
+              aurora::gx::redraw::set_bundles(was);
+            }
             // AURORA_REDRAW_TEST_TEXTURES=hex,hex (a test): the picture again with the draws of each first texture uncorrected (1: no
             // vertex moved), each to a file of its own
             if (const char* v = std::getenv("AURORA_REDRAW_TEST_TEXTURES"))

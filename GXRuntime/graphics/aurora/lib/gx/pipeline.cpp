@@ -89,4 +89,39 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   draw();
 }
 
+bool render_bundle(const DrawData& data, const wgpu::RenderBundleEncoder& bundle, WGPURenderPipeline& current) {
+  gfx::CompiledPipeline pipeline;
+  if (data.dstAlpha != UINT32_MAX || !gfx::get_pipeline(data.pipeline, pipeline)) {
+    return false;
+  }
+  const auto& resources = gfx::detail::resources();
+  bundle.SetImmediates(0, &data.immediateData, sizeof(data.immediateData));
+  const std::array offsets{data.uniformRange.offset};
+  bundle.SetBindGroup(1, resources.uniformBindGroup, offsets.size(), offsets.data());
+  if (data.bindGroups.textureBindGroup) {
+    bundle.SetBindGroup(2, gfx::find_bind_group(data.bindGroups.textureBindGroup));
+  }
+  bundle.SetIndexBuffer(resources.indexBuffer, wgpu::IndexFormat::Uint16, data.idxRange.offset, data.idxRange.size);
+  const auto bind = [&](const wgpu::RenderPipeline& p) {
+    if (p.Get() != current) {
+      bundle.SetPipeline(p);
+      current = p.Get();
+    }
+  };
+  const auto draw = [&] {
+    if (data.indexCount == 0) {
+      bundle.Draw(data.vtxCount, data.instanceCount);
+    } else {
+      bundle.DrawIndexed(data.indexCount, data.instanceCount);
+    }
+  };
+  if (pipeline.prepass) {
+    bind(pipeline.prepass);
+    draw();
+  }
+  bind(pipeline.main);
+  draw();
+  return true;
+}
+
 } // namespace aurora::gx

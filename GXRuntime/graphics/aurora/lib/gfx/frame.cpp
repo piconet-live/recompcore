@@ -24,6 +24,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <optional>
@@ -675,6 +676,7 @@ namespace {
 // AURORA_REDRAW: the frame last ended, kept for the pictures between (the render worker's)
 FramePacket g_held;
 std::vector<uint8_t> g_heldUniforms, g_patched;
+bool g_patchedHeld = false;  // g_patched is the held frame's uniforms but for its patched blocks (AURORA_REDRAW_BUNDLES)
 EndFrameCallback g_heldCallback;
 std::vector<bool> g_heldOffscreen;
 
@@ -708,20 +710,62 @@ void redraw_write_vertices(uint32_t at, const uint8_t* data, size_t bytes) {
   g_queue.WriteBuffer(g_resources.vertexBuffer, at, data, bytes);
 }
 
-bool redraw_held(const std::function<void(uint8_t* uniforms, size_t bytes)>& patch) {
+bool redraw_held(const std::function<void(uint8_t* uniforms, size_t bytes)>& patch, const std::vector<uint32_t>* blocks) {
   if (!g_heldCallback || g_held.ops.empty()) {
     return false;
   }
-  g_patched = g_heldUniforms;
-  patch(g_patched.data(), g_patched.size());
+  if (blocks != nullptr) {
+    {
+      stagelog::Scope t{"rd_patch"};
+      if (!g_patchedHeld) {
+        g_patched = g_heldUniforms;
+        g_patchedHeld = true;
+      }
+      for (const uint32_t at : *blocks) {
+        if (at + 64 <= g_patched.size()) {
+          std::memcpy(g_patched.data() + at, g_heldUniforms.data() + at, 64);
+        }
+      }
+      patch(g_patched.data(), g_patched.size());
+    }
+    // the blocks written in runs: blocks less than Gap apart go in one write
+    constexpr uint32_t Gap = 1024;
+    stagelog::Scope t{"rd_uniforms", blocks->size()};
+    for (size_t k = 0; k < blocks->size();) {
+      const uint32_t from = (*blocks)[k];
+      uint32_t to = from + 64;
+      for (++k; k < blocks->size() && (*blocks)[k] <= to + Gap; ++k) {
+        to = (*blocks)[k] + 64;
+      }
+      to = std::min<uint32_t>(to, static_cast<uint32_t>(g_patched.size()) & ~3u);
+      if (to > from) {
+        g_queue.WriteBuffer(g_resources.uniformBuffer, from, g_patched.data() + from, to - from);
+      }
+    }
+  }
   constexpr wgpu::CommandEncoderDescriptor EncoderDescriptor{.label = "Picture between encoder"};
   auto encoder = g_device.CreateCommandEncoder(&EncoderDescriptor);
   webgpu::gpu_prof::frame_begin(encoder);
-  g_queue.WriteBuffer(g_resources.uniformBuffer, 0, g_patched.data(), AURORA_ALIGN(g_patched.size(), 4));
-  for (const auto& op : g_held.ops) {
-    encode_op_again(encoder, g_held, op);
+  if (blocks == nullptr) {
+    {
+      stagelog::Scope t{"rd_patch"};
+      g_patched = g_heldUniforms;
+      patch(g_patched.data(), g_patched.size());
+    }
+    stagelog::Scope t{"rd_uniforms", g_patched.size()};
+    g_queue.WriteBuffer(g_resources.uniformBuffer, 0, g_patched.data(), AURORA_ALIGN(g_patched.size(), 4));
   }
-  g_heldCallback(encoder, {});
+  {
+    stagelog::Scope t{"rd_encode"};
+    for (const auto& op : g_held.ops) {
+      encode_op_again(encoder, g_held, op);
+    }
+  }
+  {
+    stagelog::Scope t{"rd_tail"};
+    g_heldCallback(encoder, {});
+  }
+  stagelog::Scope t{"rd_events"};
   process_events();
   return true;
 }
@@ -765,6 +809,8 @@ void end_frame(EndFrameCallback callback) {
     if (gx::redraw::g_on) {
       g_held = std::move(packet);
       g_heldCallback = callback;
+      g_patchedHeld = false;
+      forget_redraw_bundles();
       gx::redraw::hold(std::move(notes));
       note_held_passes();
     }

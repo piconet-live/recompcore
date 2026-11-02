@@ -73,4 +73,7 @@ struct Counts {
   u64 byVertex = 0, unreadable = 0, moved = 0, over = 0, written = 0;
 };
 Counts counts() noexcept;
+// AURORA_REDRAW_BUNDLES: whether the pictures' GX draws come from render bundles; a test turns it over for one picture
+bool bundles() noexcept;
+void set_bundles(bool on) noexcept;
 } // namespace aurora::gx::redraw

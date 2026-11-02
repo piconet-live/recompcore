@@ -190,7 +190,7 @@ bool on() noexcept {
 void note(const char* what, Clock::time_point start, std::uint64_t copy) noexcept {
   const auto end = Clock::now();
   const auto us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-  if (us < 100)
+  if (us < 100 && std::strncmp(what, "rd_", 3) != 0)  // (a picture between's stretches all kept: they are summed)
     return;
   char b[96];
   const int n = std::snprintf(b, sizeof b, "S,%llu,%lld,%s,%llu\n", static_cast<unsigned long long>(us_of(start)), static_cast<long long>(us), what, static_cast<unsigned long long>(copy));

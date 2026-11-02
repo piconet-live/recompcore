@@ -19,7 +19,9 @@
 // MoveFull 3 and MoveNone 8, the icon's 4 to 40 and 8 (2 cubed), the name tag's box and moves (Over, MovedWith).
 #include "redraw.hpp"
 
+#include "../gfx/encoding.hpp"
 #include "../gfx/frame.hpp"
+#include "../gfx/stagelog.hpp"
 #include "../gfx/upload_read.hpp"
 #include "rt_capture.hpp"
 #include "rt_live.hpp"
@@ -44,6 +46,7 @@ constexpr int None = -1, World = -2, ByVertex = -3, Icon = 100, Over = 200;
 Notes s_building;
 Notes s_held;
 std::vector<int> s_class;  // the held frame's notes' corrections
+std::vector<u32> s_blocks;  // the projections a picture patches (each 64 bytes at its note's projAt), sorted: AURORA_REDRAW_BUNDLES
 bool s_classified = false;
 const Request* s_classifiedFor = nullptr;
 bool s_advanced = false;  // the flat draws' and the machines' places of the held frame taken for the next frame's
@@ -339,6 +342,12 @@ void classify(const Request& q, bool advance) {
     world += c == World || c == ByVertex;
     s_class[k] = c;
   }
+  s_blocks.clear();
+  for (std::size_t k = 0; k < s_held.notes.size(); ++k)
+    if (s_class[k] != None)
+      s_blocks.push_back(s_held.notes[k].projAt);
+  std::sort(s_blocks.begin(), s_blocks.end());
+  s_blocks.erase(std::unique(s_blocks.begin(), s_blocks.end()), s_blocks.end());
   if (!advance)
     s_flatNow.swap(taken);
   if (advance) {  // (the counts once a frame)
@@ -626,7 +635,9 @@ void test_uncorrected(u32 texture) noexcept { s_testTexture = texture; }
 bool draw_picture(const Request& request, std::size_t index) {
   if (index >= request.pictures.size())
     return false;
+  gfx::stagelog::Scope pictureTime{"rd_picture"};
   if (!s_classified || s_classifiedFor != &request) {
+    gfx::stagelog::Scope t{"rd_classify"};
     classify(request, !s_advanced);
     s_advanced = true;
     s_classified = true;
@@ -660,7 +671,10 @@ bool draw_picture(const Request& request, std::size_t index) {
         on_screen(s_worldProj, moved[0], moved[1], moved[2], &x1, &y1))
       shift[i] = {x1 - x0, y1 - y0};
   }
-  move_vertices(request, motion);
+  {
+    gfx::stagelog::Scope t{"rd_vertices"};
+    move_vertices(request, motion);
+  }
   const bool drawn = gfx::redraw_held([&](u8* uniforms, std::size_t bytes) {
     s_bytes = bytes;
     for (std::size_t k = 0; k < s_held.notes.size(); ++k) {
@@ -678,11 +692,14 @@ bool draw_picture(const Request& request, std::size_t index) {
       else
         times(p, c == World || c == ByVertex ? picture.camera : picture.machine[static_cast<u32>(c)]);
     }
-  });
+  }, gfx::detail::g_redrawBundles ? &s_blocks : nullptr);
   if (drawn)
     ++s_pictures;
   return drawn;
 }
+
+bool bundles() noexcept { return gfx::detail::g_redrawBundles; }
+void set_bundles(bool on) noexcept { gfx::detail::g_redrawBundles = on; }
 
 Counts counts() noexcept {
   Counts c;

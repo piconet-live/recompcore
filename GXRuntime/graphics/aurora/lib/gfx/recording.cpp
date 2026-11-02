@@ -827,6 +827,8 @@ void end_color_pass() {
   g_recorder.currentRenderPass = UINT32_MAX;
 }
 
+detail::DrawEncoder gx_draw_encoder() noexcept { return encode_draw<gx::render, gx::DrawData>; }
+
 template <>
 gx::DrawData* get_last_draw_command() {
   if (g_recorder.currentRenderPass >= current_render_passes().size()) {

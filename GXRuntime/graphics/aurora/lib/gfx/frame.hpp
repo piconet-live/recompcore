@@ -37,7 +37,9 @@ bool begin_frame();
 void end_frame(EndFrameCallback callback);
 // AURORA_REDRAW: the render worker, one more picture of the frame last ended: its uniforms given to `patch`, its passes encoded again,
 // presented as it was. False when no frame is held.
-bool redraw_held(const std::function<void(uint8_t* uniforms, size_t bytes)>& patch);
+// `blocks` (AURORA_REDRAW_BUNDLES; sorted, each the start of 64 bytes): only those are patched and written; the rest of the uniform
+// buffer keeps the held frame's as its own true frame left it. nullptr: the whole of the frame's uniforms written.
+bool redraw_held(const std::function<void(uint8_t* uniforms, size_t bytes)>& patch, const std::vector<uint32_t>* blocks = nullptr);
 bool redraw_pass_offscreen(uint32_t pass) noexcept;
 // AURORA_REDRAW: bytes into the frame's vertex buffer at `at` (both whole words), before a picture between is encoded
 void redraw_write_vertices(uint32_t at, const uint8_t* data, size_t bytes);
