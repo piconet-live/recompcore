@@ -5,6 +5,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include "../gfx/stagelog.hpp"
 #include "rt_live.hpp"
 
 #include "rt_format.hpp"
@@ -1035,6 +1036,7 @@ void run_rays(Job& job) {
   g.slot = (g.slot + 1) % Frames;
   Slot& s = g.slots[g.slot];
   if (g.fence->GetCompletedValue() < s.fence) {
+    gfx::stagelog::Scope t{"rt_fence_wait", job.copy};
     RT_HR(g.fence->SetEventOnCompletion(s.fence, g.event));
     WaitForSingleObject(g.event, INFINITE);
   }
@@ -1173,7 +1175,10 @@ void task(const gfx::EncoderTaskContext& ctx, const wgpu::CommandEncoder& cmd, c
   std::memcpy(&p, payload, sizeof p);
   std::unique_ptr<Job> job{p.job};
   const wgpu::Texture color = wgpu::Texture::Acquire(p.color);
-  job->rules.wait();
+  {
+    gfx::stagelog::Scope t{"rules_wait", job->copy};
+    job->rules.wait();
+  }
   // not compiled yet: this frame keeps the game's own picture
   g.drawThis = job->drawable && g.ready && !g.failed;
   if (!g.drawThis) {
@@ -1314,12 +1319,18 @@ void before_frame_submit() {
   begin_access(g.inputMem, g.input);
   if (g.before)
     begin_access(g.beforeMem, g.before);
-  webgpu::g_queue.Submit(1, &g.first);
+  {
+    gfx::stagelog::Scope t{"first_submit"};
+    webgpu::g_queue.Submit(1, &g.first);
+  }
   g.first = {};
   end_access(g.inputMem, g.input);
   if (g.before)
     end_access(g.beforeMem, g.before);
-  run_rays(*g.pending);
+  {
+    gfx::stagelog::Scope t{"run_rays"};
+    run_rays(*g.pending);
+  }
   g.beforeThis = false;
   give_back(std::move(g.pending));
   begin_access(g.outputMem, g.output);

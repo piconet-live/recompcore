@@ -1,3 +1,4 @@
+#include "stagelog.hpp"
 #include "efb_readback.hpp"
 #include "frame.hpp"
 
@@ -624,8 +625,11 @@ std::optional<size_t> acquire_mapped_staging_buffer() {
 bool begin_frame() {
   ZoneScoped;
   // pace_frame_start();
+  const auto waited = PresentClock::now();
   const size_t frameSlot = acquire_frame_slot();
   const auto stagingSlot = acquire_mapped_staging_buffer();
+  if (stagelog::on())
+    stagelog::note("begin_slot_wait", waited);
   if (!stagingSlot) {
     g_frameSlots.release(frameSlot);
     return false;
@@ -701,6 +705,7 @@ void end_frame(EndFrameCallback callback) {
     g_frameSlots.release(frameSlot);
     expire_cached_bind_groups();
     map_staging_buffer(stagingSlot, true);
+    stagelog::Scope eventsTime{"process_events"};
     process_events();
   });
 }

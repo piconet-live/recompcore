@@ -2,6 +2,7 @@
 // aurora_present (gxruntime/aurora_present.h): Aurora on a thread of its own, fed the retail command stream by an
 // emulator that keeps running the game's GPU, its pictures read back for the emulator to show.
 
+#include "../../graphics/aurora/lib/gfx/stagelog.hpp"
 #include "gx/rt_capture.hpp"
 #include "gxruntime/aurora_present.h"
 
@@ -628,6 +629,11 @@ void run() {
     aurora_backend_present();
     aurora::gfx::timewarp::true_frame_done();
     const auto presented = Clock::now();
+    if (aurora::gfx::stagelog::on()) {
+      aurora::gfx::stagelog::note("copy_queue", f.in, f.copy);
+      aurora::gfx::stagelog::note("copy_feed", start, f.copy);
+      aurora::gfx::stagelog::note("copy_present", fed, f.copy);
+    }
     auto pictured = presented;
     bool got = false;
     if (asked) {

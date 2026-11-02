@@ -1,3 +1,4 @@
+#include "stagelog.hpp"
 #include "pipeline_cache.hpp"
 
 #include "clear.hpp"
@@ -531,6 +532,7 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallbac
   }
 
   if (blocking && !pipelineReady) {
+    stagelog::Scope t{"pipeline_block"};
     std::unique_lock lock{g_pipelineMutex};
     g_pipelineReadyCv.wait(lock, [=] { return g_pipelines.contains(runtimeKey) || g_pipelineThreadEnd; });
   }
