@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "../webgpu/gpu.hpp"
+#include "../webgpu/hdr.hpp"
 #include "fifo.hpp"
 
 namespace aurora::gx::rt::live {
@@ -193,7 +194,8 @@ ComPtr<IDxcBlob> compile(IDxcCompiler3* comp, const wchar_t* entry) {
   DxcBuffer src{kShader, sizeof kShader, DXC_CP_UTF8};
   if (!s_shaderFile.empty())
     src.Ptr = s_shaderFile.data(), src.Size = s_shaderFile.size();
-  LPCWSTR args[] = {L"-T", L"cs_6_5", L"-E", entry, L"-O3", L"-HV", L"2021"};
+  // KEEP_RANGE: the rays' picture keeps what is above white, for the float display copy (hdr.hpp); otherwise cut as ever
+  LPCWSTR args[] = {L"-T", L"cs_6_5", L"-E", entry, L"-O3", L"-HV", L"2021", L"-D", webgpu::hdr::float_copy() ? L"KEEP_RANGE=1" : L"KEEP_RANGE=0"};
   ComPtr<IDxcResult> res;
   if (FAILED(comp->Compile(&src, args, _countof(args), nullptr, IID_PPV_ARGS(&res))))
     return nullptr;
@@ -431,6 +433,9 @@ void make_post_targets(u32 w, u32 h) {
     g.expoRes = post_texture(1, 1, DXGI_FORMAT_R32_FLOAT, ViewExpo);
 }
 
+DXGI_FORMAT output_format() {
+  return webgpu::hdr::float_copy() ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+}
 void make_targets(u32 w, u32 h, wgpu::TextureFormat format) {
   if (w == g.w && h == g.h && format == g.format && g.input)
     return;
@@ -442,7 +447,7 @@ void make_targets(u32 w, u32 h, wgpu::TextureFormat format) {
   g.w = w, g.h = h, g.format = format;
   const DXGI_FORMAT dxgi = format == wgpu::TextureFormat::RGBA16Float ? DXGI_FORMAT_R16G16B16A16_FLOAT : format == wgpu::TextureFormat::BGRA8Unorm ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
   g.inputRes = shared_texture(w, h, dxgi, D3D12_RESOURCE_FLAG_NONE, g.inputMem, g.input);
-  g.outputRes = shared_texture(w, h, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, g.outputMem, g.output);
+  g.outputRes = shared_texture(w, h, output_format(), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, g.outputMem, g.output);
   if (g.failed)
     return;
   D3D12_HEAP_PROPERTIES hp{};
@@ -809,7 +814,7 @@ void run_rays(Job& job) {
     uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     uv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     g.dev->CreateUnorderedAccessView(g.termRes.Get(), nullptr, &uv, cpuh(base + 8));
-    uv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    uv.Format = output_format();
     g.dev->CreateUnorderedAccessView(g.outputRes.Get(), nullptr, &uv, cpuh(base + 9));
   }
   cl->SetComputeRootSignature(g.root.Get());

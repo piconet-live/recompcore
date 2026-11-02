@@ -14,6 +14,7 @@
 #include "gx/texture.hpp"
 #include "imgui.hpp"
 #include "webgpu/gpu.hpp"
+#include "webgpu/hdr.hpp"
 #include "webgpu/gpu_prof.hpp"
 #include <webgpu/webgpu_cpp.h>
 #endif
@@ -353,7 +354,12 @@ void end_frame() noexcept {
         filterView = webgpu::present_hook().finalTarget(webgpu::g_graphicsConfig.surfaceConfiguration.width,
                                                         webgpu::g_graphicsConfig.surfaceConfiguration.height);
       }
-      const wgpu::TextureView& drawView = filterView ? filterView : currentView;
+      // AURORA_LOOK_HDR=1: everything to here as for an 8-bit surface, in float; the last step to the surface in scRGB
+      const wgpu::TextureView outputView =
+          webgpu::hdr::on() ? webgpu::hdr::target(webgpu::g_graphicsConfig.surfaceConfiguration.width,
+                                                  webgpu::g_graphicsConfig.surfaceConfiguration.height)
+                            : currentView;
+      const wgpu::TextureView& drawView = filterView ? filterView : outputView;
       {
         const std::array attachments{
             wgpu::RenderPassColorAttachment{
@@ -408,7 +414,10 @@ void end_frame() noexcept {
         pass.End();
       }
       if (filterView) {
-        webgpu::present_hook().finalPass(encoder, filterView, currentView);
+        webgpu::present_hook().finalPass(encoder, filterView, outputView);
+      }
+      if (webgpu::hdr::on()) {
+        webgpu::hdr::final_pass(encoder, currentView);
       }
     } else {
       Log.info("Skipping present; window not presentable");

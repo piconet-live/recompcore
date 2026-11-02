@@ -25,6 +25,7 @@
 #include "../internal.hpp"
 #include "../window.hpp"
 #include "gpu_prof.hpp"
+#include "hdr.hpp"
 
 #ifdef WEBGPU_DAWN
 #include "../dawn/TracyPlatform.hpp"
@@ -283,6 +284,9 @@ bool raw_picture() noexcept {
     return v != nullptr && v[0] == '1';
   }();
   return on;
+}
+wgpu::TextureFormat present_format() noexcept {
+  return hdr::on() ? wgpu::TextureFormat::RGBA16Float : g_graphicsConfig.surfaceConfiguration.format;
 }
 wgpu::TextureFormat scene_format() noexcept {
   return raw_picture() ? wgpu::TextureFormat::RGBA16Float : g_graphicsConfig.surfaceConfiguration.format;
@@ -566,7 +570,7 @@ fn fs_premultiplied_alpha(in: VertexOutput) -> @location(0) vec4<f32> {
   const auto make_copy_pipeline = [&](const char* label, const char* fragmentEntryPoint,
                                       const wgpu::BlendState* blend) {
     const std::array colorTargets{wgpu::ColorTargetState{
-        .format = g_graphicsConfig.surfaceConfiguration.format,
+        .format = present_format(),
         .blend = blend,
         .writeMask = wgpu::ColorWriteMask::All,
     }};
@@ -1149,6 +1153,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
       .msaaSamples = g_config.msaa,
       .textureAnisotropy = g_config.maxTextureAnisotropy,
   };
+  hdr::choose(g_surfaceCapabilities);
   create_copy_pipeline();
   create_resample_pipeline();
   gpu_prof::initialize();
@@ -1161,6 +1166,7 @@ void shutdown() {
   g_initialized = false;
   gfx::gpu_synchronize();
   gpu_prof::shutdown();
+  hdr::shutdown();
   g_CopyBindGroupLayout = {};
   g_CopyPipeline = {};
   g_CopyPremultipliedAlphaPipeline = {};
@@ -1208,6 +1214,10 @@ static void resize_swapchain_internal(uint32_t width, uint32_t height, uint32_t 
   g_graphicsConfig.surfaceConfiguration.height = nativeHeight;
   auto surfaceConfiguration = g_graphicsConfig.surfaceConfiguration;
   surfaceConfiguration.device = g_device;
+  // Windows treats a float swapchain as scRGB without being told (seen through a window capture); Dawn's colour management chain isn't needed
+  if (hdr::on()) {
+    surfaceConfiguration.format = wgpu::TextureFormat::RGBA16Float;
+  }
   {
     window::SurfaceLock surfaceLock;
     g_surface.Configure(&surfaceConfiguration);

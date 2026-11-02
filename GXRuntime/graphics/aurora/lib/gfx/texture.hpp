@@ -59,7 +59,9 @@ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mi
                                     ArrayRef<uint8_t> data, bool tlut, const char* label) noexcept;
 TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
                                      const char* label) noexcept;
-TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept;
+// format: left out, the surface's
+TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label,
+                                 wgpu::TextureFormat format = wgpu::TextureFormat::Undefined) noexcept;
 TextureHandle new_conv_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept;
 void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept;
 }; // namespace aurora::gfx

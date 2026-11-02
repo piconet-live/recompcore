@@ -86,7 +86,7 @@ float ain(uint i, float4 r[4], float4 tex, float4 ras, float4 k) {
 float bias_of(uint b) { return b == 1 ? 0.5 : b == 2 ? -0.5 : 0.0; }
 float scale_of(uint s) { return s == 1 ? 2.0 : s == 2 ? 4.0 : s == 3 ? 0.5 : 1.0; }
 
-struct Hit { float3 pos, nrm; float4 ras; float2 uv[4]; uint draw; };
+struct Hit { float3 pos, nrm; float4 ras; float2 uv[4]; uint draw; float4 rate; float foot; };
 Hit fetch(uint prim, float2 bary) {
   Vertex a = Verts[prim * 3], b = Verts[prim * 3 + 1], c = Verts[prim * 3 + 2];
   float3 w = float3(1 - bary.x - bary.y, bary.x, bary.y);
@@ -98,20 +98,39 @@ Hit fetch(uint prim, float2 bary) {
   h.ras = a.ras * w.x + b.ras * w.y + c.ras * w.z;
   for (int i = 0; i < 4; ++i) h.uv[i] = a.uv[i] * w.x + b.uv[i] * w.y + c.uv[i] * w.z;
   h.draw = a.draw;
+  h.rate = 0;
+  h.foot = 0;
   return h;
 }
+// How fast each set of texture coordinates runs across this triangle, per unit of world: what a pixel's footprint needs to pick a texture level
+float4 uv_rates(uint prim) {
+  Vertex a = Verts[prim * 3], b = Verts[prim * 3 + 1], c = Verts[prim * 3 + 2];
+  float world = length(cross(b.pos - a.pos, c.pos - a.pos));
+  float4 r = 0;
+  for (int i = 0; i < 4; ++i) {
+    float2 e1 = b.uv[i] - a.uv[i], e2 = c.uv[i] - a.uv[i];
+    r[i] = sqrt(abs(e1.x * e2.y - e1.y * e2.x) / max(world, 1e-6));
+  }
+  return r;
+}
 // The game's own TEV stages at a hit, its reflection layers left out
-float4 shade(Hit h, float lod) {
+float4 shade(Hit h, float lod, bool layers = false) {
   Draw d = Draws[h.draw];
   float4 r[4];
   for (int i = 0; i < 4; ++i) r[i] = d.regs[i];
   for (uint i = 0; i < d.stages; ++i) {
     Stage s = Stages[d.firstStage + i];
-    if (s.reflection != 0) continue;
+    if (s.reflection != 0 && !layers) continue;
     float4 tex = 1.xxxx;
     if (s.tex != 0xFFFFFFFFu && s.tex < P.textures) {
       float2 uv = s.tc < 4 ? h.uv[s.tc] : 0.xx;
-      float4 t = Tex[NonUniformResourceIndex(s.tex)].SampleLevel(Linear, uv, lod);
+      float level = lod;
+      if (h.foot > 0 && s.tc < 4) {
+        uint tw, th;
+        Tex[NonUniformResourceIndex(s.tex)].GetDimensions(tw, th);
+        level = max(log2(max(h.rate[s.tc] * sqrt(float(tw) * th) * h.foot, 1e-3)), 0) + lod;
+      }
+      float4 t = Tex[NonUniformResourceIndex(s.tex)].SampleLevel(Linear, uv, level);
       uint sw = d.swap[s.swapTex & 3];
       tex = float4(t[sw & 3], t[(sw >> 8) & 3], t[(sw >> 16) & 3], t[(sw >> 24) & 3]);
     }
@@ -246,6 +265,12 @@ float3 glow_light(float3 pos, float3 N) {
   q.Proceed();
   return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? sum - topLight * 0.85 : sum;
 }
+// Tuned by eye, the material rule's numbers
+static const float MatGapLow = 0.45, MatGapHigh = 0.95; // own brightness against the texture around it: where shine starts and is full
+static const float MatMatte = 0.15, MatPale = 0.15;     // how far Fresnel rises at a grazing view: any surface, and more if pale
+static const float MatKeep = 0.8;                       // how much of the game's own layer stays beside the rays
+static const float MatMetal = 0.2;                      // base reflectance a full reflection layer adds to 0.04
+static const float MatMetalDim = 0.5;                   // how much of the surface a full layer gives up to its reflection, never all: no black chrome
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
   float3 raster = Raster[id.xy].rgb;
@@ -285,6 +310,45 @@ void main(uint3 id : SV_DispatchThreadID) {
       if (P.mode == 4) { dbg += shade(h, 0).rgb; break; }
       float k = d.strength;
       float cosv = saturate(-dot(N, v));
+      if (P.wet < 0) {
+        // The material rule (AURORA_RT_WET < 0): one rule for every surface, from this draw's own layer and texture. Same game, better lit: a low
+        // Fresnel base, the surface's colour kept, and light only where a reflection is brighter than the surface. Tuned numbers: see MaterialTuned.
+        uint prim = q.CommittedInstanceID() + q.CommittedPrimitiveIndex();
+        h.rate = uv_rates(prim);
+        // a pixel's width at this hit, longer along a grazing view: the texture level the raster's own filtering would pick, so shine doesn't crawl
+        h.foot = t * 2 / max(abs(P.pScale.y) * P.size.y, 1) / sqrt(max(cosv, 0.05));
+        float3 own = shade(h, 0).rgb;
+        float3 around = shade(h, 4).rgb;
+        float ownL = lum(own), aroundL = lum(around);
+        // darker than the texture around it (a gap in a grating, a seam): no shine there
+        float shine = smoothstep(MatGapLow, MatGapHigh, ownL / max(aroundL, 0.02));
+        // bright and unsaturated, on the whole: its texture reads as specular
+        float most = max(around.r, max(around.g, around.b)), least = min(around.r, min(around.g, around.b));
+        float pale = smoothstep(0.5, 0.9, most) * (1 - saturate((most - least) / max(most, 0.02)));
+        float layer = saturate(k);
+        float gloss = lerp(MatMatte + MatPale * pale, 1, layer);
+        float f0 = 0.04 + MatMetal * layer;
+        float fr = (f0 + max(gloss - f0, 0) * pow(1 - cosv, 5)) * shine;
+        // the raster had the game's own reflection layers taken out (rt_capture.cpp neutralise), and they are much of its art: a tower's rust is one. Put back, from their own stages
+        float3 gameLayer = (fogged(d, h.pos, shade(h, 0, true).rgb) - fogged(d, h.pos, own)) * MatKeep;
+        float bareM = 1 - smoothstep(0.15, 0.45, lum(raster) - ownL);
+        if (P.lightGain > 0 && (d.highlight & 4) == 0) light += engine_light(h.pos, N) * P.lightGain * bareM;
+        if (P.glowGain > 0 && (d.highlight & 6) == 0) light += glow_light(h.pos, N) * P.glowGain * bareM;
+        if (P.glowShow != 0 && (d.highlight & 2) != 0) { sum = float3(1, -1, 1); light = 0; break; }
+        if (P.mode == 2) { dbg += fr.xxx; break; }
+        if (fr > 0.002) {
+          float3 R = reflect(v, N);
+          float3 seen = trace_reflection(h.pos + N * 0.03, R, 8.0 / max(P.size.y, 1) * 512.0 / 4.0);
+          seen = min(seen, 2.0);
+          float3 under = min(raster, own * 1.2) + max(gameLayer, 0);
+          float3 tint = lerp(1.xxx, own / max(most, 0.05), 0.5 * layer);
+          float3 lit = max(seen - under, 0);
+          float3 metal = tint * seen - MatMetalDim * under;
+          term = fr * lerp(lit, metal, layer) * bareM;
+        }
+        term += gameLayer * bareM;
+        break;
+      }
       float fres = pow(1 - cosv, 5);
       // the surface's own colour: pale paint shows a reflection as dirt, so less of it, softer; dark road shines more than pale road
       float3 baseCol = (k > 0 || (N.y > 0.2 && d.cls == 0) || P.lightGain > 0 || P.glowGain > 0) ? shade(h, 0).rgb : 0.xxx;
@@ -344,7 +408,11 @@ void compose(uint3 id : SV_DispatchThreadID) {
     sum += o.rgb * w;
     weight += w;
   }
+#if KEEP_RANGE
+  Final[c] = float4(max(Raster[c].rgb + sum / weight, 0), 1);
+#else
   Final[c] = float4(saturate(Raster[c].rgb + sum / weight), 1);
+#endif
 }
 
 // The look (AURORA_LOOK_POST=1), from the frame's own pixels, for any course; rays or not. The numbers tuned by eye are named at their use.
