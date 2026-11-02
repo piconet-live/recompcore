@@ -91,6 +91,8 @@ inline constexpr EncoderTaskId InvalidEncoderTask = 0;
 // Around the frame's queue submit, on the render worker: a pass that cut the frame in two runs here
 extern void (*g_beforeFrameSubmit)();
 extern void (*g_afterFrameSubmit)();
+// Just before a picture's Present, on the render worker, outside the surface lock (AURORA_PACE: a picture between held to its refresh)
+extern void (*g_beforePresent)();
 extern void (*g_betweenTask)(wgpu::CommandEncoder& cmd, EncoderTaskId type);  // AURORA_REDRAW: a picture between reaches the frame's ray tracing task
 
 struct EncoderTaskContext {
