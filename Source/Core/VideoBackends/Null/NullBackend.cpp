@@ -8,6 +8,9 @@
 
 #include "VideoBackends/Null/VideoBackend.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 #include "Common/Common.h"
 
 #include "VideoBackends/Null/NullBoundingBox.h"
@@ -17,6 +20,7 @@
 #include "VideoBackends/Null/TextureCache.h"
 
 #include "VideoCommon/AuroraPresent.h"
+#include "VideoCommon/VertexLoaderManager.h"
 #include "VideoCommon/VideoCommon.h"
 #include "VideoCommon/VideoConfig.h"
 
@@ -73,6 +77,10 @@ void VideoBackend::InitBackendInfo(const WindowSystemInfo& wsi)
 bool VideoBackend::Initialize(const WindowSystemInfo& wsi)
 {
   VideoCommon::AuroraPresent::SetVideoOffWindow(wsi.render_surface);
+  // Only here: a run with a real backend (the test key debug.renderer) keeps the whole path
+  const char* const skip = std::getenv("AURORA_VIDEO_SKIP");
+  VertexLoaderManager::g_skip_vertex_work = skip && skip[0] == '1';
+  std::fprintf(stderr, "video off: vertex work %s\n", VertexLoaderManager::g_skip_vertex_work ? "skipped" : "kept");
   return InitializeShared(std::make_unique<NullGfx>(), std::make_unique<VertexManager>(),
                           std::make_unique<PerfQuery>(), std::make_unique<NullBoundingBox>(),
                           std::make_unique<NullEFBInterface>(), std::make_unique<TextureCache>());

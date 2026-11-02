@@ -25,6 +25,7 @@
 #include "VideoCommon/BPMemory.h"
 #include "VideoCommon/CPMemory.h"
 #include "VideoCommon/DataReader.h"
+#include "VideoCommon/FrameRedraw.h"
 #include "VideoCommon/NativeVertexFormat.h"
 #include "VideoCommon/Statistics.h"
 #include "VideoCommon/VertexLoaderBase.h"
@@ -395,6 +396,8 @@ static bool CanSplit(OpcodeDecoder::Primitive primitive)
   }
 }
 
+bool g_skip_vertex_work = false;
+
 template <bool IsPreprocess>
 int RunVertices(int vtx_attr_group, OpcodeDecoder::Primitive primitive, int count, const u8* src)
 {
@@ -408,6 +411,10 @@ int RunVertices(int vtx_attr_group, OpcodeDecoder::Primitive primitive, int coun
 
   if constexpr (!IsPreprocess)
   {
+    // What is left out writes nothing the game reads: see g_skip_vertex_work. FrameRedraw records batches, so it keeps them.
+    if (g_skip_vertex_work && !VideoCommon::FrameRedraw::Recording())
+      return size;
+
     // Doing early return for the opposite case would be cleaner
     // but triggers a false unreachable code warning in MSVC debug builds.
 

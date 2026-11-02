@@ -80,6 +80,10 @@ extern bool g_bases_dirty;  // Main only
 extern std::array<VertexLoaderBase*, CP_NUM_VAT_REG> g_main_vertex_loaders;
 extern std::array<VertexLoaderBase*, CP_NUM_VAT_REG> g_preprocess_vertex_loaders;
 extern bool g_needs_cp_xf_consistency_check;
+// Nothing draws (the Null backend, Aurora reads the stream by itself): a draw command's vertices are not converted and
+// no batch is built, so no per-draw Flush runs either. The command's size is still counted and its loader still
+// refreshed; every BP, CP and XF store stays. AURORA_VIDEO_SKIP=1, off by default. See RunVertices.
+extern bool g_skip_vertex_work;
 
 template <bool IsPreprocess = false>
 VertexLoaderBase* RefreshLoader(int vtx_attr_group)
