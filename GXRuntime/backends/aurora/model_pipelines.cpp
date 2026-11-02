@@ -286,7 +286,8 @@ void attrs(const Mesh& m, ShaderConfig& c) {
 }
 
 void ask(const Form& f) {
-  aurora::gfx::precompile_pipeline(f.config, f.scene, f.other);
+  static const bool count_only = std::getenv("AURORA_TEST_COUNT_ONLY") != nullptr;  // a test: how many forms, none compiled
+  if (!count_only) aurora::gfx::precompile_pipeline(f.config, f.scene, f.other);
   ++s_configs;
   if (s_dump) std::fwrite(&f.config, sizeof(f.config), 1, s_dump);
 }
@@ -528,8 +529,8 @@ void run() {
           g.unlock();
           s_wake.notify_all();  // (the disc walk waits for room)
           if (f.path.empty()) {  // (the walk's end)
-            std::fprintf(stderr, "[pipelines] whole disc read: %llu files, %zu shaders asked, %.0f ms after the first file\n",
-                         (unsigned long long)s_disc_read, s_shaders.size(),
+            std::fprintf(stderr, "[pipelines] whole disc read: %llu files, %zu shaders asked, %zu fog types, %llu meshes, %.0f ms after the first file\n",
+                         (unsigned long long)s_disc_read, s_shaders.size(), s_fogs.size(), (unsigned long long)s_meshes,
                          std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
             walk_told = true;
           } else {
