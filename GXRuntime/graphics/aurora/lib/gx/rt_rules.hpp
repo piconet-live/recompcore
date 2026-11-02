@@ -160,7 +160,7 @@ struct Tuning {
   float lightMaxSize = 40.f, lightMinBright = 0.07f, lightMerge = 8.f, lightFull = 2.f, machineLight = 0.3f;
   // Glowing surfaces: on when texMeans is given. The size where small lights end is where these begin.
   const float (*texMeans)[4] = nullptr;
-  std::uint32_t texCount = 0, maxGlows = 64;
+  std::uint32_t texCount = 0, maxGlows = 64, glowPerDraw = 0;  // glowPerDraw: most lights one draw may hold, 0 no limit
   float glowAddBright = 0.25f, glowBright = 0.75f, glowColourful = 0.4f;
 };
 struct Frame {
@@ -172,7 +172,7 @@ struct Frame {
   std::vector<EngineLight> machineLights;
   std::vector<EngineLight> lights;
   std::vector<GlowLight> glows;
-  std::uint32_t glowDraws = 0, glowPieces = 0;
+  std::uint32_t glowDraws = 0, glowPieces = 0, glowTopDraw = 0;  // glowTopDraw: lights held by the draw holding most
   const DrawRec* main = nullptr;
   std::uint32_t machineDraws = 0, reflective = 0;
 };
@@ -188,8 +188,12 @@ inline void build_glows(const DrawRec* draws, std::uint32_t count, const Vertex*
     return;
   struct Piece {
     float pos[3], area, colour[3], power;
+    std::uint32_t draw;
   };
   static thread_local std::vector<Piece> pieces;
+  static thread_local std::vector<std::uint32_t> held;
+  held.assign(count, 0);
+  out.glowTopDraw = 0;
   pieces.clear();
   for (std::uint32_t i = 0; i < count; ++i) {
     const DrawRec& d = draws[i];
@@ -225,6 +229,7 @@ inline void build_glows(const DrawRec* draws, std::uint32_t count, const Vertex*
           // a coarse grid of the triangle's barycentrics: fixed to it, so it travels with the world
           const float u = (a0 + 1.f / 3) / n, w = (a1 + 1.f / 3) / n;
           Piece q;
+          q.draw = i;
           for (int k = 0; k < 3; ++k)
             q.pos[k] = p0[k] + e1[k] * u + e2[k] * w, q.colour[k] = col[k];
           q.area = area * 2 / static_cast<float>(n * n);  // pairs of small triangles of the grid, near enough
@@ -253,8 +258,9 @@ inline void build_glows(const DrawRec* draws, std::uint32_t count, const Vertex*
         break;
       }
     }
-    if (merged || sums.size() == t.maxGlows)
+    if (merged || sums.size() == t.maxGlows || (t.glowPerDraw != 0 && held[p.draw] >= t.glowPerDraw))
       continue;
+    out.glowTopDraw = std::max(out.glowTopDraw, ++held[p.draw]);
     Piece q = p;
     for (int k = 0; k < 3; ++k)
       q.pos[k] *= p.area, q.colour[k] *= p.area;

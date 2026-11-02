@@ -720,7 +720,7 @@ void log_facts(const live::Job& j, const Frame& f) {
 
 // Translation beside the stream: chunks of packets to a couple of workers, each draw into the slot the stream gave it
 constexpr size_t ChunkSize = 256 * 1024;
-constexpr u32 MostDraws = 32768, MostVerts = 1500000;
+constexpr u32 MostDraws = 65536, MostVerts = 4000000;
 struct Chunk {
   live::Job* job = nullptr;
   std::unique_ptr<u8[]> data;
@@ -835,6 +835,14 @@ void run_rules(live::Job& j) {
   Tuning tuning;
   if (const char* v = std::getenv("AURORA_RT_LIGHT_FULL"))
     tuning.lightFull = static_cast<float>(std::atof(v));
+  {
+    static const char* perDraw = std::getenv("AURORA_RT_GLOW_PERDRAW");
+    static const char* most = std::getenv("AURORA_RT_GLOW_MAX");
+    if (perDraw != nullptr)
+      tuning.glowPerDraw = static_cast<u32>(std::atoi(perDraw));
+    if (most != nullptr)
+      tuning.maxGlows = static_cast<u32>(std::atoi(most));
+  }
   tuning.machineCap = s_machineCap, tuning.sceneryCap = s_sceneryCap, tuning.machineGain = s_machineGain;
   if (j.glow > 0.f) {
     tuning.texMeans = s_texAvg;

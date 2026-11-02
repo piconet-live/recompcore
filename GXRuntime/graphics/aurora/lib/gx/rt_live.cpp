@@ -134,7 +134,7 @@ struct State {
   bool outputOpen = false;
 
   double msTrace = 0, msGpu = 0, msComposeWait = 0, msBuild = 0, msRules = 0, msTranslate = 0;
-  double picks = 0, merged = 0, glowsSeen = 0;
+  double picks = 0, merged = 0, glowsSeen = 0, glowPieces = 0, glowDraws = 0, glowTop = 0;
   double msGpuMost = 0;
   u64 tris = 0, lightsSeen = 0, lightsMost = 0, reports = 0;
   FILE* timeLog = nullptr;
@@ -633,7 +633,7 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   const u32 firsts[3] = {0, fr.seeFirstVertex, fr.skyFirstVertex};
   const u32 counts[3] = {fr.seeFirstVertex, fr.skyFirstVertex - fr.seeFirstVertex, static_cast<u32>(fr.verts.size()) - fr.skyFirstVertex};
   static constexpr u32 masks[3] = {1, 4, 2};
-  ensure(s.scratch, s.scratchSize, 64u << 20, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  ensure(s.scratch, s.scratchSize, 256u << 20, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   u64 scratchAt = 0;
   {
     D3D12_RESOURCE_BARRIER bs[1]{};
@@ -901,6 +901,7 @@ void run_rays(Job& job) {
   g.msComposeWait += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   g.msBuild += job.captureMs;
   g.msRules += job.rulesMs;
+  g.glowPieces += fr.glowPieces, g.glowDraws += fr.glowDraws, g.glowTop += fr.glowTopDraw;
   g.picks += job.lightPicks, g.merged += job.mergedLights, g.glowsSeen += glowCount;
   g.msTranslate += job.translateUs.load() / 1000.0;
   g.tris += fr.verts.size() / 3;
@@ -912,10 +913,10 @@ void run_rays(Job& job) {
   }();
   if (++g.count == every) {
     const double n = g.count;
-    std::fprintf(stderr, "[rt] per frame, %u frames at %ux%u: GPU build %.2f ms and rays+cleanup %.2f ms (all %.2f, worst %.2f); CPU in the stream %.2f ms, translation beside it %.2f ms, rules %.2f ms, worker %.2f ms; %.0f triangles, lights %.1f (most %llu), picks %.1f, merged %.1f, glows %.1f\n",
+    std::fprintf(stderr, "[rt] per frame, %u frames at %ux%u: GPU build %.2f ms and rays+cleanup %.2f ms (all %.2f, worst %.2f); CPU in the stream %.2f ms, translation beside it %.2f ms, rules %.2f ms, worker %.2f ms; %.0f triangles, lights %.1f (most %llu), picks %.1f, merged %.1f, glows %.1f from %.0f pieces of %.1f draws, one draw held most %.1f\n",
                  g.count, g.w, g.h, (g.msGpu - g.msTrace) / n, g.msTrace / n, g.msGpu / n, g.msGpuMost, g.msBuild / n, g.msTranslate / n, g.msRules / n, g.msComposeWait / n, double(g.tris) / n, double(g.lightsSeen) / n,
-                 static_cast<unsigned long long>(g.lightsMost), g.picks / n, g.merged / n, g.glowsSeen / n);
-    g.count = 0, g.msGpuMost = 0, g.msGpu = g.msTrace = g.msBuild = g.msRules = g.msTranslate = g.msComposeWait = 0, g.tris = 0, g.lightsSeen = 0, g.lightsMost = 0, g.picks = g.merged = g.glowsSeen = 0;
+                 static_cast<unsigned long long>(g.lightsMost), g.picks / n, g.merged / n, g.glowsSeen / n, g.glowPieces / n, g.glowDraws / n, g.glowTop / n);
+    g.count = 0, g.msGpuMost = 0, g.msGpu = g.msTrace = g.msBuild = g.msRules = g.msTranslate = g.msComposeWait = 0, g.tris = 0, g.lightsSeen = 0, g.lightsMost = 0, g.picks = g.merged = g.glowsSeen = g.glowPieces = g.glowDraws = g.glowTop = 0;
   }
 }
 

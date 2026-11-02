@@ -267,13 +267,15 @@ float3 glow_light(float3 pos, float3 N) {
   q.Proceed();
   return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? sum - topLight * 0.85 : sum;
 }
+// Tuned by eye: what counts as a strong source (brightest channel), how much of the sky's hue tints the sky level, the most light a surface can take
+static const float LitStrongLow = 0.5, LitStrongHigh = 0.9, LitSkyTint = 0.4, LitMost = 1.25;
 // The surface's light from rays (AURORA_RT_LIGHTING=rays): sun x N.L x one shadow ray + sky x how much of the surroundings it sees + what it sees, as bounce. Returned as a factor on the picture: 1 is today's level.
 // A hit counts as closed by distance, all of it near and nothing at lightReach, so a far wall leaves the open track as it is. Glows and additive draws are seen through, adding their light. Reach, floor, gains tuned.
 float3 lighting(float3 pos, float3 N, float dist, inout uint seed) {
   float3 T = normalize(abs(N.y) < 0.9 ? cross(N, float3(0, 1, 0)) : cross(N, float3(1, 0, 0))), B = cross(N, T);
   float3 org = pos + N * (0.03 + dist * 0.0005);
   float open = 0;
-  float3 bounce = 0;
+  float3 bounce = 0, skySeen = 0;
   for (uint r = 0; r < P.lightRays; ++r) {
     float u = rnd(seed), a = rnd(seed) * 6.28318;
     float3 dir = normalize(T * (cos(a) * sqrt(u)) + B * (sin(a) * sqrt(u)) + N * sqrt(max(1 - u, 0)));
@@ -281,10 +283,10 @@ float3 lighting(float3 pos, float3 N, float dist, inout uint seed) {
     bool ended = false;
     for (int i = 0; i < 4 && !ended; ++i) {
       RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
-      RayDesc ray; ray.Origin = org; ray.Direction = dir; ray.TMin = tmin; ray.TMax = P.lightReach;
+      RayDesc ray; ray.Origin = org; ray.Direction = dir; ray.TMin = tmin; ray.TMax = 100000;
       q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskSeen, ray);
       q.Proceed();
-      if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) break;
+      if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) { skySeen += through * sky_along(dir, 3.0); break; }
       float t = q.CommittedRayT();
       Hit h = fetch(q.CommittedInstanceID() + q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
       Draw d = Draws[h.draw];
@@ -293,15 +295,21 @@ float3 lighting(float3 pos, float3 N, float dist, inout uint seed) {
       float4 c = shade(h, 3.0);
       if (d.cls == 2) { bounce += through * c.rgb * saturate(c.a); continue; }
       if (d.cls == 1) { float al = saturate(c.a); bounce += through * c.rgb * al; through *= 1 - al; continue; }
+      // a bright surface lights from any distance, whatever else is near closes only within reach; so lava lights what faces it from far away
       float near = t / P.lightReach, closed = saturate(1 - near * near);
-      bounce += through * c.rgb * closed;
+      float most = max(c.r, max(c.g, c.b)), strong = smoothstep(LitStrongLow, LitStrongHigh, most);
+      bounce += through * c.rgb * max(closed, strong);
       through *= 1 - closed;
       ended = true;
     }
     open += through;
   }
-  open /= P.lightRays, bounce /= P.lightRays;
-  float3 result = P.skyGain * max(open, P.visFloor) + P.bounce * bounce;
+  open /= P.lightRays, bounce /= P.lightRays, skySeen /= P.lightRays;
+  // the surroundings' own colour, from all these rays saw (sky, lava, neon, walls), by hue alone: their brightness stays the sky gain's. A shaded face in a lava pit is warm, without a table
+  float3 seen = skySeen + bounce;
+  float seenL = lum(seen);
+  float3 skyTint = seenL > 0.02 ? clamp(seen / seenL, 0, 2.5) : 1.xxx;
+  float3 result = P.skyGain * max(open, P.visFloor) * lerp(1.xxx, skyTint, LitSkyTint) + P.bounce * bounce;
   Light sun = Lights[P.lightCount];
   float ndl = saturate(dot(N, sun.pos));
   if (ndl > 0 && dot(sun.colour, 1.xxx) > 0) {
@@ -311,7 +319,7 @@ float3 lighting(float3 pos, float3 N, float dist, inout uint seed) {
     q.Proceed();
     if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) result += sun.colour * ndl;
   }
-  return result;
+  return min(result, LitMost);
 }
 // Tuned by eye, the material rule's numbers
 static const float MatGapLow = 0.45, MatGapHigh = 0.95; // own brightness against the texture around it: where shine starts and is full
@@ -387,7 +395,8 @@ void main(uint3 id : SV_DispatchThreadID) {
           float3 R = reflect(v, N);
           float3 seen = trace_reflection(h.pos + N * 0.03, R, 8.0 / max(P.size.y, 1) * 512.0 / 4.0);
           seen = min(seen, 2.0);
-          float3 under = raster;
+          // with light from rays the surface under the reflection is the one lit by them, or a shaded face goes dark and takes the reflection's colour
+          float3 under = P.lightRays > 0 ? raster * max(1 + light, 0) : raster;
           float3 tint = lerp(1.xxx, own / max(most, 0.05), 0.5 * layer);
           float3 lit = max(seen - under, 0);
           float3 metal = tint * seen - MatMetalDim * under;
