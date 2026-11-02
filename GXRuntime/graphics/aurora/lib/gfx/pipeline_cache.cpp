@@ -1159,7 +1159,7 @@ PipelineRef find_pipeline(const rmlui::PipelineConfig& config) {
 }
 #endif
 
-void precompile_pipeline(const gx::PipelineConfig& config) {
+void precompile_pipeline(const gx::PipelineConfig& config, bool scene_target, bool other_target) {
   // Behind any draw that is waiting (a draw moves its own pipeline to the front of the line). Remembered for a change of the render target's layout, and
   // written to the cache only when a draw uses it (find_pipeline).
   remember_pipeline_config(ShaderType::GX, config, UINT32_MAX, false);
@@ -1168,8 +1168,10 @@ void precompile_pipeline(const gx::PipelineConfig& config) {
   offscreen.colorAttachmentCount = 1;
   offscreen.sampleCount = 1;
   detail::finalize_render_target_layout(offscreen);
-  resolve_pipeline(ShaderType::GX, config, scene, PipelinePriority::Background);
-  if (offscreen.key != scene.key) {
+  if (scene_target) {
+    resolve_pipeline(ShaderType::GX, config, scene, PipelinePriority::Background);
+  }
+  if (other_target && offscreen.key != scene.key) {
     resolve_pipeline(ShaderType::GX, config, offscreen, PipelinePriority::Background);
   }
 }

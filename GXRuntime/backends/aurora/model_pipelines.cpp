@@ -12,12 +12,16 @@
 // What the file cannot say is tried in every form the renderer has: cull mode, depth update, destination alpha, scene
 // alpha. A form no draw ever wants costs a little compile time and nothing else.
 // The post stages (a tint the game sets around a draw: fn_80074A8C and its kin, a machine's flash among them) are not in any
-// file, and nothing in a file says whose model it is, so every model gets those forms, after every plain form (s_later).
+// file, and nothing in a file says whose model it is, so every model gets those forms.
+//
+// Order is what makes this work in a load's time: nearly all the cost of a pipeline is its shader (about 200 ms uncached,
+// against about 1.5 ms for one more pipeline of a shader already made). So the first form of each shader goes first, then the
+// rest (Tier below). The tiers only say when: no form is left out for any model.
 //
 // Files are told apart by their contents, not their names: LZ, a U8 archive (a machine's models come in one), a model file.
 // Only the course file goes by its name, the name the game itself opens: it has no mark of its own.
-// Order of work: files the game is reading now, then the post forms, then the rest of the disc (aurora_present_model_file's
-// later: only when ray tracing is on or a test asks), each only while the compile queue is short.
+// Order of work: files the game is reading now, each tier, then the rest of the disc (aurora_present_model_file's later: only
+// when ray tracing is on or a test asks), each only while the compile queue is short.
 // Nothing here reads or writes the guest: the bytes are the disc's, copied on the disc thread. Effects and the HUD are not models,
 // so they stay as they were: their pipelines compile at their first draw.
 #include "gxruntime/aurora_present.h"
@@ -61,12 +65,24 @@ std::mutex s_lock;
 std::condition_variable s_wake;
 std::deque<File> s_files, s_disc_files;
 uint64_t s_disc_bytes = 0;
-std::vector<PipelineConfig> s_later;  // the post forms, not yet asked for
+// Tier: First a new shader, plain form, the scene's target. Same: more pipelines of known shaders. PostSmall: post stages of
+// models in the 16-bit vertex form (machines are; only an order, a guess that costs nothing if wrong). Rest: all else.
+enum Tier { First, Same, PostSmall, Rest, Tiers };
+struct Form {
+  PipelineConfig config;
+  bool scene, other;
+};
+std::deque<Form> s_tiers[Tiers];
+std::set<std::vector<uint8_t>> s_shaders;
 bool s_quit = false, s_aurora_up = false;
 std::thread s_thread;
-std::vector<PipelineConfig> s_bases;  // fog left at none
+struct Base {
+  PipelineConfig config;  // fog left at none
+  int post;
+  bool small;
+};
+std::vector<Base> s_bases;
 std::set<std::vector<uint8_t>> s_seen;
-std::vector<bool> s_base_takes_fog;
 std::set<uint8_t> s_fogs{0};
 uint64_t s_meshes = 0, s_meshes_left_out = 0, s_configs = 0;
 FILE* s_dump = nullptr;
@@ -264,12 +280,27 @@ void attrs(const Mesh& m, ShaderConfig& c) {
   c.vtxStride = off;
 }
 
-void precompile_with_fog(const PipelineConfig& base, uint8_t fog) {
+void ask(const Form& f) {
+  aurora::gfx::precompile_pipeline(f.config, f.scene, f.other);
+  ++s_configs;
+  if (s_dump) std::fwrite(&f.config, sizeof(f.config), 1, s_dump);
+}
+
+// A form with this fog goes in its tier: its first of a shader (destination alpha off or on makes a different one) for the
+// scene's target at the front, the other target's copy last
+void plan(const PipelineConfig& base, uint8_t fog, int post, bool small) {
   PipelineConfig c = base;
   c.shaderConfig.fogType = fog;
-  aurora::gfx::precompile_pipeline(c);
-  ++s_configs;
-  if (s_dump) std::fwrite(&c, sizeof(c), 1, s_dump);
+  std::vector<uint8_t> shader(sizeof(c.shaderConfig) + 1);
+  std::memcpy(shader.data(), &c.shaderConfig, sizeof(c.shaderConfig));
+  shader.back() = c.dstAlpha == UINT32_MAX;
+  const bool first = s_shaders.insert(std::move(shader)).second;
+  const Tier tier = post != 0 ? (small && c.dstAlpha != UINT32_MAX ? PostSmall : Rest)
+                    : first && c.dstAlpha != UINT32_MAX ? First
+                    : c.dstAlpha == 255 ? Same
+                                        : Rest;
+  s_tiers[tier].push_back(Form{c, true, false});
+  s_tiers[Rest].push_back(Form{c, false, true});
 }
 
 void forms(const Mesh& m) {
@@ -281,7 +312,6 @@ void forms(const Mesh& m) {
   }
   const uint32_t flags = m.flags;
   // (seen: a mesh with the no-fog flag drawn with fog on, and one without it drawn with fog off: both forms for all)
-  const bool takes_fog = true;
   ShaderConfig shader{};
   shader.tevSwapTable = {TevSwap{GX_CH_RED, GX_CH_GREEN, GX_CH_BLUE, GX_CH_ALPHA},
                          TevSwap{GX_CH_RED, GX_CH_GREEN, GX_CH_BLUE, GX_CH_RED},
@@ -326,15 +356,8 @@ void forms(const Mesh& m) {
               std::vector<uint8_t> key(sizeof(p));
               std::memcpy(key.data(), &p, sizeof(p));
               if (s_seen.insert(std::move(key)).second) {
-                if (post != 0) {
-                  s_later.push_back(p);
-                  continue;
-                }
-                s_bases.push_back(p);
-                s_base_takes_fog.push_back(takes_fog);
-                for (const uint8_t fog : s_fogs) {
-                  if (fog == 0 || takes_fog) precompile_with_fog(p, fog);
-                }
+                s_bases.push_back(Base{p, post, (m.model & 1) != 0});
+                for (const uint8_t fog : s_fogs) plan(p, fog, post, (m.model & 1) != 0);
               }
             }
           }
@@ -420,28 +443,33 @@ void read_file(const File& f) {
     const uint8_t fog = whole[at];
     if (s_fogs.insert(fog).second) {
       std::fprintf(stderr, "[pipelines] fog type %u from %s\n", fog, f.path.c_str());
-      for (size_t i = 0; i < s_bases.size(); ++i) {
-        if (s_base_takes_fog[i]) precompile_with_fog(s_bases[i], fog);
-      }
+      for (const Base& b : s_bases) plan(b.config, fog, b.post, b.small);
     }
     return;
   }
-  const uint64_t meshes = s_meshes, configs = s_configs;
-  const size_t later = s_later.size();
+  const uint64_t meshes = s_meshes;
+  const size_t first = s_tiers[First].size();
   read_contents(f.bytes, 0);
   if (s_meshes != meshes)
-    std::fprintf(stderr, "[pipelines] file %s: %llu meshes, %llu new forms, %zu new post forms\n", f.path.c_str(),
-                 (unsigned long long)(s_meshes - meshes), (unsigned long long)(s_configs - configs), s_later.size() - later);
+    std::fprintf(stderr, "[pipelines] file %s: %llu meshes, %zu new shaders\n", f.path.c_str(),
+                 (unsigned long long)(s_meshes - meshes), s_tiers[First].size() - first);
 }
 
-void ask_later(size_t count) {
-  while (count-- != 0 && !s_later.empty()) {
-    const PipelineConfig p = s_later.back();
-    s_later.pop_back();
-    s_bases.push_back(p);
-    s_base_takes_fog.push_back(true);
-    for (const uint8_t fog : s_fogs) precompile_with_fog(p, fog);
+bool tiers_empty() {
+  return std::all_of(std::begin(s_tiers), std::end(s_tiers), [](const auto& t) { return t.empty(); });
+}
+
+// The nearest tier's next few; false when none is left
+bool ask_next(size_t count) {
+  for (auto& tier : s_tiers) {
+    if (tier.empty()) continue;
+    for (; count != 0 && !tier.empty(); --count) {
+      ask(tier.front());
+      tier.pop_front();
+    }
+    return true;
   }
+  return false;
 }
 
 void run() {
@@ -455,7 +483,7 @@ void run() {
   if (const char* dump = std::getenv("AURORA_TEST_MODEL_DUMP")) s_dump = std::fopen(dump, "wb");
   const auto t0 = Clock::now();
   constexpr size_t Short = 32;  // the compile queue counts as short: later work never stands in front of a file being read
-  bool told = true;
+  bool told = true, told_first = true;
   for (;;) {
     File f;
     bool have = false;
@@ -467,15 +495,20 @@ void run() {
         s_files.pop_front();
         have = true;
       } else {
-        const bool more = !s_later.empty() || !s_disc_files.empty();
+        if (s_tiers[First].empty() && aurora::gfx::pipelines_waiting() == 0 && !told_first) {
+          told_first = true;
+          std::fprintf(stderr, "[pipelines] every shader so far made: %zu shaders, %.0f ms after the first file\n", s_shaders.size(),
+                       std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+        }
+        const bool more = !tiers_empty() || !s_disc_files.empty();
         const size_t waiting = aurora::gfx::pipelines_waiting();
         if (waiting >= Short || (waiting != 0 && !more)) {
           s_wake.wait_for(g, std::chrono::milliseconds(20), [] { return s_quit || !s_files.empty(); });
           continue;
         }
-        if (!s_later.empty()) {
+        if (!tiers_empty()) {
           g.unlock();
-          ask_later(Short);
+          ask_next(Short);
           told = false;
           continue;
         }
@@ -504,6 +537,7 @@ void run() {
     if (have) {
       read_file(f);
       told = false;
+      told_first = false;
     }
   }
   if (s_dump) std::fclose(s_dump);

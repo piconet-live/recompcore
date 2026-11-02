@@ -41,7 +41,7 @@ PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLa
 PipelineRef find_pipeline(const clear::PipelineConfig& config, const RenderTargetLayout& layout, bool blocking = false);
 PipelineRef find_pipeline(const rmlui::PipelineConfig& config);
 // A GX pipeline a draw will want, compiled ahead on the compile threads. Any thread.
-void precompile_pipeline(const gx::PipelineConfig& config);
+void precompile_pipeline(const gx::PipelineConfig& config, bool scene_target = true, bool other_target = true);
 size_t pipelines_waiting();
 size_t pipelines_compiled();
 
