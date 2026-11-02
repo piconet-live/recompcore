@@ -1,3 +1,5 @@
+#include "../gfx/stagelog.hpp"
+#include <functional>
 #include "rt_capture.hpp"
 #include "rt_format.hpp"
 #if defined(AURORA_RT_LIVE)
@@ -947,6 +949,53 @@ void late_compare(const live::Job& j) {
                  static_cast<unsigned long long>(s_lateMoved[1]), static_cast<unsigned long long>(s_lateDraws[1]), s_lateMost[1]);
 }
 
+bool motion_thread_on() {
+  static const bool v = [] {
+    const char* e = std::getenv("AURORA_RT_MOTION_THREAD");
+    return e != nullptr && e[0] == '1';
+  }();
+  return v;
+}
+// One job at a time: the rules hold the motion lock from before they post until after they wait
+std::mutex s_motionWorkLock;
+std::condition_variable s_motionWorkWake;
+std::function<void()> s_motionWork;
+bool s_motionWorkDone = false;
+void motion_post(std::function<void()> work) {
+  static const bool started = [] {
+    std::thread([] {
+      live::name_thread();
+      for (;;) {
+        std::function<void()> job;
+        {
+          std::unique_lock lock{s_motionWorkLock};
+          s_motionWorkWake.wait(lock, [] { return static_cast<bool>(s_motionWork); });
+          job = std::move(s_motionWork);
+          s_motionWork = nullptr;
+        }
+        job();
+        {
+          std::lock_guard lock{s_motionWorkLock};
+          s_motionWorkDone = true;
+        }
+        s_motionWorkWake.notify_all();
+      }
+    }).detach();
+    return true;
+  }();
+  (void)started;
+  {
+    std::lock_guard lock{s_motionWorkLock};
+    s_motionWork = std::move(work);
+    s_motionWorkDone = false;
+  }
+  s_motionWorkWake.notify_all();
+}
+void motion_wait() {
+  std::unique_lock lock{s_motionWorkLock};
+  s_motionWorkWake.wait(lock, [] { return s_motionWorkDone; });
+}
+
 void run_rules(live::Job& j) {
   const auto t0 = std::chrono::steady_clock::now();
   Tuning tuning;
@@ -983,12 +1032,15 @@ void run_rules(live::Job& j) {
   static std::mutex motionLock;  // two frames' rules can overlap
   std::unique_lock motionHeld{motionLock, std::defer_lock};
   std::thread motion;
+  bool motionPosted = false;
   static const bool hashOnly = [] {
     const char* v = std::getenv("AURORA_RT_MOTION_ONLY");
     return v != nullptr && v[0] == '2';
   }();
-  if (s_motionOn)
+  if (s_motionOn) {
+    gfx::stagelog::Scope t{"motion_lock", j.copy};
     motionHeld.lock();
+  }
   // the camera's move from the two frames' views, when the stream knew both
   static float lastView[12];
   static u64 lastViewCopy = 0;
@@ -1003,10 +1055,16 @@ void run_rules(live::Job& j) {
     lastViewKnown = staticView != nullptr;
   }
   if (s_motionOn && !hashOnly)
-    motion = std::thread([&j, staticMove, staticMoveKnown] {
+  {
+    const auto asked = std::chrono::steady_clock::now();
+    const auto work = [&j, staticMove, staticMoveKnown, asked] {
+      if (gfx::stagelog::on())
+        gfx::stagelog::note("motion_start", asked, j.copy);
       static MotionTracker tracker;
       const auto ts0 = std::chrono::steady_clock::now();
       tracker.step(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, j.copy, prev, j.motion, staticMoveKnown ? &staticMove : nullptr);
+      if (gfx::stagelog::on())
+        gfx::stagelog::note("motion_step", ts0, j.copy);
       static double stepMs = 0;
       static u32 stepN = 0;
       stepMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts0).count();
@@ -1014,18 +1072,39 @@ void run_rules(live::Job& j) {
         std::fprintf(stderr, "[rt] motion step %.2f ms, %u draws, %zu verts\n", stepMs / stepN, j.drawCount, prev.size() / 3);
         stepN = 0, stepMs = 0;
       }
-    });
-  build_frame(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, tuning, j.frame);
+    };
+    // AURORA_RT_MOTION_THREAD=1: one thread for this for the whole run, not a new one each frame
+    if (motion_thread_on()) {
+      motion_post(work);
+      motionPosted = true;
+    } else {
+      motion = std::thread(work);
+    }
+  }
+  {
+    gfx::stagelog::Scope t{"build_frame", j.copy};
+    build_frame(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, tuning, j.frame);
+  }
   if (staticScene && j.frame.main != nullptr) {
-    scene::match_static(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, s_texAvg, MostTexAvg, j.frame.main->proj[0], j.frame.main->proj[5], j.frame, j.world);
+    {
+      gfx::stagelog::Scope t{"match_static", j.copy};
+      scene::match_static(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, s_texAvg, MostTexAvg, j.frame.main->proj[0], j.frame.main->proj[5], j.frame, j.world);
+    }
+    gfx::stagelog::Scope t{"assemble", j.copy};
     assemble_frame(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, j.world.drop.data(), j.frame);
   } else {
     assemble_frame(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, nullptr, j.frame);
     if (scene::on() && !staticScene && j.frame.main != nullptr)
       scene::match(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, s_texAvg, MostTexAvg, j.frame.main->proj[0], j.frame.main->proj[5], j.world);
   }
-  if (motion.joinable()) {
-    motion.join();
+  if (motion.joinable() || motionPosted) {
+    {
+      gfx::stagelog::Scope t{"motion_join", j.copy};
+      if (motionPosted)
+        motion_wait();
+      else
+        motion.join();
+    }
     j.frame.prevPos.clear();
     j.frame.prevPos.reserve(j.frame.verts.size() * 3);
     for (const auto& [first, count] : j.frame.spans)
@@ -1045,6 +1124,7 @@ void run_rules(live::Job& j) {
       size_t bytes = 0;
       std::unique_lock lock{s_texLock};
       size_t n = 0;
+      gfx::stagelog::Scope mipsTime{"tex_mips", j.copy};
       static thread_local std::vector<Tex> take;
       take.clear();
       while (n < s_texs.size() && (n == 0 || bytes + s_texs[n].rgba.size() <= Budget)) {
@@ -1061,6 +1141,8 @@ void run_rules(live::Job& j) {
     std::memcpy(j.viewport, j.frame.main->viewport, sizeof j.viewport);
   }
   j.rulesMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  if (gfx::stagelog::on())
+    gfx::stagelog::note("rules", t0, j.copy);
   j.mergedLights = static_cast<u32>(j.frame.merged.size()), j.lightPicks = static_cast<u32>(j.frame.picks.size());
   if (s_lightLog != nullptr && j.drawable)
     log_lights(j, j.frame);
