@@ -108,9 +108,8 @@ void FileLogger::ModelFiles(const DiscIO::Volume& volume, const DiscIO::Partitio
 // Aurora takes each only when it has nothing nearer to do, and holds this thread back when it has enough.
 void FileLogger::StartWholeDisc(const DiscIO::Volume& volume, const DiscIO::Partition& partition)
 {
-  m_whole_disc = std::thread([this, copy = std::shared_ptr<DiscIO::VolumeDisc>(
-                                        DiscIO::CreateDisc(volume.GetBlobReader().CopyReader())),
-                              partition] {
+  std::shared_ptr<DiscIO::VolumeDisc> copy = DiscIO::CreateDisc(volume.GetBlobReader().CopyReader());
+  m_whole_disc = std::thread([this, copy, partition] {
     const DiscIO::FileSystem* file_system = copy ? copy->GetFileSystem(partition) : nullptr;
     if (!file_system)
       return;
