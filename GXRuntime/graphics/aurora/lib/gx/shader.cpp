@@ -407,6 +407,8 @@ std::string tev_op(GXTevOp op, std::string_view bias, std::string_view scale, st
 std::string tev_color_op(GXTevOp op, std::string_view bias, std::string_view scale, bool clamp, std::string_view a,
                          std::string_view b, std::string_view c, std::string_view d) {
   std::string expr = tev_op(op, bias, scale, a, b, c, d, "vec3(0)"sv);
+  if (webgpu::raw_picture())
+    return fmt::format("max({}, vec3f(-4.0))", expr);
   return clamp ? fmt::format("clamp({}, vec3f(0.0), vec3f(1.0))", expr)
                : fmt::format("clamp({}, vec3f(-4.0), vec3f(4.0))", expr);
 }
@@ -414,6 +416,8 @@ std::string tev_color_op(GXTevOp op, std::string_view bias, std::string_view sca
 std::string tev_alpha_op(GXTevOp op, std::string_view bias, std::string_view scale, bool clamp, std::string_view a,
                          std::string_view b, std::string_view c, std::string_view d) {
   std::string expr = tev_op(op, bias, scale, a, b, c, d, "0.0"sv);
+  if (webgpu::raw_picture())
+    return fmt::format("max({}, -4.0)", expr);
   return clamp ? fmt::format("clamp({}, 0.0, 1.0)", expr) : fmt::format("clamp({}, -4.0, 4.0)", expr);
 }
 
@@ -846,10 +850,11 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
           var diff = {3};
           lighting = lighting + (attn * diff * light.color);
       }}
-      {7}{8} = ({4} * clamp(lighting, vec4f(0.0), vec4f(1.0))){8};
+      {7}{8} = ({4} * {10}){8};
     }})""",
                      i, GX::MaxLights, lightAttnFn, lightDiffFn, matSrc, ambSrc, posVar, outVar, swizzle,
-                     alpha ? "a"sv : ""sv);
+                     alpha ? "a"sv : ""sv,
+                     webgpu::raw_picture() ? "max(lighting, vec4f(0.0))"sv : "clamp(lighting, vec4f(0.0), vec4f(1.0))"sv);
 }
 
 absl::flat_hash_set<gfx::ShaderRef> s_seenShaders;

@@ -1,3 +1,6 @@
+#include <cstdio>
+#include <cstdlib>
+#include <algorithm>
 #include "efb_readback.hpp"
 
 #include "../internal.hpp"
@@ -43,6 +46,42 @@ void complete_map(wgpu::MapAsyncStatus status, wgpu::StringView message) {
       const bool bgra = g_copyFormat == wgpu::TextureFormat::BGRA8Unorm ||
                         g_copyFormat == wgpu::TextureFormat::BGRA8UnormSrgb;
       g_pixels.resize(static_cast<size_t>(g_copyWidth) * g_copyHeight * 4u);
+      if (g_copyFormat == wgpu::TextureFormat::RGBA16Float) {
+        // the raw picture: the range is reported (AURORA_LOOK_PEAKLOG=<file>), the picture shown as the display would, cut at white
+        const auto half = [](uint16_t h) {
+          const uint32_t e = (h >> 10) & 31, m = h & 1023;
+          const float v = e == 0 ? static_cast<float>(m) / (1024.f * 16384.f) : e == 31 ? 65535.f : (1.f + static_cast<float>(m) / 1024.f) * static_cast<float>(1u << e) / 32768.f;
+          return (h & 0x8000) != 0 ? -v : v;
+        };
+        float peak = 0.f, least = 0.f;
+        uint64_t over1 = 0, over2 = 0, over4 = 0;
+        for (uint32_t y = 0; y < g_copyHeight; ++y) {
+          const auto* srcRow = reinterpret_cast<const uint16_t*>(mapped + static_cast<size_t>(y) * g_copyBytesPerRow);
+          uint8_t* dstRow = g_pixels.data() + static_cast<size_t>(y) * g_copyWidth * 4u;
+          for (uint32_t x = 0; x < g_copyWidth; ++x) {
+            float most = 0.f;
+            for (uint32_t c = 0; c < 4u; ++c) {
+              const float v = half(srcRow[x * 4u + c]);
+              if (c < 3u)
+                most = std::max(most, v), least = std::min(least, v);
+              dstRow[x * 4u + c] = static_cast<uint8_t>(std::clamp(v, 0.f, 1.f) * 255.f + 0.5f);
+            }
+            peak = std::max(peak, most);
+            over1 += most > 1.01f, over2 += most > 2.f, over4 += most > 4.f;
+          }
+        }
+        if (const char* path = std::getenv("AURORA_LOOK_PEAKLOG"))
+          if (FILE* f = std::fopen(path, "ab")) {
+            const double all = static_cast<double>(g_copyWidth) * g_copyHeight / 100.0;
+            std::fprintf(f, "peak %.2f least %.2f, share over 1: %.2f%%, over 2: %.2f%%, over 4: %.2f%%\n", peak, least, over1 / all, over2 / all, over4 / all);
+            std::fclose(f);
+          }
+        g_readyWidth = g_copyWidth;
+        g_readyHeight = g_copyHeight;
+        g_ready = true;
+        g_buffer.Unmap();
+        return;
+      }
       for (uint32_t y = 0; y < g_copyHeight; ++y) {
         const uint8_t* srcRow = mapped + static_cast<size_t>(y) * g_copyBytesPerRow;
         uint8_t* dstRow = g_pixels.data() + static_cast<size_t>(y) * g_copyWidth * 4u;
@@ -99,7 +138,8 @@ void after_submit() noexcept {
     if (format != wgpu::TextureFormat::RGBA8Unorm &&
         format != wgpu::TextureFormat::RGBA8UnormSrgb &&
         format != wgpu::TextureFormat::BGRA8Unorm &&
-        format != wgpu::TextureFormat::BGRA8UnormSrgb) {
+        format != wgpu::TextureFormat::BGRA8UnormSrgb &&
+        format != wgpu::TextureFormat::RGBA16Float) {
       static bool warned = false;
       if (!warned) {
         warned = true;
@@ -111,7 +151,7 @@ void after_submit() noexcept {
     const uint32_t width = src.size.width;
     const uint32_t height = src.size.height;
     // WebGPU requires 256-byte bytesPerRow alignment for texture->buffer.
-    const uint32_t bytesPerRow = (width * 4u + 255u) & ~255u;
+    const uint32_t bytesPerRow = (width * (format == wgpu::TextureFormat::RGBA16Float ? 8u : 4u) + 255u) & ~255u;
     const uint64_t byteSize = static_cast<uint64_t>(bytesPerRow) * height;
     const wgpu::BufferDescriptor bufferDescriptor{
         .label = "EFB Readback Buffer",

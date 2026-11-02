@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "gpu.hpp"
 
 #include <algorithm>
@@ -96,7 +97,17 @@ AuroraLogLevel wgpu_log_level(wgpu::LoggingType type) {
   }
 }
 
+// AURORA_DAWN_LOG=<file>: what Dawn says, kept where a test can read it
+void dawn_note(std::string_view text) {
+  if (const char* path = std::getenv("AURORA_DAWN_LOG"))
+    if (FILE* f = std::fopen(path, "ab")) {
+      std::fwrite(text.data(), 1, text.size(), f);
+      std::fputc('\n', f);
+      std::fclose(f);
+    }
+}
 void wgpu_log(wgpu::LoggingType type, wgpu::StringView message) {
+  dawn_note(std::string_view(message.data, message.length));
   Log.report(wgpu_log_level(type), "WebGPU message: {}", message);
 }
 
@@ -266,13 +277,24 @@ wgpu::PresentMode select_present_mode(const wgpu::SurfaceCapabilities& capabilit
   return wgpu::PresentMode::Fifo;
 }
 
+bool raw_picture() noexcept {
+  static const bool on = [] {
+    const char* v = std::getenv("AURORA_LOOK_RAW");
+    return v != nullptr && v[0] == '1';
+  }();
+  return on;
+}
+wgpu::TextureFormat scene_format() noexcept {
+  return raw_picture() ? wgpu::TextureFormat::RGBA16Float : g_graphicsConfig.surfaceConfiguration.format;
+}
+
 TextureWithSampler create_render_texture(uint32_t width, uint32_t height, bool multisampled) {
   const wgpu::Extent3D size{
       .width = width,
       .height = height,
       .depthOrArrayLayers = 1,
   };
-  const auto format = g_graphicsConfig.surfaceConfiguration.format;
+  const auto format = scene_format();
   uint32_t sampleCount = 1;
   if (multisampled) {
     sampleCount = g_graphicsConfig.msaaSamples;
@@ -604,7 +626,7 @@ void create_resample_pipeline() {
   };
   auto module = g_device.CreateShaderModule(&moduleDescriptor);
   const std::array colorTargets{wgpu::ColorTargetState{
-      .format = g_graphicsConfig.surfaceConfiguration.format,
+      .format = scene_format(),
       .writeMask = wgpu::ColorWriteMask::All,
   }};
   const wgpu::FragmentState fragmentState{
@@ -970,7 +992,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
       if (feature == wgpu::FeatureName::SharedTextureMemoryD3D12Resource) {
         const char* rt = std::getenv("AURORA_RT");
         const char* look = std::getenv("AURORA_LOOK_POST");
-        if ((rt != nullptr && rt[0] == '1') || (look != nullptr && look[0] == '1'))
+        if ((rt != nullptr && rt[0] == '1') || (look != nullptr && look[0] == '1') || raw_picture())
           requiredFeatures.push_back(feature);
       }
       if (feature == wgpu::FeatureName::CoreFeaturesAndLimits || feature == wgpu::FeatureName::TextureCompressionBC ||
@@ -1054,6 +1076,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     });
     deviceDescriptor.SetUncapturedErrorCallback(
         [](const wgpu::Device& device, wgpu::ErrorType type, wgpu::StringView message) {
+          dawn_note(std::string_view(message.data, message.length));
           if (g_initialized) {
             FATAL("WebGPU error {}: {}", underlying(type), message);
           } else {
@@ -1063,6 +1086,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     deviceDescriptor.SetDeviceLostCallback(
         wgpu::CallbackMode::AllowSpontaneous,
         [](const wgpu::Device& device, wgpu::DeviceLostReason reason, wgpu::StringView message) {
+          dawn_note(std::string_view(message.data, message.length));
           // (Destroyed: the device went on purpose, at a shutdown or as the process ends: no error. Patch 19)
           if (g_initialized && reason != wgpu::DeviceLostReason::Destroyed) {
             FATAL("Device lost: {}", message);

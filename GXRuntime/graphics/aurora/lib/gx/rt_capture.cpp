@@ -6,6 +6,7 @@
 
 #include "recomp.hpp"
 #include "../gfx/texture_convert.hpp"
+#include "../gfx/efb_readback.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -1062,6 +1063,11 @@ void begin_copy(std::uint64_t copy) noexcept {
 }
 
 void frame_end() noexcept {
+  // AURORA_LOOK_PEAKLOG=<file>: the raw picture's range, measured a few times a second's worth of frames
+  static const bool peakLog = std::getenv("AURORA_LOOK_PEAKLOG") != nullptr;
+  static u32 peakAt = 0;
+  if (peakLog && ++peakAt % 120 == 0)
+    gfx::efb_readback::request();
 #if defined(AURORA_RT_LIVE)
   if (g_hook) {
     if (s_seenPerspective)
