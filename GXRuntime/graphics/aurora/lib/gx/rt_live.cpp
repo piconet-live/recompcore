@@ -73,7 +73,8 @@ struct PostParams {
   u32 rayed, autoExposure, frame, levels;
 };
 // The look's descriptors, after the textures': for good until the size changes. Each texture a read view, then a write view
-constexpr u32 PostDescriptors = 2 * (1 + PostLevels + PostLevels - 1) + 1;
+constexpr u32 BetweenDescriptors = 3;  // the warped term's two views, the true term's read
+constexpr u32 PostDescriptors = 2 * (1 + PostLevels + PostLevels - 1) + 1 + BetweenDescriptors;
 constexpr u32 PostFirst = Frames * SlotDescriptors + MaxTextures;
 // As rt.hlsl's DenoiseParams, one for each step of a frame
 struct DenoiseParams {
@@ -84,6 +85,7 @@ struct DenoiseParams {
 };
 constexpr u32 DenoiseSteps = 8, DenoiseViews = 12, DenoiseIterations = 4;
 constexpr u32 ConstantStride = 256;
+constexpr u32 ViewBetweenTrue = PostFirst + PostDescriptors - BetweenDescriptors, ViewBetween = ViewBetweenTrue + 1;
 constexpr u32 ViewHdr = PostFirst, ViewDown = ViewHdr + 2, ViewUp = ViewDown + 2 * PostLevels, ViewExpo = ViewUp + 2 * (PostLevels - 1);
 
 struct Slot {
@@ -105,6 +107,21 @@ struct Slot {
   // what this slot's timings belong to, for the time log
   u64 copy = 0;
   u32 tris = 0, lightCount = 0, uploads = 0;
+  bool between = false;  // its timings are a picture between's
+  ComPtr<ID3D12Resource> betweenConstants;
+  void* betweenMap = nullptr;
+};
+// rt.hlsl's BetweenParams
+struct BetweenMachine {
+  float m[3][4];
+  float at[4];
+};
+struct BetweenParams {
+  float size[2], rectXY[2], rectWH[2], vpXY[2], vpWH[2], pScale[2], pOffset[2];
+  u32 count, iterations;
+  float radius2, far_, pad_[2];
+  float camera[3][4];
+  BetweenMachine machine[30];
 };
 struct State {
   bool failed = false, ready = false;
@@ -116,7 +133,15 @@ struct State {
   ComPtr<ID3D12DescriptorHeap> heap;
   UINT inc = 0;
   ComPtr<ID3D12RootSignature> root;
-  ComPtr<ID3D12PipelineState> trace, compose, lightPass, temporal, atrous;
+  ComPtr<ID3D12PipelineState> trace, compose, lightPass, temporal, atrous, betweenWarp, betweenHdr, betweenCompose;
+  // pictures between: the true frame's colour texture and view for its rays; this picture's corrections; what they cost
+  wgpu::Texture lastColor;
+  bool haveTerm = false, pendingBetween = false;
+  float lastView[10]{};  // viewport's and projection's numbers of the true frame: rect wh, vp xy, vp wh, scale, offset
+  BetweenParams betweenParams{};
+  ComPtr<ID3D12Resource> termBetween;
+  double msBetweenGpu = 0, msBetweenCpu = 0;
+  u64 betweenCount = 0, betweenGpuCount = 0;
   // Light across frames (AURORA_RT_DENOISE=1): textures for this frame and the last; a texture with its descriptors written per step
   ComPtr<ID3D12Resource> guide[2], motion, noisyOpen, noisySky, histOpen[2], histSky[2], moments[2], tmpOpen[2], tmpSky[2];
   u32 flip = 0;
@@ -292,8 +317,9 @@ void init_device() {
   auto traceCs = compile(comp.Get(), L"main"), composeCs = compile(comp.Get(), L"compose");
   auto hdrCs = compile(comp.Get(), L"hdr_in"), downCs = compile(comp.Get(), L"bloom_down"), upCs = compile(comp.Get(), L"bloom_up"),
        expoCs = compile(comp.Get(), L"exposure"), toneCs = compile(comp.Get(), L"tone");
+  auto warpCs = compile(comp.Get(), L"between_warp"), betweenHdrCs = compile(comp.Get(), L"between_hdr"), betweenComposeCs = compile(comp.Get(), L"between_compose");
   auto lightCs = compile(comp.Get(), L"light_pass"), temporalCs = compile(comp.Get(), L"temporal"), atrousCs = compile(comp.Get(), L"atrous");
-  if (!lightCs || !temporalCs || !atrousCs ||
+  if (!warpCs || !betweenHdrCs || !betweenComposeCs || !lightCs || !temporalCs || !atrousCs ||
       !traceCs || !composeCs || !hdrCs || !downCs || !upCs || !expoCs || !toneCs)
     return fail("the shader does not compile");
 
@@ -332,7 +358,7 @@ void init_device() {
     one[i].BaseShaderRegister = i < 2 ? 8 + i : i;  // t8, t9, u2, u3
     one[i].Flags = r1[0].Flags;
   }
-  D3D12_ROOT_PARAMETER1 rp[10]{};
+  D3D12_ROOT_PARAMETER1 rp[11]{};
   rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   rp[0].Constants.Num32BitValues = sizeof(Params) / 4;
   rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -355,6 +381,9 @@ void init_device() {
   rp[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
   rp[9].Descriptor.ShaderRegister = 2;
   rp[9].Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE;
+  rp[10].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+  rp[10].Descriptor.ShaderRegister = 3;
+  rp[10].Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE;
   D3D12_STATIC_SAMPLER_DESC ss[2]{};
   ss[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
   ss[0].AddressU = ss[0].AddressV = ss[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -365,7 +394,7 @@ void init_device() {
   ss[1].AddressU = ss[1].AddressV = ss[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
   D3D12_VERSIONED_ROOT_SIGNATURE_DESC rs{};
   rs.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
-  rs.Desc_1_1.NumParameters = 10;
+  rs.Desc_1_1.NumParameters = 11;
   rs.Desc_1_1.pParameters = rp;
   rs.Desc_1_1.NumStaticSamplers = 2;
   rs.Desc_1_1.pStaticSamplers = ss;
@@ -383,7 +412,7 @@ void init_device() {
   RT_HR(g.dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.trace)));
   pd.CS = {composeCs->GetBufferPointer(), composeCs->GetBufferSize()};
   RT_HR(g.dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.compose)));
-  const std::pair<ComPtr<ID3D12PipelineState>*, IDxcBlob*> posts[] = {{&g.hdrIn, hdrCs.Get()}, {&g.bloomDown, downCs.Get()}, {&g.bloomUp, upCs.Get()}, {&g.exposure, expoCs.Get()}, {&g.tone, toneCs.Get()}, {&g.lightPass, lightCs.Get()}, {&g.temporal, temporalCs.Get()}, {&g.atrous, atrousCs.Get()}};
+  const std::pair<ComPtr<ID3D12PipelineState>*, IDxcBlob*> posts[] = {{&g.hdrIn, hdrCs.Get()}, {&g.bloomDown, downCs.Get()}, {&g.bloomUp, upCs.Get()}, {&g.exposure, expoCs.Get()}, {&g.tone, toneCs.Get()}, {&g.lightPass, lightCs.Get()}, {&g.temporal, temporalCs.Get()}, {&g.atrous, atrousCs.Get()}, {&g.betweenWarp, warpCs.Get()}, {&g.betweenHdr, betweenHdrCs.Get()}, {&g.betweenCompose, betweenComposeCs.Get()}};
   for (const auto& [pso, cs] : posts) {
     pd.CS = {cs->GetBufferPointer(), cs->GetBufferSize()};
     RT_HR(g.dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(pso->GetAddressOf())));
@@ -538,6 +567,17 @@ void make_targets(u32 w, u32 h, wgpu::TextureFormat format) {
   }
   if (post_on())
     make_post_targets(w, h);
+  if (redraw::g_on) {
+    g.termBetween = post_texture(w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, ViewBetween);
+    if (g.termRes) {
+      D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+      sv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+      sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      sv.Texture2D.MipLevels = 1;
+      g.dev->CreateShaderResourceView(g.termRes.Get(), &sv, cpuh(ViewBetweenTrue));
+    }
+  }
   if (g.failed)
     return;
   const wgpu::BindGroupLayoutEntry e{.binding = 0,
@@ -831,6 +871,7 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   p.glowGain = job.glow;
   static const u32 glowShow = std::getenv("AURORA_RT_GLOW_SHOW") != nullptr ? 1 : 0;
   p.glowShow = glowShow;
+  std::memcpy(g.lastView, p.rectWH, sizeof g.lastView);
   cl->SetComputeRoot32BitConstants(0, sizeof(Params) / 4, &p, 0);
   // Each step's constants and textures: a slot's own descriptors, written as it goes
   if (!s.constants) {
@@ -992,6 +1033,121 @@ void run_post(Slot& s, Job& job) {
 }
 
 // What the rays do for one frame, on Dawn's queue, between the frame's two command buffers
+// One picture between: no rays. The true frame's reflections and light (its term) carried by the corrections, then the picture's own raster
+// beneath them; bloom and exposure as the true frame left them.
+void run_between() {
+  const auto t0 = std::chrono::steady_clock::now();
+  g.slot = (g.slot + 1) % Frames;
+  Slot& s = g.slots[g.slot];
+  if (g.fence->GetCompletedValue() < s.fence) {
+    RT_HR(g.fence->SetEventOnCompletion(s.fence, g.event));
+    WaitForSingleObject(g.event, INFINITE);
+  }
+  if (s.between && s.fence != 0) {
+    u64* ts = nullptr;
+    const D3D12_RANGE range{8 * 6 * g.slot, 8 * 6 * (g.slot + 1)};
+    if (SUCCEEDED(g.queryResult->Map(0, &range, reinterpret_cast<void**>(&ts)))) {
+      const u64* t6 = ts + 6 * g.slot;
+      g.msBetweenGpu += double(t6[5] - t6[0]) * 1000.0 / g.gpuTicks;
+      ++g.betweenGpuCount;
+      g.queryResult->Unmap(0, nullptr);
+    }
+  }
+  s.between = true;
+  s.keep.clear();
+  if (!s.betweenConstants) {
+    s.betweenConstants = make_buffer(D3D12_HEAP_TYPE_UPLOAD, (sizeof(BetweenParams) + 255) & ~255ull, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    RT_HR(s.betweenConstants->Map(0, nullptr, &s.betweenMap));
+  }
+  BetweenParams& b = g.betweenParams;
+  b.size[0] = static_cast<float>(g.w), b.size[1] = static_cast<float>(g.h);
+  b.rectXY[0] = b.rectXY[1] = 0;
+  b.rectWH[0] = g.lastView[0], b.rectWH[1] = g.lastView[1];
+  b.vpXY[0] = g.lastView[2], b.vpXY[1] = g.lastView[3], b.vpWH[0] = g.lastView[4], b.vpWH[1] = g.lastView[5];
+  b.pScale[0] = g.lastView[6], b.pScale[1] = g.lastView[7], b.pOffset[0] = g.lastView[8], b.pOffset[1] = g.lastView[9];
+  std::memcpy(s.betweenMap, &b, sizeof b);
+  RT_HR(s.alloc->Reset());
+  RT_HR(s.cl->Reset(s.alloc.Get(), nullptr));
+  ID3D12GraphicsCommandList4* cl = s.cl.Get();
+  ID3D12DescriptorHeap* heaps[] = {g.heap.Get()};
+  cl->SetDescriptorHeaps(1, heaps);
+  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot);
+  const u32 base = g.slot * SlotDescriptors;
+  D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+  sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  sv.Format = g.inputRes->GetDesc().Format;
+  sv.Texture2D.MipLevels = 1;
+  g.dev->CreateShaderResourceView(g.inputRes.Get(), &sv, cpuh(base + 3));
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+  uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+  uv.Format = output_format();
+  g.dev->CreateUnorderedAccessView(g.outputRes.Get(), nullptr, &uv, cpuh(base + 9));
+  cl->SetComputeRootSignature(g.root.Get());
+  cl->SetComputeRootDescriptorTable(1, gpuh(base));
+  cl->SetComputeRootDescriptorTable(2, gpuh(Frames * SlotDescriptors));
+  const auto transition = [&](ID3D12Resource* r, bool toRead) {
+    D3D12_RESOURCE_BARRIER t{};
+    t.Transition.pResource = r;
+    t.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    t.Transition.StateBefore = toRead ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    t.Transition.StateAfter = toRead ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    cl->ResourceBarrier(1, &t);
+  };
+  const bool rayed = g.haveTerm;
+  transition(g.termRes.Get(), true);
+  if (rayed) {
+    cl->SetComputeRootConstantBufferView(10, s.betweenConstants->GetGPUVirtualAddress());
+    cl->SetPipelineState(g.betweenWarp.Get());
+    cl->SetComputeRootDescriptorTable(4, gpuh(ViewBetweenTrue));
+    cl->SetComputeRootDescriptorTable(5, gpuh(ViewBetweenTrue));
+    cl->SetComputeRootDescriptorTable(6, gpuh(ViewBetween + 1));
+    cl->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
+  }
+  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot + 1);
+  for (u32 q = 2; q < 5; ++q)
+    cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot + q);
+  transition(g.termBetween.Get(), true);
+  if (post_on()) {
+    static const float range = post_setting("AURORA_LOOK_RANGE", 12.f), bloom = post_setting("AURORA_LOOK_BLOOM", 0.18f), grade = post_setting("AURORA_LOOK_GRADE", 1.f);
+    static const u32 autoExposure = post_setting("AURORA_LOOK_EXPOSURE", 1.f) != 0.f ? 1 : 0;
+    PostParams pp{{0.f, 0.f}, range, bloom, 0.f, grade, 1u, autoExposure, g.frame, PostLevels};
+    const auto pass = [&](ID3D12PipelineState* pso, u32 readA, u32 readB, u32 write, float tx, float ty) {
+      cl->SetPipelineState(pso);
+      pp.texel[0] = tx, pp.texel[1] = ty;
+      cl->SetComputeRoot32BitConstants(3, sizeof(PostParams) / 4, &pp, 0);
+      cl->SetComputeRootDescriptorTable(4, gpuh(readA));
+      cl->SetComputeRootDescriptorTable(5, gpuh(readB));
+      cl->SetComputeRootDescriptorTable(6, gpuh(write));
+      cl->SetComputeRootDescriptorTable(7, gpuh(ViewExpo));
+      cl->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
+    };
+    pass(g.betweenHdr.Get(), ViewBetween, ViewBetween, ViewHdr + 1, 0.f, 0.f);
+    transition(g.hdrRes.Get(), true);
+    transition(g.upRes[0].Get(), true);
+    pass(g.tone.Get(), ViewHdr, ViewUp, ViewHdr + 1, 1.f / g.w, 1.f / g.h);
+    transition(g.hdrRes.Get(), false);
+    transition(g.upRes[0].Get(), false);
+  } else {
+    cl->SetPipelineState(g.betweenCompose.Get());
+    cl->SetComputeRootDescriptorTable(5, gpuh(ViewBetween));
+    cl->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
+  }
+  transition(g.termBetween.Get(), false);
+  transition(g.termRes.Get(), false);
+  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot + 5);
+  cl->ResolveQueryData(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot, 6, g.queryResult.Get(), 8 * 6 * g.slot);
+  RT_HR(cl->Close());
+  ID3D12CommandList* lists[] = {cl};
+  g.queue->ExecuteCommandLists(1, lists);
+  s.fence = ++g.fenceValue;
+  RT_HR(g.queue->Signal(g.fence.Get(), s.fence));
+  g.msBetweenCpu += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  if (++g.betweenCount % 1200 == 0)
+    std::fprintf(stderr, "[rt] between: %llu pictures, CPU %.2f ms, GPU warp and compose %.2f ms each\n", static_cast<unsigned long long>(g.betweenCount), g.msBetweenCpu / g.betweenCount,
+                 g.betweenGpuCount ? g.msBetweenGpu / g.betweenGpuCount : 0.0);
+}
+
 void run_rays(Job& job) {
   const auto t0 = std::chrono::steady_clock::now();
   g.slot = (g.slot + 1) % Frames;
@@ -1007,6 +1163,13 @@ void run_rays(Job& job) {
     if (SUCCEEDED(g.queryResult->Map(0, &range, reinterpret_cast<void**>(&ts)))) {
       const u64* t6 = ts + 6 * g.slot;
       const double k = 1000.0 / g.gpuTicks, all = double(t6[5] - t6[0]) * k;
+      if (s.between) {
+        g.msBetweenGpu += all;
+        ++g.betweenGpuCount;
+        g.queryResult->Unmap(0, nullptr);
+        s.fence = 0;  // (this slot's timing taken)
+      } else
+      {
       const double build = double(t6[1] - t6[0]) * k, lightMs = double(t6[2] - t6[1]) * k, denoiseMs = double(t6[3] - t6[2]) * k, reflectMs = double(t6[4] - t6[3]) * k, composeMs = double(t6[5] - t6[4]) * k;
       g.msGpu += all;
       g.msGpuMost = std::max(g.msGpuMost, all);
@@ -1016,9 +1179,11 @@ void run_rays(Job& job) {
       if (g.timeLog != nullptr)
         std::fprintf(g.timeLog, "%llu,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%u\n", static_cast<unsigned long long>(s.copy), build, lightMs, denoiseMs, reflectMs, composeMs, s.tris, s.lightCount, s.uploads);
       g.queryResult->Unmap(0, nullptr);
+      }
     }
   }
   s.keep.clear();
+  s.between = false;
   s.copy = job.copy, s.tris = static_cast<u32>(job.frame.verts.size() / 3), s.lightCount = static_cast<u32>(job.frame.lights.size()), s.uploads = static_cast<u32>(job.textures.size());
   RT_HR(s.alloc->Reset());
   RT_HR(s.cl->Reset(s.alloc.Get(), nullptr));
@@ -1134,6 +1299,8 @@ void task(const gfx::EncoderTaskContext& ctx, const wgpu::CommandEncoder& cmd, c
   std::memcpy(&p, payload, sizeof p);
   std::unique_ptr<Job> job{p.job};
   const wgpu::Texture color = wgpu::Texture::Acquire(p.color);
+  g.lastColor = color;
+  g.haveTerm = false;
   job->rules.wait();
   g.drawThis = job->drawable;
   if (!g.drawThis) {
@@ -1152,7 +1319,20 @@ void task(const gfx::EncoderTaskContext& ctx, const wgpu::CommandEncoder& cmd, c
   cmd.CopyTextureToTexture(&src, &dst, &size);
   g.first = ctx.frameEncoder->Finish();
   *ctx.frameEncoder = webgpu::g_device.CreateCommandEncoder();
+  g.haveTerm = !job->postOnly;
   g.pending = std::move(job);
+}
+
+// A picture between: the corrected raster goes to the same place the true frame's went
+void between_task(wgpu::CommandEncoder& cmd) {
+  if (g.failed || !g.ready || !g.drawThis || !g.lastColor || !g.input || !g.termBetween)
+    return;
+  const wgpu::TexelCopyTextureInfo src{.texture = g.lastColor}, dst{.texture = g.input};
+  const wgpu::Extent3D size{.width = g.w, .height = g.h, .depthOrArrayLayers = 1};
+  cmd.CopyTextureToTexture(&src, &dst, &size);
+  g.first = cmd.Finish();
+  cmd = webgpu::g_device.CreateCommandEncoder();
+  g.pendingBetween = true;
 }
 
 void draw(const gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass, const void*, size_t, void*) {
@@ -1228,6 +1408,7 @@ bool submit_job(std::unique_ptr<Job> job) {
     g.draw = gfx::register_draw_type({.label = "ray traced picture", .draw = draw});
     gfx::g_beforeFrameSubmit = before_frame_submit;
     gfx::g_afterFrameSubmit = after_frame_submit;
+    gfx::g_betweenTask = between_task;
   }
   // from inside the command stream: these calls must not drain it
   const gx::fifo::HoldDrain hold;
@@ -1243,7 +1424,46 @@ bool submit_job(std::unique_ptr<Job> job) {
   return true;
 }
 
+// This picture's corrections for the rays' pass: a machine that shows on screen and is near enough to matter (tuned: 200 units; radius 6, as
+// the draws'), for how far away the machine's own pixels take this rule.
+void between_set(const redraw::Request& q, std::size_t index) {
+  constexpr float Reach = 200.f;
+  static const u32 iterations = static_cast<u32>(post_setting("AURORA_RT_BETWEEN_ITERATIONS", 3.f));
+  BetweenParams& b = g.betweenParams;
+  const redraw::Picture& p = q.pictures[index];
+  for (u32 r = 0; r < 3; ++r)
+    for (u32 k = 0; k < 4; ++k)
+      b.camera[r][k] = p.camera[4 * r + k];
+  b.iterations = iterations;
+  b.radius2 = 6.f * 6.f;
+  b.far_ = 20000.f;
+  b.count = 0;
+  for (u32 i = 0; i < redraw::MostMachines; ++i) {
+    if (!(q.machines & (1u << i)))
+      continue;
+    const auto& a = q.at[i];
+    if (a[2] > 3.f || a[0] * a[0] + a[1] * a[1] + a[2] * a[2] > Reach * Reach)
+      continue;
+    BetweenMachine& m = b.machine[b.count++];
+    for (u32 r = 0; r < 3; ++r)
+      for (u32 k = 0; k < 4; ++k)
+        m.m[r][k] = p.machine[i][4 * r + k];
+    m.at[0] = a[0], m.at[1] = a[1], m.at[2] = a[2], m.at[3] = 0;
+  }
+}
+
 void before_frame_submit() {
+  if (g.pendingBetween && !g.failed) {
+    g.pendingBetween = false;
+    begin_access(g.inputMem, g.input);
+    webgpu::g_queue.Submit(1, &g.first);
+    g.first = {};
+    end_access(g.inputMem, g.input);
+    run_between();
+    begin_access(g.outputMem, g.output);
+    g.outputOpen = true;
+    return;
+  }
   if (!g.pending || g.failed)
     return;
   begin_access(g.inputMem, g.input);

@@ -32,6 +32,7 @@ using webgpu::g_device;
 using webgpu::g_queue;
 
 void (*g_beforeFrameSubmit)() = nullptr;
+void (*g_betweenTask)(wgpu::CommandEncoder& cmd) = nullptr;
 void (*g_afterFrameSubmit)() = nullptr;
 
 namespace {
@@ -459,6 +460,11 @@ void encode_op_again(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameO
   case FrameOpType::TextureCopy:
     if (op.textureCopy != nullptr) {
       cmd.CopyTextureToTexture(&op.textureCopy->src, &op.textureCopy->dst, &op.textureCopy->size);
+    }
+    break;
+  case FrameOpType::EncoderTask:
+    if (g_betweenTask != nullptr) {
+      g_betweenTask(cmd);
     }
     break;
   default:

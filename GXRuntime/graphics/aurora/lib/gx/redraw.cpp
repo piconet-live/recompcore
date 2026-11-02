@@ -13,6 +13,8 @@
 #include "redraw.hpp"
 
 #include "../gfx/frame.hpp"
+#include "rt_capture.hpp"
+#include "rt_live.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -202,6 +204,8 @@ bool draw_picture(const Request& request, std::size_t index) {
     s_classifiedFor = &request;
   }
   const Picture& picture = request.pictures[index];
+  if (rt::g_live)
+    rt::live::between_set(request, index);
   const bool drawn = gfx::redraw_held([&](u8* uniforms, std::size_t bytes) {
     s_bytes = bytes;
     for (std::size_t k = 0; k < s_held.notes.size(); ++k) {

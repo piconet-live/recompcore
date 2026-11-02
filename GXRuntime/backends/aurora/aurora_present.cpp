@@ -252,7 +252,7 @@ struct State {
   std::uint64_t redraw_position = 0;
   std::atomic<std::uint64_t> redraw_generation{0};
   std::atomic<std::uint64_t> redraw_drawn{0}, redraw_stale{0};
-  std::uint64_t redraw_asked = 0, redraw_busy = 0, redraw_passed = 0, redraw_no_request = 0, redraw_far = 0;
+  std::uint64_t redraw_asked = 0, redraw_busy = 0, redraw_passed = 0, redraw_no_request = 0, redraw_far = 0, redraw_old = 0;
   std::atomic<double> redraw_cost_ms{2.0};
   double redraw_cost_sum = 0, redraw_cost_most = 0;
   std::uint64_t between_drawn = 0, between_late = 0, between_left_out = 0, between_out_true_waits = 0;  // Aurora's thread's
@@ -602,10 +602,15 @@ void run() {
         // A picture between when its moment comes; the next true frame always comes first.
         const auto now = Clock::now();
         if (!redraw_for) {
-          if (s->redraw_request && s->redraw_position >= redraw_frame_position) {
-            if (s->redraw_position - redraw_frame_position > kRedrawMostBurstsAfterCopy) {
+          // (the read position moves by whole passes of the FIFO, so a frame's can be a little past what was written at the tick)
+          if (s->redraw_request && s->redraw_position + kRedrawMostBurstsAfterCopy < redraw_frame_position) {
+            s->redraw_request.reset();  // a frame's before this one
+            ++s->redraw_old;
+          }
+          if (s->redraw_request) {
+            if (s->redraw_position > redraw_frame_position + kRedrawMostBurstsAfterCopy) {
+              // made after a list whose copy is still on its way: it waits for that frame
               ++s->redraw_far;
-              s->redraw_request.reset();
               redraw_frame = false;
               continue;
             }
@@ -654,9 +659,39 @@ void run() {
             return;
           }
           const auto began = Clock::now();
+          // AURORA_REDRAW_SHOTS=a,b,c (a test, in order): a picture between from each of those copies on, to a file
+          static const std::vector<std::uint64_t> shots = [] {
+            std::vector<std::uint64_t> out;
+            if (const char* v = std::getenv("AURORA_REDRAW_SHOTS"))
+              for (const char* at = v; *at != 0;) {
+                char* end = nullptr;
+                out.push_back(std::strtoull(at, &end, 10));
+                at = *end != 0 ? end + 1 : end;
+              }
+            return out;
+          }();
+          static std::size_t shots_taken = 0;  // each at the first picture from that copy on: a copy may have none
+          const bool shoot = !s->shot_prefix.empty() && shots_taken < shots.size() && copy >= shots[shots_taken];
+          if (shoot)
+            ++shots_taken;
+          if (shoot)
+            aurora_request_framebuffer_readback();
           if (!aurora::gx::redraw::draw_picture(*request, index))
             return;
           const auto done = Clock::now();
+          if (shoot) {
+            const std::uint8_t* rgba = nullptr;
+            u32 w = 0, h = 0;
+            for (int attempt = 0; attempt < 8000 && !aurora_take_framebuffer_readback(&rgba, &w, &h); ++attempt) {
+              aurora_pump_framebuffer_readback();
+              std::this_thread::sleep_for(std::chrono::microseconds(250));
+            }
+            if (rgba != nullptr) {
+              char path[64];
+              std::snprintf(path, sizeof path, "-between-%06llu-%zu.png", static_cast<unsigned long long>(copy), index);
+              write_png(s->shot_prefix + path, rgba, w, h);
+            }
+          }
           const double took = ms(done - began);
           s->redraw_cost_ms.store(s->redraw_cost_ms.load(std::memory_order_relaxed) * 0.9 + took * 0.1, std::memory_order_relaxed);
           s->redraw_cost_sum += took;
@@ -847,10 +882,10 @@ void run() {
     aurora::gfx::render_worker::synchronize();
     const auto c = aurora::gx::redraw::counts();
     const auto drawn = s->redraw_drawn.load();
-    std::fprintf(stderr, "[aurora-present] redraw: requests taken %llu, pictures drawn %llu (cost mean %.2f ms, most %.2f on the render worker), passed by the clock %llu, worker busy waits %llu, stale %llu, frames without a request %llu, request far from its frame %llu; classes per frame: world %.0f, machine %.0f, whole %.0f, icon %.0f, flat %.0f, offscreen %.0f; uniform bytes %llu; draws with a split matrix %llu\n",
+    std::fprintf(stderr, "[aurora-present] redraw: requests taken %llu, pictures drawn %llu (cost mean %.2f ms, most %.2f on the render worker), passed by the clock %llu, worker busy waits %llu, stale %llu, frames without a request %llu, request ahead of its frame %llu, older than its frame %llu; classes per frame: world %.0f, machine %.0f, whole %.0f, icon %.0f, flat %.0f, offscreen %.0f; uniform bytes %llu; draws with a split matrix %llu\n",
                  (unsigned long long)s->redraw_asked, (unsigned long long)drawn, drawn ? s->redraw_cost_sum / drawn : 0.0, s->redraw_cost_most,
                  (unsigned long long)s->redraw_passed, (unsigned long long)s->redraw_busy, (unsigned long long)s->redraw_stale.load(),
-                 (unsigned long long)s->redraw_no_request, (unsigned long long)s->redraw_far, c.frames ? double(c.world) / c.frames : 0.0,
+                 (unsigned long long)s->redraw_no_request, (unsigned long long)s->redraw_far, (unsigned long long)s->redraw_old, c.frames ? double(c.world) / c.frames : 0.0,
                  c.frames ? double(c.machine) / c.frames : 0.0, c.frames ? double(c.whole) / c.frames : 0.0, c.frames ? double(c.icon) / c.frames : 0.0,
                  c.frames ? double(c.flat) / c.frames : 0.0, c.frames ? double(c.offscreen) / c.frames : 0.0, (unsigned long long)c.uniformBytes, (unsigned long long)c.splits);
   }

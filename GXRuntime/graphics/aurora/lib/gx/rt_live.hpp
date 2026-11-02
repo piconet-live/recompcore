@@ -4,6 +4,7 @@
 #include "rt_motion.hpp"
 #include "rt_rules.hpp"
 #include "rt_scene.hpp"
+#include "redraw.hpp"
 
 #include <atomic>
 #include <future>
@@ -42,6 +43,7 @@ std::unique_ptr<Job> take_job();
 bool submit_job(std::unique_ptr<Job> job);
 void before_frame_submit();
 void after_frame_submit();
+void between_set(const redraw::Request& q, std::size_t index);
 bool failed() noexcept;
 bool look_on() noexcept;  // AURORA_LOOK_POST=1
 // The name Aurora's fault handler knows its own threads by

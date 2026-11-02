@@ -798,21 +798,80 @@ RWTexture2D<float4> Dest : register(u2);
 RWTexture2D<float> Expo : register(u3);
 SamplerState Edge : register(s1);
 
-float3 term_at(int2 c) {
-  float4 mid = Term[c];
+float3 term_of(Texture2D<float4> from, int2 c) {
+  float4 mid = from[c];
   float3 sum = mid.rgb;
   float weight = 1;
   static const int2 off[8] = {int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1), int2(1, 1), int2(-1, 1), int2(1, -1), int2(-1, -1)};
   for (int i = 0; i < 8; ++i) {
-    float4 o = Term[c + off[i]];
+    float4 o = from[c + off[i]];
     float w = (i < 4 ? 0.6 : 0.35) * saturate(1 - abs(o.a - mid.a) / max(mid.a * 0.02, 0.02));
     sum += o.rgb * w;
     weight += w;
   }
   return sum / weight;
 }
-// The frame is 8 bits, so all above white is lost: range is an estimate. Near-white with all channels high means clipped: bright light gets its range back, saturated paint at full value mostly does not.
-// Tuned: 0.8..1 where it starts, 0.5..1 how white, 0.35 what saturated colour keeps; P range the strength (AURORA_LOOK_RANGE).
+float3 term_at(int2 c) { return term_of(Term, c); }
+
+// Pictures between (AURORA_REDRAW with rays): light and reflections once per true frame, carried to each picture. Each pixel looks for the
+// true frame's pixel that lands on it: from a guess, that pixel's own hit distance gives its place in the true view; the place decides
+// its move (within a machine's radius of its place: that machine's correction, else the camera's), and the miss corrects the guess.
+struct BetweenMachine { float4 m[3]; float4 at; };
+struct BetweenParams {
+  float2 size, rectXY, rectWH, vpXY, vpWH, pScale, pOffset;
+  uint count, iterations;
+  float radius2, farAway, pad0, pad1;
+  float4 camera[3];
+  BetweenMachine machine[30];
+};
+ConstantBuffer<BetweenParams> BW : register(b3);
+[numthreads(8, 8, 1)]
+void between_warp(uint3 id : SV_DispatchThreadID) {
+  const float2 x = id.xy + 0.5;
+  float2 s = x;
+  int2 most = int2(BW.size) - 1;
+  for (uint n = 0; n < BW.iterations; ++n) {
+    float t = ReadA[clamp(int2(s), 0, most)].a;
+    float2 efb = BW.rectXY + s / BW.size * BW.rectWH;
+    float2 ndc = float2((efb.x - BW.vpXY.x) / BW.vpWH.x * 2 - 1, 1 - (efb.y - BW.vpXY.y) / BW.vpWH.y * 2);
+    float3 v = normalize(float3((ndc + BW.pOffset) / BW.pScale, -1));
+    float3 p = v * (t > 0 ? t : BW.farAway);
+    float4 m0 = BW.camera[0], m1 = BW.camera[1], m2 = BW.camera[2];
+    if (t > 0) {
+      float nearest = BW.radius2;
+      for (uint i = 0; i < BW.count; ++i) {
+        float3 d = p - BW.machine[i].at.xyz;
+        float d2 = dot(d, d);
+        if (d2 < nearest) { nearest = d2; m0 = BW.machine[i].m[0]; m1 = BW.machine[i].m[1]; m2 = BW.machine[i].m[2]; }
+      }
+    }
+    float4 h = float4(p, 1);
+    float3 q = float3(dot(m0, h), dot(m1, h), dot(m2, h));
+    if (q.z > -0.01) break;
+    float2 to = q.xy / -q.z * BW.pScale - BW.pOffset;
+    float2 e = BW.vpXY + float2((to.x + 1) / 2 * BW.vpWH.x, (1 - to.y) / 2 * BW.vpWH.y);
+    s += x - (e - BW.rectXY) / BW.rectWH * BW.size;
+  }
+  Dest[id.xy] = ReadA[clamp(int2(s), 0, most)];
+}
+[numthreads(8, 8, 1)]
+void between_hdr(uint3 id : SV_DispatchThreadID) {
+  int2 c = id.xy;
+  float3 shown = Raster[c].rgb + term_of(ReadB, c);
+  float most = max(shown.r, max(shown.g, shown.b)), least = min(shown.r, min(shown.g, shown.b));
+  float clip = smoothstep(0.8, 1.0, most) * (0.35 + 0.65 * smoothstep(0.5, 1.0, least));
+  Dest[c] = float4(pow(max(shown, 0), 2.2) * (1 + PP.range * clip * clip), 1);
+}
+[numthreads(8, 8, 1)]
+void between_compose(uint3 id : SV_DispatchThreadID) {
+  int2 c = id.xy;
+#if KEEP_RANGE
+  Final[c] = float4(max(Raster[c].rgb + term_of(ReadB, c), 0), 1);
+#else
+  Final[c] = float4(saturate(Raster[c].rgb + term_of(ReadB, c)), 1);
+#endif
+}
+
 [numthreads(8, 8, 1)]
 void hdr_in(uint3 id : SV_DispatchThreadID) {
   int2 c = id.xy;
