@@ -16,6 +16,7 @@
 #include "Common/Logging/LogManager.h"
 #include "Common/StringUtil.h"
 
+#include "DiscIO/Blob.h"
 #include "DiscIO/Filesystem.h"
 #include "DiscIO/Volume.h"
 #include "DiscIO/VolumeDisc.h"
