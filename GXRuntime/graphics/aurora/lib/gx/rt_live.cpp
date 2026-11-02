@@ -67,6 +67,7 @@ struct Params {
   // AURORA_RT_LIGHTING=1: the surface's light from rays (rt.hlsl lighting()). rays 0: off
   u32 lightRays;
   float skyGain, lightReach, bounce, visFloor;
+  u32 stableShine;  // AURORA_RT_SHINE_STABLE=1
 };
 
 constexpr u32 Frames = 3, SlotDescriptors = 12, MaxTextures = 8192, PostLevels = 6;
@@ -836,6 +837,8 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   p.lightShadow = shadow;
   p.bodyCalm = job.calm;
   p.wet = job.wet;
+  static const u32 stableShine = post_setting("AURORA_RT_SHINE_STABLE", 0.f) != 0.f ? 1 : 0;
+  p.stableShine = stableShine;
   p.skyFirst = fr.skyFirstVertex;
   p.glowCount = glowCount;
   p.glowGain = job.glow;

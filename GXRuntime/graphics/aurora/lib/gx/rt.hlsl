@@ -45,6 +45,7 @@ struct Params {
   float wet;
   uint lightRays;    // the surface's light from rays, this many a pixel; 0 off
   float skyGain, lightReach, bounce, visFloor;
+  uint stableShine;
 };
 struct Light { float3 pos; float3 colour; float reach; };
 struct GlowLight { float3 pos; float area; float3 colour; float radius; };
@@ -455,6 +456,8 @@ static const float MatGapLow = 0.45, MatGapHigh = 0.95; // own brightness agains
 static const float MatMatte = 0.2, MatPale = 0.1;      // how far Fresnel rises at a grazing view: any surface, and more if pale
 static const float MatLayerRise = 0.6;                  // how far Fresnel rises on a full reflection layer: the layer is already the game's own shine
 static const float MatMetal = 0.15;                      // base reflectance a full reflection layer adds to 0.04
+// AURORA_RT_SHINE_STABLE=1, tuned: the gap test reads the texture this many levels softer, so a dimple's lit rim doesn't take shine a pixel at a time; a reflection adds at most this share of the surface's own brightness (with a floor, so dark road still shows neon)
+static const float MatShineSofter = 1.5, MatAddMost = 0.8, MatAddFloor = 0.25;
 static const float MatMetalDim = 0.7;                   // how much of the surface a full layer gives up to its reflection, never all: no black chrome
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
@@ -526,7 +529,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         float3 around = shade(h, 4).rgb;
         float ownL = lum(own), aroundL = lum(around);
         // darker than the texture around it (a gap in a grating, a seam): no shine there
-        float shine = smoothstep(MatGapLow, MatGapHigh, ownL / max(aroundL, 0.02));
+        float shine = smoothstep(MatGapLow, MatGapHigh, (P.stableShine != 0 ? lum(shade(h, MatShineSofter).rgb) : ownL) / max(aroundL, 0.02));
         // bright and unsaturated, on the whole: its texture reads as specular
         float most = max(around.r, max(around.g, around.b)), least = min(around.r, min(around.g, around.b));
         float pale = smoothstep(0.5, 0.9, most) * (1 - saturate((most - least) / max(most, 0.02)));
@@ -561,6 +564,7 @@ void main(uint3 id : SV_DispatchThreadID) {
           float3 lit = max(seen - under, 0);
           float3 metal = tint * seen - MatMetalDim * under;
           term = fr * lerp(lit, metal, layer) * bareM;
+          if (P.stableShine != 0) term = min(term, max(lum(under), MatAddFloor) * MatAddMost);
         }
         break;
       }

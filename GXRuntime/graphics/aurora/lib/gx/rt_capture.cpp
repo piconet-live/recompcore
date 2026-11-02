@@ -35,6 +35,7 @@ bool g_neutral = false;
 bool g_gameLightOff = false;
 bool g_noVertexColour = false;
 bool g_gameLit[2]{};
+float g_ambientWarmth = 0.f;
 bool g_capturing = false;
 bool g_noHud = false;
 bool g_live = false;
@@ -216,6 +217,8 @@ void start() noexcept {
     s_at = std::strtoull(at, nullptr, 10);
   if (const char* v = std::getenv("AURORA_RT_GAME_LIGHT"); v != nullptr && v[0] == '0')
     g_gameLightOff = true;
+  if (const char* v = std::getenv("AURORA_RT_AMBIENT_WARMTH"))
+    g_ambientWarmth = static_cast<float>(std::atof(v));
   if (const char* v = std::getenv("AURORA_RT_DENOISE"); v != nullptr && v[0] == '1')
     s_motionOn = true;
   // with our own light: the rays' shadows stand in for the game's. AURORA_RT_GAME_SHADOW=1 keeps the game's
