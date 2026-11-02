@@ -585,21 +585,30 @@ Up up_at(int2 c, float dist, float3 N) {
 // a sharp texture's single bright grains (the game's LOD bias and the sampler's anisotropy, grains finer than the rays' own read) have darker grains
 // beside them, and the gate stays open there. Only the picture is read: any course, any texture. A glow's own edge loses r pixels to our light, and
 // a glow not much wider than 2r+1 pixels loses part of its own: on c25 r=2 cleared the road's bright patches but dimmed the lit tunnel pillars'
-// slots; r=1 cost them less and cleared about half the grains. Not yet the rule to ship: a mean over the area, not the darkest, is the next try.
+// slots; r=1 cost them less and cleared about half the grains. Not yet the rule to ship (GATE_MEAN below).
 #ifndef GATE_MIN
 #define GATE_MIN 0
 #endif
+// GATE_MEAN (AURORA_RT_GATE_MEAN=1 with GATE_MIN=r): the mean over that area, not the darkest. Grains average out to the surface's own colour; a glow a
+// few pixels wide keeps its core bright (the darkest took the dark wall beside a lit pillar's slot). On c25 the mean (5x5, 7x7) kept the pillars'
+// slots as the glow build has them, but left most of the road's sparkly streaks: there the raster's area is brighter than the surface's own colour
+// too. Neither alone is the rule; next try: shut where the darkest is far above the surface, or the mean is far above it by more than a grain can be.
+#ifndef GATE_MEAN
+#define GATE_MEAN 0
+#endif
 static const int GateMin = (int)(GATE_MIN + 0.5);
-// the raster's luminance at picture pixel c (Before when it holds the picture from before the last blends), the darkest within r around
-float darkest_seen(int2 c, float2 rasterDim, int r) {
-  float least = 1e9;
+// the raster's luminance at picture pixel c (Before when it holds the picture from before the last blends), the darkest within r around, or their mean
+float darkest_seen(int2 c, float2 rasterDim, int r, bool mean = false) {
+  float least = 1e9, sum = 0;
   const int2 top = int2(P.size) - 1;
   for (int y = -r; y <= r; ++y)
     for (int x = -r; x <= r; ++x) {
       const int2 p = clamp(c + int2(x, y), int2(0, 0), top);
-      least = min(least, lum((P.stableShine & 2) != 0 ? Before[p].rgb : Raster[int2((p + 0.5) * rasterDim / P.size)].rgb));
+      const float l = lum((P.stableShine & 2) != 0 ? Before[p].rgb : Raster[int2((p + 0.5) * rasterDim / P.size)].rgb);
+      least = min(least, l);
+      sum += l;
     }
-  return least;
+  return mean ? sum / ((2 * r + 1) * (2 * r + 1)) : least;
 }
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
@@ -699,7 +708,7 @@ void main(uint3 id : SV_DispatchThreadID) {
           hr.stretch = 1 / max(cosv, 0.05);
           gateL = lum(shade(hr, 0, false, true).rgb);
         }
-        const float seenL = GateMin > 0 ? darkest_seen(id.xy, rasterDim, GateMin) : lum((P.stableShine & 2) != 0 ? Before[id.xy].rgb : raster);
+        const float seenL = GateMin > 0 ? darkest_seen(id.xy, rasterDim, GateMin, GATE_MEAN != 0) : lum((P.stableShine & 2) != 0 ? Before[id.xy].rgb : raster);
         float bareM = 1 - smoothstep(0.15, 0.45, seenL - gateL);
         if (P.lightGain > 0 && (d.highlight & 4) == 0) light += engine_light(h.pos, N) * P.lightGain * bareM;
         if (P.glowGain > 0 && (d.highlight & 6) == 0) light += glow_light(h.pos, N) * P.glowGain * bareM;

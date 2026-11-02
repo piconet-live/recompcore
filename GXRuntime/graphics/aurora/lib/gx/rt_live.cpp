@@ -299,7 +299,9 @@ const std::vector<std::wstring>& shader_defines() {
                                          {"AURORA_RT_FLARE_SHOW", L"FLARE_SHOW", 0.f},   {"AURORA_RT_HOT_CORE_HALF", L"HOT_CORE_HALF", 1.f},
                                          {"AURORA_RT_GLOW_GAIN", L"GLOW_GAIN", 1.f},
                                          // the glow gate compares with the darkest raster pixel within this many (0: the one pixel; rt.hlsl GATE_MIN)
-                                         {"AURORA_RT_GATE_MIN", L"GATE_MIN", 0.f}};
+                                         {"AURORA_RT_GATE_MIN", L"GATE_MIN", 0.f},
+                                         // 1: that area's mean, not its darkest (rt.hlsl GATE_MEAN)
+                                         {"AURORA_RT_GATE_MEAN", L"GATE_MEAN", 0.f}};
     for (const auto& n : numbers) {
       const char* v = std::getenv(n.env);
       const float f = v != nullptr && v[0] != '\0' ? static_cast<float>(std::atof(v)) : n.otherwise;
