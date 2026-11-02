@@ -538,7 +538,7 @@ void run() {
             s_from_disc = false;
             ++s_disc_read;
           }
-          told = told_first = false;
+          told = false;
           continue;
         }
         if (walk_told && s_tiers[DiscFirst].empty() && waiting == 0) {
