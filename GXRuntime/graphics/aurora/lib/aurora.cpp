@@ -1,3 +1,4 @@
+#include "gfx/stagelog.hpp"
 #include <aurora/aurora.h>
 #include <aurora/time.hpp>
 
@@ -287,10 +288,10 @@ bool begin_frame() noexcept {
 void end_frame() noexcept {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
-  gx::fifo::drain();
+  { gfx::stagelog::Scope t{"drain"}; gx::fifo::drain(); }
   gx::fifo::end_frame();
   gx::texture::end_frame();
-  gfx::finish();
+  { gfx::stagelog::Scope t{"finish"}; gfx::finish(); }
   auto imguiDrawData = imgui::freeze();
   webgpu::PresentHook::Draw hookDraw;
   if (webgpu::present_hook().capture != nullptr) {
@@ -323,6 +324,7 @@ void end_frame() noexcept {
       if (window::is_presentable() && g_surface) {
         ZoneScopedN("Acquire texture");
         wgpu::SurfaceTexture surfaceTexture;
+        gfx::stagelog::Scope acquireTime{"acquire"};
         g_surface.GetCurrentTexture(&surfaceTexture);
         surfaceStatus = surfaceTexture.status;
         if (surfaceStatus == wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal) {
@@ -431,6 +433,7 @@ void end_frame() noexcept {
       ZoneScopedN("Queue Submit");
       if (gfx::g_beforeFrameSubmit != nullptr)
         gfx::g_beforeFrameSubmit();
+      gfx::stagelog::Scope submitTime{"submit"};
       g_queue.Submit(1, &buffer);
       if (gfx::g_afterFrameSubmit != nullptr)
         gfx::g_afterFrameSubmit();
@@ -448,6 +451,7 @@ void end_frame() noexcept {
       {
         window::SurfaceLock surfaceLock;
         if (window::is_presentable()) {
+          gfx::stagelog::Scope presentTime{"present"};
           status = g_surface.Present();
         }
       }

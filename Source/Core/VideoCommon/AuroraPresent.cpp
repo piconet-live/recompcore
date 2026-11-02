@@ -189,6 +189,17 @@ bool Load(const std::string& path)
   if (!s_module)
   {
     const std::wstring wide = UTF8ToWString(path);
+    // AURORA_DXC_FIRST=1: the shader compiler is loaded first and never freed, so it initialises before Dawn and
+    // detaches after it. Dawn would load it last, and at process exit a DXC object it still held was released after
+    // dxcompiler.dll had detached: DXC's own assert, a breakpoint at dxcompiler.dll+0x10750f. Dawn's load finds this one.
+    const char* const dxc_first = std::getenv("AURORA_DXC_FIRST");
+    if (dxc_first && dxc_first[0] == '1')
+    {
+      const size_t slash = wide.find_last_of(L"\\/");
+      const std::wstring dxc = (slash == std::wstring::npos ? std::wstring() : wide.substr(0, slash + 1)) + L"dxcompiler.dll";
+      const HMODULE loaded = LoadLibraryExW(dxc.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+      std::fprintf(stderr, "[aurora-present] dxcompiler.dll loaded first: %s\n", loaded ? "yes" : "no");
+    }
     // its own folder first for its DLLs (Dawn, SDL, the shader compiler beside it)
     s_module = LoadLibraryExW(wide.c_str(), nullptr,
                               LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);

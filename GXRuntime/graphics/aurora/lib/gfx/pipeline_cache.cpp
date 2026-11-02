@@ -1,3 +1,5 @@
+#include "../thread.hpp"
+#include "stagelog.hpp"
 #include "pipeline_cache.hpp"
 
 #include "clear.hpp"
@@ -531,6 +533,7 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallbac
   }
 
   if (blocking && !pipelineReady) {
+    stagelog::Scope t{"pipeline_block"};
     std::unique_lock lock{g_pipelineMutex};
     g_pipelineReadyCv.wait(lock, [=] { return g_pipelines.contains(runtimeKey) || g_pipelineThreadEnd; });
   }
@@ -1042,6 +1045,13 @@ static void pipeline_worker() {
       }
     }
     const bool wanted = wantedByDraw;
+    // AURORA_PIPELINE_QUIET=1: compiling ahead (thousands of forms all through a race) gives way to the game's threads; a draw's own at normal
+    static const bool quiet = [] {
+      const char* v = std::getenv("AURORA_PIPELINE_QUIET");
+      return v != nullptr && v[0] == '1';
+    }();
+    if (quiet)
+      thread::set_background(!wanted);
     const auto compileStart = std::chrono::steady_clock::now();
     auto result = pending.create();
     const auto compileEnd = std::chrono::steady_clock::now();
