@@ -220,6 +220,11 @@ void start() noexcept {
   if (const char* v = std::getenv("AURORA_RT_LOOK"); v != nullptr && v[0] == '1') {
     s_road = 1.4f, s_glow = 0.5f, s_calm = 0.3f, s_wet = 0.35f, s_machineCap = 0.9f, s_sceneryCap = 0.7f, s_machineGain = 3.f;
   }
+  // AURORA_RT_LOOK=2, the material rule: the game's own reflection layers stay in the raster, the rays only add (rt.hlsl, MatGapLow and on). The picture stays the rays-off picture, better lit.
+  if (const char* v = std::getenv("AURORA_RT_LOOK"); v != nullptr && v[0] == '2') {
+    g_neutral = false;
+    s_road = 0.f, s_glow = 0.5f, s_wet = -1.f, s_machineCap = 1.f, s_sceneryCap = 1.f, s_machineGain = 1.f;
+  }
   const auto setting = [](const char* name, float& to) {
     if (const char* v = std::getenv(name))
       to = static_cast<float>(std::atof(v));

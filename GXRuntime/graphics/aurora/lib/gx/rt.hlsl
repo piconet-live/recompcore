@@ -267,9 +267,8 @@ float3 glow_light(float3 pos, float3 N) {
 }
 // Tuned by eye, the material rule's numbers
 static const float MatGapLow = 0.45, MatGapHigh = 0.95; // own brightness against the texture around it: where shine starts and is full
-static const float MatMatte = 0.15, MatPale = 0.15;     // how far Fresnel rises at a grazing view: any surface, and more if pale
-static const float MatKeep = 0.8;                       // how much of the game's own layer stays beside the rays
-static const float MatMetal = 0.2;                      // base reflectance a full reflection layer adds to 0.04
+static const float MatMatte = 0.3, MatPale = 0.1;      // how far Fresnel rises at a grazing view: any surface, and more if pale
+static const float MatMetal = 0.25;                      // base reflectance a full reflection layer adds to 0.04
 static const float MatMetalDim = 0.5;                   // how much of the surface a full layer gives up to its reflection, never all: no black chrome
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
@@ -311,8 +310,8 @@ void main(uint3 id : SV_DispatchThreadID) {
       float k = d.strength;
       float cosv = saturate(-dot(N, v));
       if (P.wet < 0) {
-        // The material rule (AURORA_RT_WET < 0): one rule for every surface, from this draw's own layer and texture. Same game, better lit: a low
-        // Fresnel base, the surface's colour kept, and light only where a reflection is brighter than the surface. Tuned numbers: see MaterialTuned.
+        // The material rule (AURORA_RT_LOOK=2, signalled by a negative wet): one rule for every surface, from this draw's own layer and texture. The raster keeps
+        // the game's own reflection layers here, so it is the rays-off picture: same game, better lit. A low Fresnel base, and light only where a reflection is brighter than the surface.
         uint prim = q.CommittedInstanceID() + q.CommittedPrimitiveIndex();
         h.rate = uv_rates(prim);
         // a pixel's width at this hit, longer along a grazing view: the texture level the raster's own filtering would pick, so shine doesn't crawl
@@ -329,8 +328,6 @@ void main(uint3 id : SV_DispatchThreadID) {
         float gloss = lerp(MatMatte + MatPale * pale, 1, layer);
         float f0 = 0.04 + MatMetal * layer;
         float fr = (f0 + max(gloss - f0, 0) * pow(1 - cosv, 5)) * shine;
-        // the raster had the game's own reflection layers taken out (rt_capture.cpp neutralise), and they are much of its art: a tower's rust is one. Put back, from their own stages
-        float3 gameLayer = (fogged(d, h.pos, shade(h, 0, true).rgb) - fogged(d, h.pos, own)) * MatKeep;
         float bareM = 1 - smoothstep(0.15, 0.45, lum(raster) - ownL);
         if (P.lightGain > 0 && (d.highlight & 4) == 0) light += engine_light(h.pos, N) * P.lightGain * bareM;
         if (P.glowGain > 0 && (d.highlight & 6) == 0) light += glow_light(h.pos, N) * P.glowGain * bareM;
@@ -340,13 +337,12 @@ void main(uint3 id : SV_DispatchThreadID) {
           float3 R = reflect(v, N);
           float3 seen = trace_reflection(h.pos + N * 0.03, R, 8.0 / max(P.size.y, 1) * 512.0 / 4.0);
           seen = min(seen, 2.0);
-          float3 under = min(raster, own * 1.2) + max(gameLayer, 0);
+          float3 under = raster;
           float3 tint = lerp(1.xxx, own / max(most, 0.05), 0.5 * layer);
           float3 lit = max(seen - under, 0);
           float3 metal = tint * seen - MatMetalDim * under;
           term = fr * lerp(lit, metal, layer) * bareM;
         }
-        term += gameLayer * bareM;
         break;
       }
       float fres = pow(1 - cosv, 5);
