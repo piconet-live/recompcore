@@ -455,6 +455,8 @@ void end_frame() noexcept {
     if (canPresent && g_surface) {
       ZoneScopedN("Present");
       wgpu::ConvertibleStatus status = wgpu::Status::Error;
+      if (gfx::g_beforePresent != nullptr)
+        gfx::g_beforePresent();
       {
         window::SurfaceLock surfaceLock;
         if (window::is_presentable()) {
