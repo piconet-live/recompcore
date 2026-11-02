@@ -118,6 +118,10 @@ u16 wgpu_aniso(GXAnisotropy aniso) {
 }
 } // namespace
 
+u16 raster_anisotropy(const GXTexObj_& obj) noexcept {
+  return wgpu_filter_mode(obj.min_filter()).second == wgpu::MipmapFilterMode::Undefined ? 1 : wgpu_aniso(obj.max_aniso());
+}
+
 TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 format, ArrayRef<uint8_t> data,
                                     bool tlut, const char* label) noexcept {
   ZoneScoped;

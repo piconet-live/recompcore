@@ -6,6 +6,7 @@ struct Stage {
   uint aa, ab, ac, ad, aop, abias, ascale, aclamp, areg;
   uint kc, ka, swapTex, reflection;
   float4 k;
+  float lodBias, lodMin, lodMax, aniso;  // rt_format.hpp StageRec: the same stride
 };
 struct Draw {
   uint stages, firstStage;

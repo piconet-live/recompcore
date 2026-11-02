@@ -460,6 +460,13 @@ void translate(const Packet& st, DrawRec& d, Vertex* outVerts) noexcept {
     auto& s = d.stage[i];
     s.tc = g.texCoordId, s.map = g.texMapId;
     s.tex = g.texMapId != GX_TEXMAP_NULL ? add_texture(texSnaps[i]) : UINT32_MAX;
+    s.lodBias = 0.f, s.lodMin = 0.f, s.lodMax = 16.f, s.aniso = 1.f;
+    if (s.tex != UINT32_MAX) {
+      const GXTexObj_& o = texSnaps[i].obj;
+      const bool mips = o.min_filter() != GX_NEAR && o.min_filter() != GX_LINEAR;
+      s.lodBias = o.lod_bias(), s.lodMin = mips ? o.min_lod() : 0.f, s.lodMax = mips ? o.max_lod() : 0.f;
+      s.aniso = static_cast<float>(gfx::raster_anisotropy(o));
+    }
     s.ca = g.colorPass.a, s.cb = g.colorPass.b, s.cc = g.colorPass.c, s.cd = g.colorPass.d;
     s.cop = g.colorOp.op, s.cbias = g.colorOp.bias, s.cscale = g.colorOp.scale, s.cclamp = g.colorOp.clamp, s.creg = g.colorOp.outReg;
     s.aa = g.alphaPass.a, s.ab = g.alphaPass.b, s.ac = g.alphaPass.c, s.ad = g.alphaPass.d;

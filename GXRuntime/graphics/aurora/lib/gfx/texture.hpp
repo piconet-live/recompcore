@@ -131,6 +131,10 @@ struct GXTlutObj_ {
   void set_no_cache(bool value) noexcept { flags = value ? flags | 0x80 : flags & ~0x80; }
 };
 static_assert(sizeof(GXTlutObj_) <= sizeof(GXTlutObj), "GXTlutObj too small!");
+namespace aurora::gfx {
+// The anisotropy the raster's sampler gives this texture (TextureBind::get_descriptor), 1 where it has no mips: for the rays to read it at the raster's level
+u16 raster_anisotropy(const GXTexObj_& obj) noexcept;
+} // namespace aurora::gfx
 
 namespace aurora::gfx {
 struct TextureBind {

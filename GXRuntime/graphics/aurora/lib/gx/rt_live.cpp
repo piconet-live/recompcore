@@ -283,7 +283,9 @@ const std::vector<std::wstring>& shader_defines() {
   static const std::vector<std::wstring> defines = [] {
     // KEEP_RANGE: the rays' picture keeps what is above white, for the float display copy (hdr.hpp); otherwise cut as ever
     std::vector<std::wstring> d{webgpu::hdr::float_copy() ? L"KEEP_RANGE=1" : L"KEEP_RANGE=0", flare_on() ? L"FLARE=1" : L"FLARE=0",
-                                hot_core_on() ? L"HOT_CORE=1" : L"HOT_CORE=0"};
+                                hot_core_on() ? L"HOT_CORE=1" : L"HOT_CORE=0",
+                                // AURORA_RT_GATE_LEVEL=1 (off by default): the glow gate reads the surface at the raster's texture level (rt.hlsl GATE_LEVEL)
+                                env_one("AURORA_RT_GATE_LEVEL") ? L"GATE_LEVEL=1" : L"GATE_LEVEL=0"};
     // tuned by eye; what each means is at its use in rt.hlsl
     struct Number {
       const char* env;

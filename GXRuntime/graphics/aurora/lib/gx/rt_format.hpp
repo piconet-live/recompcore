@@ -18,6 +18,8 @@ struct StageRec {
   std::uint32_t kc, ka, swapTex;
   std::uint32_t reflection;  // 1 a reflection layer, 2 looked up by the normal but not a reflection (a highlight)
   float k[4];  // the stage's K colour and alpha selection resolved
+  // How the raster picks the texture's level: the game's LOD bias and clamps, the sampler's anisotropy (rt.hlsl shade, asRaster)
+  float lodBias, lodMin, lodMax, aniso;
 };
 struct DrawRec {
   float proj[16];

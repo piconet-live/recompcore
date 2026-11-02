@@ -6,6 +6,7 @@ struct Stage {
   uint aa, ab, ac, ad, aop, abias, ascale, aclamp, areg;
   uint kc, ka, swapTex, reflection;
   float4 k;
+  float lodBias, lodMin, lodMax, aniso;  // how the raster picks the texture's level (rt_format.hpp)
 };
 struct Draw {
   uint stages, firstStage;
@@ -139,7 +140,7 @@ float ain(uint i, float4 r[4], float4 tex, float4 ras, float4 k) {
 float bias_of(uint b) { return b == 1 ? 0.5 : b == 2 ? -0.5 : 0.0; }
 float scale_of(uint s) { return s == 1 ? 2.0 : s == 2 ? 4.0 : s == 3 ? 0.5 : 1.0; }
 
-struct Hit { float3 pos, nrm; float4 ras; float2 uv[4]; uint draw; float4 rate; float foot; };
+struct Hit { float3 pos, nrm; float4 ras; float2 uv[4]; uint draw; float4 rate; float foot; float stretch; };
 Hit fetch(uint prim, float2 bary) {
   Vertex a = Verts[prim * 3], b = Verts[prim * 3 + 1], c = Verts[prim * 3 + 2];
   float3 w = float3(1 - bary.x - bary.y, bary.x, bary.y);
@@ -153,6 +154,7 @@ Hit fetch(uint prim, float2 bary) {
   h.draw = a.draw;
   h.rate = 0;
   h.foot = 0;
+  h.stretch = 1;
   return h;
 }
 WorldMesh world_mesh(uint inst, uint geo) { return World[(inst & WorldMask) + geo]; }
@@ -196,8 +198,10 @@ float4 uv_rates(uint prim) {
   }
   return r;
 }
-// The game's own TEV stages at a hit, its reflection layers left out
-float4 shade(Hit h, float lod, bool layers = false) {
+// The game's own TEV stages at a hit, its reflection layers left out. asRaster (with a footprint): each texture at the level the raster's sampler picks,
+// h.foot a picture pixel's width across, h.stretch how much longer it runs along a grazing view: the longer axis over the sampler's anisotropy, or the
+// shorter, then the game's own LOD bias and clamps.
+float4 shade(Hit h, float lod, bool layers = false, bool asRaster = false) {
   Draw d = Draws[h.draw];
   float4 r[4];
   for (int i = 0; i < 4; ++i) r[i] = d.regs[i];
@@ -212,6 +216,10 @@ float4 shade(Hit h, float lod, bool layers = false) {
         uint tw, th;
         Tex[NonUniformResourceIndex(s.tex)].GetDimensions(tw, th);
         level = max(log2(max(h.rate[s.tc] * sqrt(float(tw) * th) * h.foot, 1e-3)), 0) + lod;
+        if (asRaster) {
+          const float across = h.rate[s.tc] * sqrt(float(tw) * th) * h.foot;
+          level = clamp(log2(max(max(across * max(h.stretch, 1) / max(s.aniso, 1), across), 1e-3)) + s.lodBias, s.lodMin, s.lodMax) + lod;
+        }
       }
       float4 t = Tex[NonUniformResourceIndex(s.tex)].SampleLevel(Linear, uv, level);
       uint sw = d.swap[s.swapTex & 3];
@@ -562,6 +570,16 @@ Up up_at(int2 c, float dist, float3 N) {
   return u;
 }
 #define UP_READ(tex, u) (tex[u.p[0]] * u.w[0] + tex[u.p[1]] * u.w[1] + tex[u.p[2]] * u.w[2] + tex[u.p[3]] * u.w[3])
+// GATE_LEVEL (AURORA_RT_GATE_LEVEL=1, off by default): the material rule keeps our light and reflection off a surface the raster shows far brighter
+// than the surface's own colour, a glow drawn over it (bareM in main). The own colour reads each texture at the footprint of a ray pixel (two picture
+// pixels with AURORA_RT_HALF), the same in both directions; the raster reads it with the game's LOD bias (-1, -2 on Sand Ocean's road and walls) and
+// the sampler's anisotropy, levels sharper. On a grainy texture the raster's bright grains and the sharp edges of its dark panels stood far above that
+// blurred colour: the gate shut grain by grain, in rectangles around the panels, and those pixels kept the raster's unlit brightness, bright speckled
+// patches on the road. With this the gate reads the surface at the raster's own level, from the draw's texture state: any texture with a LOD bias or
+// anisotropy, on any course. The rest of the material rule keeps its softer colour.
+#ifndef GATE_LEVEL
+#define GATE_LEVEL 0
+#endif
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
   float2 rasterDim;
@@ -652,7 +670,15 @@ void main(uint3 id : SV_DispatchThreadID) {
         float gloss = lerp(MatMatte + MatPale * pale, MatLayerRise, layer);
         float f0 = 0.04 + MatMetal * layer;
         float fr = (f0 + max(gloss - f0, 0) * pow(1 - cosv, 5)) * shine;
-        float bareM = 1 - smoothstep(0.15, 0.45, lum((P.stableShine & 2) != 0 ? Before[id.xy].rgb : raster) - ownL);
+        float gateL = ownL;
+        if (GATE_LEVEL) {
+          // the surface's own colour at the raster's texture level (a picture pixel, the game's LOD bias, the sampler's anisotropy): as sharp as the raster's
+          Hit hr = h;
+          hr.foot = t * 2 / max(abs(P.pScale.y) * rasterDim.y, 1);
+          hr.stretch = 1 / max(cosv, 0.05);
+          gateL = lum(shade(hr, 0, false, true).rgb);
+        }
+        float bareM = 1 - smoothstep(0.15, 0.45, lum((P.stableShine & 2) != 0 ? Before[id.xy].rgb : raster) - gateL);
         if (P.lightGain > 0 && (d.highlight & 4) == 0) light += engine_light(h.pos, N) * P.lightGain * bareM;
         if (P.glowGain > 0 && (d.highlight & 6) == 0) light += glow_light(h.pos, N) * P.glowGain * bareM;
         if (P.glowShow != 0 && (d.highlight & 2) != 0) { sum = float3(1, -1, 1); light = 0; break; }
