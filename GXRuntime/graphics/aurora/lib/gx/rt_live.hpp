@@ -1,6 +1,7 @@
 #pragma once
 // The live pass's face (AURORA_RT=1). See rt_live.cpp. Recording thread: submit_job at the frame's HUD; render worker: the two hooks
 // around the frame's submit.
+#include "rt_motion.hpp"
 #include "rt_rules.hpp"
 
 #include <atomic>
@@ -24,6 +25,7 @@ struct Job {
   std::promise<void> done;
   std::future<void> rules;
   Frame frame;
+  MotionResult motion;
   std::vector<LiveTexture> textures;
   float proj[16], viewport[4];
   float road, light, glow, calm, wet;

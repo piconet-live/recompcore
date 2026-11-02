@@ -75,6 +75,15 @@ struct PostParams {
 // The look's descriptors, after the textures': for good until the size changes. Each texture a read view, then a write view
 constexpr u32 PostDescriptors = 2 * (1 + PostLevels + PostLevels - 1) + 1;
 constexpr u32 PostFirst = Frames * SlotDescriptors + MaxTextures;
+// As rt.hlsl's DenoiseParams, one for each step of a frame
+struct DenoiseParams {
+  float prevScale[2], prevOffset[2], prevVpXY[2], prevVpWH[2];
+  float cam[3][4];
+  float alphaLeast, phiNormal, phiDepth, phiLight;
+  u32 step, reset, denoised, show;
+};
+constexpr u32 DenoiseSteps = 8, DenoiseViews = 12, DenoiseIterations = 4;
+constexpr u32 ConstantStride = 256;
 constexpr u32 ViewHdr = PostFirst, ViewDown = ViewHdr + 2, ViewUp = ViewDown + 2 * PostLevels, ViewExpo = ViewUp + 2 * (PostLevels - 1);
 
 struct Slot {
@@ -86,7 +95,9 @@ struct Slot {
     u64 size = 0;
     void* map = nullptr;
   } verts, draws, stages, lights, glows;
-  ComPtr<ID3D12Resource> blas[3], tlas, scratch, instances;
+  ComPtr<ID3D12Resource> blas[3], tlas, scratch, instances, constants;
+  void* constantsMap = nullptr;
+  Buf prevPos;
   u64 blasSize[3]{}, tlasSize = 0, scratchSize = 0;
   std::vector<ComPtr<ID3D12Resource>> keep;
   // what this slot's timings belong to, for the time log
@@ -103,7 +114,14 @@ struct State {
   ComPtr<ID3D12DescriptorHeap> heap;
   UINT inc = 0;
   ComPtr<ID3D12RootSignature> root;
-  ComPtr<ID3D12PipelineState> trace, compose;
+  ComPtr<ID3D12PipelineState> trace, compose, lightPass, temporal, atrous;
+  // Light across frames (AURORA_RT_DENOISE=1): textures for this frame and the last; a texture with its descriptors written per step
+  ComPtr<ID3D12Resource> guide[2], motion, noisyOpen, noisySky, histOpen[2], histSky[2], moments[2], tmpOpen[2], tmpSky[2];
+  u32 flip = 0;
+  float prevProj[16]{}, prevViewport[4]{};
+  u64 lastLitCopy = 0;
+  bool historyGood = false;
+  double msLight = 0, msDenoise = 0, motionAgree = 0, motionOwn = 0;
   // The picture's look (AURORA_LOOK_POST=1): high range, bloom chain down and up, exposure, tone curve
   ComPtr<ID3D12PipelineState> hdrIn, bloomDown, bloomUp, exposure, tone;
   ComPtr<ID3D12Resource> hdrRes, downRes[PostLevels], upRes[PostLevels - 1], expoRes;
@@ -232,7 +250,7 @@ void init_device() {
   g.event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
   D3D12_DESCRIPTOR_HEAP_DESC hd{};
   hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-  hd.NumDescriptors = Frames * SlotDescriptors + MaxTextures + PostDescriptors;
+  hd.NumDescriptors = Frames * SlotDescriptors + MaxTextures + PostDescriptors + Frames * DenoiseSteps * DenoiseViews;
   hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   RT_HR(g.dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g.heap)));
   g.inc = g.dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -243,7 +261,7 @@ void init_device() {
   }
   D3D12_QUERY_HEAP_DESC qd{};
   qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-  qd.Count = 4 * Frames;
+  qd.Count = 6 * Frames;
   RT_HR(g.dev->CreateQueryHeap(&qd, IID_PPV_ARGS(&g.queries)));
   g.queryResult = make_buffer(D3D12_HEAP_TYPE_READBACK, 8 * qd.Count, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
   RT_HR(g.queue->GetTimestampFrequency(&g.gpuTicks));
@@ -265,7 +283,9 @@ void init_device() {
   auto traceCs = compile(comp.Get(), L"main"), composeCs = compile(comp.Get(), L"compose");
   auto hdrCs = compile(comp.Get(), L"hdr_in"), downCs = compile(comp.Get(), L"bloom_down"), upCs = compile(comp.Get(), L"bloom_up"),
        expoCs = compile(comp.Get(), L"exposure"), toneCs = compile(comp.Get(), L"tone");
-  if (!traceCs || !composeCs || !hdrCs || !downCs || !upCs || !expoCs || !toneCs)
+  auto lightCs = compile(comp.Get(), L"light_pass"), temporalCs = compile(comp.Get(), L"temporal"), atrousCs = compile(comp.Get(), L"atrous");
+  if (!lightCs || !temporalCs || !atrousCs ||
+      !traceCs || !composeCs || !hdrCs || !downCs || !upCs || !expoCs || !toneCs)
     return fail("the shader does not compile");
 
   D3D12_DESCRIPTOR_RANGE1 r1[2]{};
@@ -276,6 +296,16 @@ void init_device() {
   r1[1].NumDescriptors = 2;
   r1[1].OffsetInDescriptorsFromTableStart = 8;
   r1[1].Flags = r1[0].Flags;
+  D3D12_DESCRIPTOR_RANGE1 rd[2]{};
+  rd[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  rd[0].NumDescriptors = 1;
+  rd[0].BaseShaderRegister = 10;
+  rd[0].Flags = r1[0].Flags;
+  rd[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  rd[1].NumDescriptors = DenoiseViews - 1;
+  rd[1].BaseShaderRegister = 4;
+  rd[1].OffsetInDescriptorsFromTableStart = 1;
+  rd[1].Flags = r1[0].Flags;
   D3D12_DESCRIPTOR_RANGE1 r2{};
   r2.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
   r2.NumDescriptors = UINT_MAX;
@@ -288,7 +318,7 @@ void init_device() {
     one[i].BaseShaderRegister = i < 2 ? 8 + i : i;  // t8, t9, u2, u3
     one[i].Flags = r1[0].Flags;
   }
-  D3D12_ROOT_PARAMETER1 rp[8]{};
+  D3D12_ROOT_PARAMETER1 rp[10]{};
   rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   rp[0].Constants.Num32BitValues = sizeof(Params) / 4;
   rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -305,6 +335,12 @@ void init_device() {
     rp[4 + i].DescriptorTable.NumDescriptorRanges = 1;
     rp[4 + i].DescriptorTable.pDescriptorRanges = &one[i];
   }
+  rp[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  rp[8].DescriptorTable.NumDescriptorRanges = 2;
+  rp[8].DescriptorTable.pDescriptorRanges = rd;
+  rp[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+  rp[9].Descriptor.ShaderRegister = 2;
+  rp[9].Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE;
   D3D12_STATIC_SAMPLER_DESC ss[2]{};
   ss[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
   ss[0].AddressU = ss[0].AddressV = ss[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -315,7 +351,7 @@ void init_device() {
   ss[1].AddressU = ss[1].AddressV = ss[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
   D3D12_VERSIONED_ROOT_SIGNATURE_DESC rs{};
   rs.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
-  rs.Desc_1_1.NumParameters = 8;
+  rs.Desc_1_1.NumParameters = 10;
   rs.Desc_1_1.pParameters = rp;
   rs.Desc_1_1.NumStaticSamplers = 2;
   rs.Desc_1_1.pStaticSamplers = ss;
@@ -333,7 +369,7 @@ void init_device() {
   RT_HR(g.dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.trace)));
   pd.CS = {composeCs->GetBufferPointer(), composeCs->GetBufferSize()};
   RT_HR(g.dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.compose)));
-  const std::pair<ComPtr<ID3D12PipelineState>*, IDxcBlob*> posts[] = {{&g.hdrIn, hdrCs.Get()}, {&g.bloomDown, downCs.Get()}, {&g.bloomUp, upCs.Get()}, {&g.exposure, expoCs.Get()}, {&g.tone, toneCs.Get()}};
+  const std::pair<ComPtr<ID3D12PipelineState>*, IDxcBlob*> posts[] = {{&g.hdrIn, hdrCs.Get()}, {&g.bloomDown, downCs.Get()}, {&g.bloomUp, upCs.Get()}, {&g.exposure, expoCs.Get()}, {&g.tone, toneCs.Get()}, {&g.lightPass, lightCs.Get()}, {&g.temporal, temporalCs.Get()}, {&g.atrous, atrousCs.Get()}};
   for (const auto& [pso, cs] : posts) {
     pd.CS = {cs->GetBufferPointer(), cs->GetBufferSize()};
     RT_HR(g.dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(pso->GetAddressOf())));
@@ -342,7 +378,7 @@ void init_device() {
     g.timeLog = std::fopen(path, "wb");
     if (g.timeLog != nullptr) {
       std::setvbuf(g.timeLog, nullptr, _IOLBF, 4096);
-      std::fprintf(g.timeLog, "copy,build_ms,rays_ms,compose_ms,tris,lights,uploads\n");
+      std::fprintf(g.timeLog, "copy,build_ms,light_ms,denoise_ms,reflect_ms,compose_ms,tris,lights,uploads\n");
     }
   }
   g.ready = true;
@@ -378,6 +414,13 @@ ComPtr<ID3D12Resource> shared_texture(u32 w, u32 h, DXGI_FORMAT fmt, D3D12_RESOU
   return r;
 }
 
+bool denoise_on() {
+  static const bool on = [] {
+    const char* v = std::getenv("AURORA_RT_DENOISE");
+    return v != nullptr && v[0] == '1';
+  }();
+  return on;
+}
 bool post_on() {
   static const bool on = [] {
     const char* v = std::getenv("AURORA_LOOK_POST");
@@ -465,6 +508,20 @@ void make_targets(u32 w, u32 h, wgpu::TextureFormat format) {
   d.SampleDesc.Count = 1;
   d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
   RT_HR(g.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&g.termRes)));
+  if (denoise_on()) {
+    const auto make = [&](ComPtr<ID3D12Resource>& r, DXGI_FORMAT fmt) {
+      d.Format = fmt;
+      if (FAILED(g.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&r))))
+        fail("no texture for light across frames");
+    };
+    constexpr DXGI_FORMAT F16 = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    make(g.motion, F16), make(g.noisyOpen, F16), make(g.noisySky, F16);
+    for (u32 i = 0; i < 2; ++i) {
+      make(g.guide[i], DXGI_FORMAT_R32G32B32A32_FLOAT);
+      make(g.histOpen[i], F16), make(g.histSky[i], F16), make(g.moments[i], F16), make(g.tmpOpen[i], F16), make(g.tmpSky[i], F16);
+    }
+    g.historyGood = false;
+  }
   if (post_on())
     make_post_targets(w, h);
   if (g.failed)
@@ -620,6 +677,9 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   if (fr.stages.empty())
     fr.stages.push_back({});
   stage(s, s.verts, fr.verts.data(), fr.verts.size() * sizeof(Vertex));
+  const bool lit = denoise_on() && fr.prevPos.size() == fr.verts.size() * 3;
+  if (lit)
+    stage(s, s.prevPos, fr.prevPos.data(), fr.prevPos.size() * sizeof(float));
   stage(s, s.draws, fr.draws.data(), fr.draws.size() * sizeof(GpuDraw));
   stage(s, s.stages, fr.stages.data(), fr.stages.size() * sizeof(StageRec));
   stage(s, s.lights, fr.lights.data(), fr.lights.size() * sizeof(EngineLight));
@@ -678,7 +738,7 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   bd.ScratchAccelerationStructureData = s.scratch->GetGPUVirtualAddress() + scratchAt;
   cl->BuildRaytracingAccelerationStructure(&bd, 0, nullptr);
   cl->ResourceBarrier(1, &uav);
-  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 4 * g.slot + 1);
+  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot + 1);
 
   D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
   sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -743,9 +803,102 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   static const u32 glowShow = std::getenv("AURORA_RT_GLOW_SHOW") != nullptr ? 1 : 0;
   p.glowShow = glowShow;
   cl->SetComputeRoot32BitConstants(0, sizeof(Params) / 4, &p, 0);
+  // Each step's constants and textures: a slot's own descriptors, written as it goes
+  if (!s.constants) {
+    s.constants = make_buffer(D3D12_HEAP_TYPE_UPLOAD, ConstantStride * DenoiseSteps, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    RT_HR(s.constants->Map(0, nullptr, &s.constantsMap));
+  }
+  DenoiseParams dp{};
+  const u32 denoiseFirst = PostFirst + PostDescriptors + g.slot * DenoiseSteps * DenoiseViews;
+  u32 stepAt = 0;
+  // A step's textures by the order of rt.hlsl's registers u4 on; a null where it reads nothing
+  const auto bind = [&](std::initializer_list<ID3D12Resource*> uavs) {
+    const u32 at = denoiseFirst + stepAt * DenoiseViews;
+    D3D12_SHADER_RESOURCE_VIEW_DESC pv{};
+    pv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    pv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    pv.Format = DXGI_FORMAT_UNKNOWN;
+    pv.Buffer.NumElements = lit ? static_cast<u32>(fr.verts.size()) : 1;
+    pv.Buffer.StructureByteStride = 12;
+    g.dev->CreateShaderResourceView(lit ? s.prevPos.gpu.Get() : nullptr, &pv, cpuh(at));
+    u32 k = 1;
+    for (ID3D12Resource* r : uavs) {
+      D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+      uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+      uv.Format = r != nullptr ? r->GetDesc().Format : DXGI_FORMAT_R16G16B16A16_FLOAT;
+      g.dev->CreateUnorderedAccessView(r, nullptr, &uv, cpuh(at + k++));
+    }
+    for (; k < DenoiseViews; ++k) {
+      D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+      uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+      uv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+      g.dev->CreateUnorderedAccessView(nullptr, nullptr, &uv, cpuh(at + k));
+    }
+    std::memcpy(static_cast<u8*>(s.constantsMap) + size_t(stepAt) * ConstantStride, &dp, sizeof dp);
+    cl->SetComputeRootDescriptorTable(8, gpuh(at));
+    cl->SetComputeRootConstantBufferView(9, s.constants->GetGPUVirtualAddress() + u64(stepAt) * ConstantStride);
+    ++stepAt;
+  };
+  const auto barrier = [&] {
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    cl->ResourceBarrier(1, &b);
+  };
+  static const float alphaLeast = post_setting("AURORA_RT_DENOISE_ALPHA", 0.1f), phiNormal = post_setting("AURORA_RT_DENOISE_PHI_N", 32.f),
+                     phiDepth = post_setting("AURORA_RT_DENOISE_PHI_Z", 1.f), phiLight = post_setting("AURORA_RT_DENOISE_PHI_L", 4.f);
+  static const u32 show = static_cast<u32>(post_setting("AURORA_RT_SHOW", 0.f));
+  dp.alphaLeast = alphaLeast, dp.phiNormal = phiNormal, dp.phiDepth = phiDepth, dp.phiLight = phiLight;
+  dp.prevScale[0] = g.prevProj[0], dp.prevScale[1] = g.prevProj[5], dp.prevOffset[0] = g.prevProj[2], dp.prevOffset[1] = g.prevProj[6];
+  for (u32 i = 0; i < 2; ++i)
+    dp.prevVpXY[i] = g.prevViewport[i], dp.prevVpWH[i] = g.prevViewport[2 + i];
+  std::memcpy(dp.cam, job.motion.prevFromCur.m, sizeof dp.cam);
+  dp.reset = !g.historyGood || !job.motion.known || job.copy > g.lastLitCopy + 4 ? 1 : 0;
+  ID3D12Resource* litOpen = nullptr;
+  ID3D12Resource* litSky = nullptr;
+  const u32 now = g.flip, old = g.flip ^ 1;
+  if (lit && p.lightRays > 0) {
+    dp.denoised = 1;
+    bind({g.guide[now].Get(), g.motion.Get(), g.noisyOpen.Get(), g.noisySky.Get()});
+    cl->SetPipelineState(g.lightPass.Get());
+    cl->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
+    barrier();
+    cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot + 2);
+    bind({g.guide[now].Get(), g.motion.Get(), g.noisyOpen.Get(), g.noisySky.Get(), g.guide[old].Get(), g.histOpen[old].Get(), g.histSky[old].Get(), g.moments[old].Get(),
+          g.tmpOpen[0].Get(), g.tmpSky[0].Get(), g.moments[now].Get()});
+    cl->SetPipelineState(g.temporal.Get());
+    cl->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
+    barrier();
+    // the first step's result is the next frame's history; then back and forth
+    ID3D12Resource* fromO = g.tmpOpen[0].Get();
+    ID3D12Resource* fromS = g.tmpSky[0].Get();
+    cl->SetPipelineState(g.atrous.Get());
+    for (u32 i = 0; i < DenoiseIterations; ++i) {
+      ID3D12Resource* toO = i == 0 ? g.histOpen[now].Get() : g.tmpOpen[i & 1].Get();
+      ID3D12Resource* toS = i == 0 ? g.histSky[now].Get() : g.tmpSky[i & 1].Get();
+      dp.step = 1u << i;
+      bind({g.guide[now].Get(), nullptr, fromO, fromS, nullptr, nullptr, nullptr, nullptr, toO, toS});
+      cl->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
+      barrier();
+      fromO = toO, fromS = toS;
+    }
+    litOpen = fromO, litSky = fromS;
+    g.historyGood = true;
+    g.lastLitCopy = job.copy;
+    g.flip = old;
+  } else {
+    cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot + 2);
+  }
+  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot + 3);
+  std::memcpy(g.prevProj, job.proj, sizeof g.prevProj);
+  std::memcpy(g.prevViewport, job.viewport, sizeof g.prevViewport);
+  dp.show = lit ? show : 0;
+  // AURORA_RT_SHOW=4: the raw rays in the place of the smoothed
+  if (show == 4 && lit) litOpen = g.noisyOpen.Get(), litSky = g.noisySky.Get();
+  bind({lit ? g.guide[now].Get() : nullptr, lit ? g.motion.Get() : nullptr, litOpen, litSky, nullptr, nullptr, nullptr, lit ? g.moments[now].Get() : nullptr});
   cl->SetPipelineState(g.trace.Get());
   cl->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
-  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 4 * g.slot + 2);
+  barrier();
+  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot + 4);
 }
 
 // The look: the frame's high range, a bloom chain, exposure, the tone curve. On the frame's own queue: no frame waits for it.
@@ -821,16 +974,18 @@ void run_rays(Job& job) {
   // this slot's last timings, now done
   if (s.fence != 0) {
     u64* ts = nullptr;
-    const D3D12_RANGE range{8 * 4 * g.slot, 8 * 4 * (g.slot + 1)};
+    const D3D12_RANGE range{8 * 6 * g.slot, 8 * 6 * (g.slot + 1)};
     if (SUCCEEDED(g.queryResult->Map(0, &range, reinterpret_cast<void**>(&ts)))) {
-      const double k = 1000.0 / g.gpuTicks, all = double(ts[4 * g.slot + 3] - ts[4 * g.slot]) * k;
+      const u64* t6 = ts + 6 * g.slot;
+      const double k = 1000.0 / g.gpuTicks, all = double(t6[5] - t6[0]) * k;
+      const double build = double(t6[1] - t6[0]) * k, lightMs = double(t6[2] - t6[1]) * k, denoiseMs = double(t6[3] - t6[2]) * k, reflectMs = double(t6[4] - t6[3]) * k, composeMs = double(t6[5] - t6[4]) * k;
       g.msGpu += all;
       g.msGpuMost = std::max(g.msGpuMost, all);
-      g.msTrace += double(ts[4 * g.slot + 2] - ts[4 * g.slot + 1]) * k;
+      g.msTrace += reflectMs;
+      g.msLight += lightMs, g.msDenoise += denoiseMs;
       // AURORA_RT_TIMELOG=<file>: a line a frame, to find one slow frame by its copy and what it carried
       if (g.timeLog != nullptr)
-        std::fprintf(g.timeLog, "%llu,%.3f,%.3f,%.3f,%u,%u,%u\n", static_cast<unsigned long long>(s.copy), double(ts[4 * g.slot + 1] - ts[4 * g.slot]) * k,
-                     double(ts[4 * g.slot + 2] - ts[4 * g.slot + 1]) * k, double(ts[4 * g.slot + 3] - ts[4 * g.slot + 2]) * k, s.tris, s.lightCount, s.uploads);
+        std::fprintf(g.timeLog, "%llu,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%u\n", static_cast<unsigned long long>(s.copy), build, lightMs, denoiseMs, reflectMs, composeMs, s.tris, s.lightCount, s.uploads);
       g.queryResult->Unmap(0, nullptr);
     }
   }
@@ -841,7 +996,7 @@ void run_rays(Job& job) {
   ID3D12GraphicsCommandList4* cl = s.cl.Get();
   ID3D12DescriptorHeap* heaps[] = {g.heap.Get()};
   cl->SetDescriptorHeaps(1, heaps);
-  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 4 * g.slot);
+  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot);
   auto& fr = job.frame;
   const u32 base = g.slot * SlotDescriptors;
   u32 glowCount = 0;
@@ -865,8 +1020,9 @@ void run_rays(Job& job) {
   cl->SetComputeRootDescriptorTable(1, gpuh(base));
   cl->SetComputeRootDescriptorTable(2, gpuh(Frames * SlotDescriptors));
   if (job.postOnly) {
-    cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 4 * g.slot + 1);
-    cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 4 * g.slot + 2);
+    cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot + 1);
+    for (u32 q = 2; q < 5; ++q)
+      cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot + q);
   } else {
     trace_part(s, job, base, glowCount);
     if (g.failed)
@@ -890,8 +1046,8 @@ void run_rays(Job& job) {
   }
   std::swap(tb.Transition.StateBefore, tb.Transition.StateAfter);
   cl->ResourceBarrier(1, &tb);
-  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 4 * g.slot + 3);
-  cl->ResolveQueryData(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 4 * g.slot, 4, g.queryResult.Get(), 8 * 4 * g.slot);
+  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot + 5);
+  cl->ResolveQueryData(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot, 6, g.queryResult.Get(), 8 * 6 * g.slot);
   RT_HR(cl->Close());
   ID3D12CommandList* lists[] = {cl};
   g.queue->ExecuteCommandLists(1, lists);
@@ -900,6 +1056,7 @@ void run_rays(Job& job) {
 
   g.msComposeWait += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   g.msBuild += job.captureMs;
+  g.motionAgree += job.motion.agreeing, g.motionOwn += job.motion.matched;
   g.msRules += job.rulesMs;
   g.glowPieces += fr.glowPieces, g.glowDraws += fr.glowDraws, g.glowTop += fr.glowTopDraw;
   g.picks += job.lightPicks, g.merged += job.mergedLights, g.glowsSeen += glowCount;
@@ -913,9 +1070,11 @@ void run_rays(Job& job) {
   }();
   if (++g.count == every) {
     const double n = g.count;
+    std::fprintf(stderr, "[rt] lit: light rays %.2f ms, smoothing %.2f ms, reflections %.2f ms; motion: camera agreed %.2f of what was compared, %.2f of vertices known by their own bytes\n", g.msLight / n, g.msDenoise / n, g.msTrace / n, g.motionAgree / n, g.motionOwn / n);
     std::fprintf(stderr, "[rt] per frame, %u frames at %ux%u: GPU build %.2f ms and rays+cleanup %.2f ms (all %.2f, worst %.2f); CPU in the stream %.2f ms, translation beside it %.2f ms, rules %.2f ms, worker %.2f ms; %.0f triangles, lights %.1f (most %llu), picks %.1f, merged %.1f, glows %.1f from %.0f pieces of %.1f draws, one draw held most %.1f\n",
-                 g.count, g.w, g.h, (g.msGpu - g.msTrace) / n, g.msTrace / n, g.msGpu / n, g.msGpuMost, g.msBuild / n, g.msTranslate / n, g.msRules / n, g.msComposeWait / n, double(g.tris) / n, double(g.lightsSeen) / n,
+                 g.count, g.w, g.h, (g.msGpu - g.msTrace - g.msLight - g.msDenoise) / n, g.msTrace / n, g.msGpu / n, g.msGpuMost, g.msBuild / n, g.msTranslate / n, g.msRules / n, g.msComposeWait / n, double(g.tris) / n, double(g.lightsSeen) / n,
                  static_cast<unsigned long long>(g.lightsMost), g.picks / n, g.merged / n, g.glowsSeen / n, g.glowPieces / n, g.glowDraws / n, g.glowTop / n);
+    g.msLight = g.msDenoise = g.motionAgree = g.motionOwn = 0;
     g.count = 0, g.msGpuMost = 0, g.msGpu = g.msTrace = g.msBuild = g.msRules = g.msTranslate = g.msComposeWait = 0, g.tris = 0, g.lightsSeen = 0, g.lightsMost = 0, g.picks = g.merged = g.glowsSeen = g.glowPieces = g.glowDraws = g.glowTop = 0;
   }
 }

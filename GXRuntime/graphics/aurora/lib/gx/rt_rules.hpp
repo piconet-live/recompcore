@@ -162,8 +162,10 @@ struct Tuning {
   const float (*texMeans)[4] = nullptr;
   std::uint32_t texCount = 0, maxGlows = 64, glowPerDraw = 0;  // glowPerDraw: most lights one draw may hold, 0 no limit
   float glowAddBright = 0.25f, glowBright = 0.75f, glowColourful = 0.4f;
+  const float* prevPos = nullptr;  // motion data, three floats a vertex in the order of verts: kept beside the frame's vertices (rt_motion.hpp)
 };
 struct Frame {
+  std::vector<float> prevPos;       // each of verts in the last frame's view space, with motion data on
   std::vector<Vertex> verts;        // solid surfaces first, then what light passes through (see-through, glows), then the sky
   std::uint32_t seeFirstVertex = 0, skyFirstVertex = 0;
   std::vector<GpuDraw> draws;
@@ -278,7 +280,7 @@ inline void build_glows(const DrawRec* draws, std::uint32_t count, const Vertex*
 // The main view is the perspective projection with the most triangles. Sky: the largest see-through shells around the view,
 // by size against the largest in the frame, with no table of courses.
 inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex* verts, const Tuning& t, Frame& out) {
-  out.verts.clear(), out.draws.clear(), out.stages.clear(), out.main = nullptr, out.machineDraws = out.reflective = 0, out.seeFirstVertex = out.skyFirstVertex = 0;
+  out.verts.clear(), out.prevPos.clear(), out.draws.clear(), out.stages.clear(), out.main = nullptr, out.machineDraws = out.reflective = 0, out.seeFirstVertex = out.skyFirstVertex = 0;
   const auto key = [](const DrawRec& d) { return std::array<int, 2>{static_cast<int>(d.proj[0] * 1000), static_cast<int>(d.proj[5] * 1000)}; };
   std::array<int, 2> best{};
   {
@@ -407,6 +409,8 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
       if (extent[i] <= 0.f || group != pass)
         continue;
       out.verts.insert(out.verts.end(), verts + draws[i].firstVertex, verts + draws[i].firstVertex + draws[i].vertices);
+      if (t.prevPos != nullptr)
+        out.prevPos.insert(out.prevPos.end(), t.prevPos + size_t(draws[i].firstVertex) * 3, t.prevPos + size_t(draws[i].firstVertex + draws[i].vertices) * 3);
     }
   }
 }

@@ -63,6 +63,26 @@ Texture2D<float4> Term : register(t6);
 StructuredBuffer<GlowLight> Glows : register(t7);
 Texture2D<float4> Tex[] : register(t0, space1);
 SamplerState Linear : register(s0);
+// Light across frames (AURORA_RT_DENOISE=1): see light_pass, temporal, atrous below
+struct DenoiseParams {
+  float2 prevScale, prevOffset, prevVpXY, prevVpWH;
+  float4 cam[3];    // this frame's view space to the last frame's
+  float alphaLeast, phiNormal, phiDepth, phiLight;
+  uint step, reset, denoised, show;
+};
+ConstantBuffer<DenoiseParams> DP : register(b2);
+StructuredBuffer<float3> PrevPos : register(t10);
+RWTexture2D<float4> Guide : register(u4);    // normal (2), distance along -z, sun term; -1 there: takes no light. Distance 0: nothing there
+RWTexture2D<float4> Motion : register(u5);   // to the last frame's pixel (2), the distance it had then, how much it may smear (1 yes, 0 no: from the draw). Orthographic draws (HUD, text, portraits) are drawn after all this and never enter it
+RWTexture2D<float4> ReadOpen : register(u6);  // bounce (3), open
+RWTexture2D<float4> ReadSky : register(u7);   // sky seen (3), variance
+RWTexture2D<float4> GuideOld : register(u8);
+RWTexture2D<float4> OldOpen : register(u9);
+RWTexture2D<float4> OldSky : register(u10);
+RWTexture2D<float4> OldMoments : register(u11);
+RWTexture2D<float4> WriteOpen : register(u12);
+RWTexture2D<float4> WriteSky : register(u13);
+RWTexture2D<float4> WriteMoments : register(u14);  // mean, mean of squares, frames of history, 0
 
 uint rng_next(inout uint s) { s = s * 747796405u + 2891336453u; uint w = ((s >> ((s >> 28) + 4)) ^ s) * 277803737u; return (w >> 22) ^ w; }
 float rnd(inout uint s) { return rng_next(s) / 4294967296.0; }
@@ -269,56 +289,66 @@ float3 glow_light(float3 pos, float3 N) {
 }
 // Tuned by eye: what counts as a strong source (brightest channel), how much of the sky's hue tints the sky level, the most light a surface can take
 static const float LitStrongLow = 0.5, LitStrongHigh = 0.9, LitSkyTint = 0.4, LitMost = 1.25;
-// The surface's light from rays (AURORA_RT_LIGHTING=rays): sun x N.L x one shadow ray + sky x how much of the surroundings it sees + what it sees, as bounce. Returned as a factor on the picture: 1 is today's level.
-// A hit counts as closed by distance, all of it near and nothing at lightReach, so a far wall leaves the open track as it is. Glows and additive draws are seen through, adding their light. Reach, floor, gains tuned.
-float3 lighting(float3 pos, float3 N, float dist, inout uint seed) {
+// Tuned: the most one ray can bring, so one lucky ray at a bright source doesn't sparkle
+static const float LitRayMost = 2.0;
+// What the rays bring a surface: how open it is, what it sees as bounce, what it sees of the sky. xi: the first ray's place in the hemisphere, the rest follow by a fixed sequence.
+// A hit counts as closed by distance, all of it near and nothing at lightReach, so a far wall leaves the open track as it is. Glows and additive draws are seen through, adding their light. Reach tuned.
+void light_rays(float3 pos, float3 N, float dist, float2 xi, out float open, out float3 bounce, out float3 skySeen) {
   float3 T = normalize(abs(N.y) < 0.9 ? cross(N, float3(0, 1, 0)) : cross(N, float3(1, 0, 0))), B = cross(N, T);
   float3 org = pos + N * (0.03 + dist * 0.0005);
-  float open = 0;
-  float3 bounce = 0, skySeen = 0;
+  open = 0, bounce = 0, skySeen = 0;
   for (uint r = 0; r < P.lightRays; ++r) {
-    float u = rnd(seed), a = rnd(seed) * 6.28318;
+    float u = frac(xi.x + r * 0.7548777), a = frac(xi.y + r * 0.5698403) * 6.28318;
     float3 dir = normalize(T * (cos(a) * sqrt(u)) + B * (sin(a) * sqrt(u)) + N * sqrt(max(1 - u, 0)));
     float through = 1, tmin = 0.02;
+    float3 rayBounce = 0, raySky = 0;
     bool ended = false;
     for (int i = 0; i < 4 && !ended; ++i) {
       RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
       RayDesc ray; ray.Origin = org; ray.Direction = dir; ray.TMin = tmin; ray.TMax = 100000;
       q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskSeen, ray);
       q.Proceed();
-      if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) { skySeen += through * sky_along(dir, 3.0); break; }
+      if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) { raySky += through * sky_along(dir, 3.0); break; }
       float t = q.CommittedRayT();
       Hit h = fetch(q.CommittedInstanceID() + q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
       Draw d = Draws[h.draw];
       tmin = t + 0.02;
       if (d.cls == 3) continue;
       float4 c = shade(h, 3.0);
-      if (d.cls == 2) { bounce += through * c.rgb * saturate(c.a); continue; }
-      if (d.cls == 1) { float al = saturate(c.a); bounce += through * c.rgb * al; through *= 1 - al; continue; }
+      if (d.cls == 2) { rayBounce += through * c.rgb * saturate(c.a); continue; }
+      if (d.cls == 1) { float al = saturate(c.a); rayBounce += through * c.rgb * al; through *= 1 - al; continue; }
       // a bright surface lights from any distance, whatever else is near closes only within reach; so lava lights what faces it from far away
       float near = t / P.lightReach, closed = saturate(1 - near * near);
       float most = max(c.r, max(c.g, c.b)), strong = smoothstep(LitStrongLow, LitStrongHigh, most);
-      bounce += through * c.rgb * max(closed, strong);
+      rayBounce += through * c.rgb * max(closed, strong);
       through *= 1 - closed;
       ended = true;
     }
     open += through;
+    bounce += min(rayBounce, LitRayMost.xxx);
+    skySeen += min(raySky, LitRayMost.xxx);
   }
   open /= P.lightRays, bounce /= P.lightRays, skySeen /= P.lightRays;
+}
+// The sun on this point: N.L x one shadow ray. No random choice: no noise to smooth.
+float sun_term(float3 pos, float3 N, float dist) {
+  Light sun = Lights[P.lightCount];
+  float ndl = saturate(dot(N, sun.pos));
+  if (ndl <= 0 || dot(sun.colour, 1.xxx) <= 0) return 0;
+  RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
+  RayDesc ray; ray.Origin = pos + N * (0.03 + dist * 0.0005); ray.Direction = sun.pos; ray.TMin = 0.02; ray.TMax = 100000;
+  q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskSolid, ray);
+  q.Proceed();
+  return q.CommittedStatus() != COMMITTED_TRIANGLE_HIT ? ndl : 0;
+}
+// sun x N.L x shadow + sky x how much of the surroundings it sees + what it sees, as bounce. A factor on the picture: 1 is today's level. Floor and gains tuned.
+float3 lit_factor(float open, float3 bounce, float3 skySeen, float sunTerm) {
   // the surroundings' own colour, from all these rays saw (sky, lava, neon, walls), by hue alone: their brightness stays the sky gain's. A shaded face in a lava pit is warm, without a table
   float3 seen = skySeen + bounce;
   float seenL = lum(seen);
   float3 skyTint = seenL > 0.02 ? clamp(seen / seenL, 0, 2.5) : 1.xxx;
   float3 result = P.skyGain * max(open, P.visFloor) * lerp(1.xxx, skyTint, LitSkyTint) + P.bounce * bounce;
-  Light sun = Lights[P.lightCount];
-  float ndl = saturate(dot(N, sun.pos));
-  if (ndl > 0 && dot(sun.colour, 1.xxx) > 0) {
-    RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
-    RayDesc ray; ray.Origin = org; ray.Direction = sun.pos; ray.TMin = 0.02; ray.TMax = 100000;
-    q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskSolid, ray);
-    q.Proceed();
-    if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) result += sun.colour * ndl;
-  }
+  result += Lights[P.lightCount].colour * sunTerm;
   return min(result, LitMost);
 }
 // Tuned by eye, the material rule's numbers
@@ -389,7 +419,18 @@ void main(uint3 id : SV_DispatchThreadID) {
         if (P.lightGain > 0 && (d.highlight & 4) == 0) light += engine_light(h.pos, N) * P.lightGain * bareM;
         if (P.glowGain > 0 && (d.highlight & 6) == 0) light += glow_light(h.pos, N) * P.glowGain * bareM;
         if (P.glowShow != 0 && (d.highlight & 2) != 0) { sum = float3(1, -1, 1); light = 0; break; }
-        if (P.lightRays > 0 && (d.highlight & 6) == 0) light += (lighting(h.pos, N, t, seed) - 1) * bareM;
+        if (P.lightRays > 0 && (d.highlight & 6) == 0) {
+          float3 f;
+          if (DP.denoised != 0) {
+            float4 a = ReadOpen[id.xy], b = ReadSky[id.xy];
+            f = lit_factor(a.a, a.rgb, b.rgb, Guide[id.xy].w);
+          } else {
+            float open; float3 bounce, skySeen;
+            light_rays(h.pos, N, t, float2(rnd(seed), rnd(seed)), open, bounce, skySeen);
+            f = lit_factor(open, bounce, skySeen, sun_term(h.pos, N, t));
+          }
+          light += (f - 1) * bareM;
+        }
         if (P.mode == 2) { dbg += fr.xxx; break; }
         if (fr > 0.002) {
           float3 R = reflect(v, N);
@@ -449,10 +490,165 @@ void main(uint3 id : SV_DispatchThreadID) {
   Out[id.xy] = float4(P.mode == 1 ? refl + lit : raster + refl + lit, 1);
 }
 
+float2 oct_of(float3 n) {
+  float2 p = n.xy / (abs(n.x) + abs(n.y) + abs(n.z));
+  return n.z >= 0 ? p : (1 - abs(p.yx)) * float2(p.x >= 0 ? 1 : -1, p.y >= 0 ? 1 : -1);
+}
+float3 normal_of(float2 e) {
+  float3 n = float3(e, 1 - abs(e.x) - abs(e.y));
+  if (n.z < 0) n.xy = (1 - abs(n.yx)) * float2(n.x >= 0 ? 1 : -1, n.y >= 0 ? 1 : -1);
+  return normalize(n);
+}
+float noise_at(float2 p) { return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715)))); }
+// The first pass of light across frames: where each pixel's surface is, where it was, the sun, and the rays' raw light
+[numthreads(8, 8, 1)]
+void light_pass(uint3 id : SV_DispatchThreadID) {
+  float2 px = id.xy + 0.5;
+  float2 efb = P.rectXY + px / P.size * P.rectWH;
+  float2 ndc = float2((efb.x - P.vpXY.x) / P.vpWH.x * 2 - 1, 1 - (efb.y - P.vpXY.y) / P.vpWH.y * 2);
+  float3 v = normalize(float3((ndc + P.pOffset) / P.pScale, -1));
+  float tmin = 0.01;
+  Guide[id.xy] = float4(0, 0, 0, -1);
+  ReadOpen[id.xy] = 0;
+  ReadSky[id.xy] = 0;
+  // nothing there: only the camera moved it
+  float3 pp = float3(dot(DP.cam[0], float4(v, 0)), dot(DP.cam[1], float4(v, 0)), dot(DP.cam[2], float4(v, 0))) * 10000;
+  float3 prevAt = pp;
+  float prevZ = 0, smear = 1;
+  for (int i = 0; i < 8; ++i) {
+    RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
+    RayDesc ray; ray.Origin = 0; ray.Direction = v; ray.TMin = tmin; ray.TMax = 100000;
+    q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskSeen, ray);
+    q.Proceed();
+    if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) break;
+    float t = q.CommittedRayT();
+    uint prim = q.CommittedInstanceID() + q.CommittedPrimitiveIndex();
+    float2 bary = q.CommittedTriangleBarycentrics();
+    Hit h = fetch(prim, bary);
+    Draw d = Draws[h.draw];
+    if (d.cls >= 2) { tmin = t + 0.02; continue; }
+    if (d.cls == 1 && d.strength <= 0 && shade(h, 0).a < 0.5) { tmin = t + 0.02; continue; }
+    float3 N = h.nrm;
+    if (dot(N, v) > 0) N = -N;
+    float3 w = float3(1 - bary.x - bary.y, bary.x, bary.y);
+    prevAt = PrevPos[prim * 3] * w.x + PrevPos[prim * 3 + 1] * w.y + PrevPos[prim * 3 + 2] * w.z;
+    prevZ = -prevAt.z;
+    // a draw outside the depth is drawn over the world: it stays sharp
+    smear = (d.highlight & 4) != 0 ? 0 : 1;
+    float sunV = -1;
+    if ((d.highlight & 6) == 0) {
+      float2 xi = float2(noise_at(id.xy) + P.frame * 0.7548777, noise_at(id.xy + float2(47, 17)) + P.frame * 0.5698403);
+      float open; float3 bounce, skySeen;
+      light_rays(h.pos, N, t, xi, open, bounce, skySeen);
+      ReadOpen[id.xy] = float4(bounce, open);
+      ReadSky[id.xy] = float4(skySeen, 0);
+      sunV = sun_term(h.pos, N, t);
+    }
+    Guide[id.xy] = float4(oct_of(N), -h.pos.z, sunV);
+    break;
+  }
+  // where this point was in the last frame's picture, as the last frame's projection and viewport draw it
+  float2 pn = DP.prevScale * (prevAt.xy / max(-prevAt.z, 1e-3)) - DP.prevOffset;
+  float2 pe = float2((pn.x + 1) * 0.5 * DP.prevVpWH.x + DP.prevVpXY.x, (1 - pn.y) * 0.5 * DP.prevVpWH.y + DP.prevVpXY.y);
+  float2 pp2 = (pe - P.rectXY) / P.rectWH * P.size;
+  Motion[id.xy] = float4(pp2 - px, prevZ, smear);
+}
+// A surface's light as last frame left it: what lands on the same surface there, by where it was (bilinear, each of the four kept only if it is the same surface).
+// History is short at this game's speed, so a pixel with little of it lets atrous blur it harder. Tuned: 1% + the local slope in distance, normal 0.7, alphaLeast.
+[numthreads(8, 8, 1)]
+void temporal(uint3 id : SV_DispatchThreadID) {
+  int2 c = id.xy;
+  float4 g = Guide[c];
+  float4 inO = ReadOpen[c], inS = ReadSky[c];
+  float l = inO.a + lum(inO.rgb);
+  if (g.z <= 0 || g.w < 0) { WriteOpen[c] = inO; WriteSky[c] = float4(inS.rgb, 0); WriteMoments[c] = float4(l, l * l, 0, 0); return; }
+  float3 n = normal_of(g.xy);
+  float4 m = Motion[c];
+  float slope = max(abs(Guide[c + int2(1, 0)].z - g.z), abs(Guide[c + int2(0, 1)].z - g.z));
+  slope = min(slope, g.z * 0.25);
+  float tol = g.z * 0.01 + slope * 2 + abs(m.z - g.z) * 0.02;
+  float2 at = c + 0.5 + m.xy - 0.5, f = frac(at);
+  int2 b = int2(floor(at));
+  float4 oldO = 0, oldS = 0, oldM = 0;
+  float sum = 0;
+  uint w0, h0;
+  Guide.GetDimensions(w0, h0);
+  if (DP.reset == 0)
+    for (int k = 0; k < 4; ++k) {
+      int2 o = int2(k & 1, k >> 1), p = b + o;
+      if (p.x < 0 || p.y < 0 || p.x >= int(w0) || p.y >= int(h0)) continue;
+      float4 q = GuideOld[p];
+      if (q.z <= 0 || q.w < 0 || abs(q.z - m.z) > tol || dot(normal_of(q.xy), n) < 0.7) continue;
+      float wk = (o.x ? f.x : 1 - f.x) * (o.y ? f.y : 1 - f.y) + 1e-4;
+      oldO += OldOpen[p] * wk, oldS += OldSky[p] * wk, oldM += OldMoments[p] * wk;
+      sum += wk;
+    }
+  if (sum < 1e-3) {
+    WriteOpen[c] = inO; WriteSky[c] = float4(inS.rgb, 1); WriteMoments[c] = float4(l, l * l, 0, 0);
+    return;
+  }
+  oldO /= sum, oldS /= sum, oldM /= sum;
+  float age = oldM.z + 1;
+  float alpha = max(1 / (age + 1), DP.alphaLeast);
+  float m1 = lerp(oldM.x, l, alpha), m2 = lerp(oldM.y, l * l, alpha);
+  // little history: variance unknown, taken as large, so atrous spreads it
+  float variance = age < 4 ? 1.0 / age : max(m2 - m1 * m1, 0);
+  WriteOpen[c] = lerp(oldO, inO, alpha);
+  WriteSky[c] = float4(lerp(oldS.rgb, inS.rgb, alpha), variance);
+  WriteMoments[c] = float4(m1, m2, min(age, 64), 0);
+}
+// A wavelet step: a 3x3 at DP.step apart, kept to the same surface by normal and distance; light only joins what is near it, by how uncertain it is (variance). Tuned: phiNormal, phiDepth, phiLight.
+[numthreads(8, 8, 1)]
+void atrous(uint3 id : SV_DispatchThreadID) {
+  int2 c = id.xy;
+  float4 g = Guide[c];
+  float4 mo = ReadOpen[c], ms = ReadSky[c];
+  if (g.z <= 0 || g.w < 0) { WriteOpen[c] = mo; WriteSky[c] = ms; return; }
+  uint w0, h0;
+  Guide.GetDimensions(w0, h0);
+  float3 n = normal_of(g.xy);
+  float lc = mo.a + lum(mo.rgb);
+  float slope = max(abs(Guide[c + int2(1, 0)].z - g.z), abs(Guide[c + int2(0, 1)].z - g.z));
+  slope = min(slope, g.z * 0.25);
+  float sigma = DP.phiLight * sqrt(max(ms.a, 0)) + 0.01;
+  float4 so = 0;
+  float3 ss = 0;
+  float weight = 0, varSum = 0, varW = 0;
+  for (int y = -1; y <= 1; ++y)
+    for (int x = -1; x <= 1; ++x) {
+      int2 p = c + int2(x, y) * int(DP.step);
+      if (p.x < 0 || p.y < 0 || p.x >= int(w0) || p.y >= int(h0)) continue;
+      float4 q = Guide[p];
+      if (q.z <= 0 || q.w < 0) continue;
+      float4 o = ReadOpen[p], s = ReadSky[p];
+      float k = (x == 0 ? 0.5 : 0.25) * (y == 0 ? 0.5 : 0.25);
+      float dist = length(float2(x, y)) * DP.step;
+      float wz = exp(-abs(q.z - g.z) / (DP.phiDepth * (g.z * 0.01 + slope * dist) + 1e-3));
+      float wn = pow(saturate(dot(normal_of(q.xy), n)), DP.phiNormal);
+      float wl = exp(-abs(o.a + lum(o.rgb) - lc) / sigma);
+      float wk = k * wz * wn * wl;
+      so += o * wk, ss += s.rgb * wk;
+      weight += wk;
+      varSum += s.a * wk * wk, varW += wk;
+    }
+  WriteOpen[c] = so / max(weight, 1e-5);
+  WriteSky[c] = float4(ss / max(weight, 1e-5), varSum / max(varW * varW, 1e-8));
+}
+
 // Live: one ray a pixel, so the term is noisy and its edges jagged: a small cross, kept to the same surface by depth, then over the raster
 [numthreads(8, 8, 1)]
 void compose(uint3 id : SV_DispatchThreadID) {
   int2 c = id.xy;
+  // AURORA_RT_SHOW: what the light across frames sees. 1 motion (how far a pixel moved), 2 history (black none, white full), 3 the light alone, smoothed, 4 the same raw
+  if (DP.show != 0) {
+    float4 m = Motion[c], s = OldMoments[c], a = ReadOpen[c], b = ReadSky[c], g = Guide[c];
+    float3 o = 0;
+    if (DP.show == 1) o = float3(abs(m.xy) / 64, g.z <= 0 ? 0.5 : 0);
+    else if (DP.show == 2) o = (s.z / 16).xxx;
+    else if (DP.show == 3 || DP.show == 4) o = g.w < 0 ? float3(0.1, 0, 0.1) : lit_factor(a.a, a.rgb, b.rgb, g.w) * 0.6;
+    Final[c] = float4(o, 1);
+    return;
+  }
   float4 mid = Term[c];
   float3 sum = mid.rgb;
   float weight = 1;

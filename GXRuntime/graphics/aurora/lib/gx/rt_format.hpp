@@ -32,6 +32,10 @@ struct DrawRec {
   float fogColour[4];
   // An additive draw's light, as the draw itself says: where (a line's first vertex, else the middle), how big, colour, brightness
   float lightPos[3], lightExtent, lightColour[3], lightBright;
+  // What motion data knows a draw by, its own bytes: raw list and arrays (rt_motion.hpp); its one matrix, when it has just one
+  std::uint64_t motionKey;
+  float motionMtx[12];
+  std::uint32_t motionSingle;
   StageRec stage[16];
 };
 // A draw's lighting as the stream set it, kept beside the draw (AURORA_RT_LIGHTFACTS only)

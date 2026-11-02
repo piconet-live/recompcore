@@ -39,6 +39,7 @@ bool g_noHud = false;
 bool g_live = false;
 bool g_hook = false;
 static bool s_seenPerspective = false;
+static bool s_motionOn = false;  // AURORA_RT_DENOISE=1: motion data from the draws (rt_motion.hpp)
 
 bool skip_draw() noexcept {
   if (g_gxState.projType == GX_PERSPECTIVE) {
@@ -213,6 +214,8 @@ void start() noexcept {
     s_at = std::strtoull(at, nullptr, 10);
   if (const char* v = std::getenv("AURORA_RT_GAME_LIGHT"); v != nullptr && v[0] == '0')
     g_gameLightOff = true;
+  if (const char* v = std::getenv("AURORA_RT_DENOISE"); v != nullptr && v[0] == '1')
+    s_motionOn = true;
   if (const char* v = std::getenv("AURORA_RT_VERTEX_COLOUR"); v != nullptr && v[0] == '0')
     g_noVertexColour = true;
   const char* noHud = std::getenv("AURORA_RT_NO_HUD");
@@ -288,7 +291,7 @@ struct Packet {
   u32 drawSlot, vertSlot, drawIndex, firstVertex;
   GXPrimitive prim;
   u16 vtxCount;
-  u32 rawOffset, stagesOffset, mtxOffset, mtxCount, lightsOffset;
+  u32 rawOffset, rawBytes, stagesOffset, mtxOffset, mtxCount, lightsOffset;
   decltype(GXState::proj) proj;
   decltype(GXState::logicalViewport) logicalViewport;
   decltype(GXState::projType) projType;
@@ -347,6 +350,33 @@ void translate(const Packet& st, DrawRec& d, Vertex* outVerts) noexcept {
   d.viewport[4] = vp.znear, d.viewport[5] = vp.zfar;
   d.projType = st.projType;
   d.stages = st.numTevStages;
+  if (s_motionOn) {
+    // the draw's own bytes and where its arrays are: the same list of the same model next frame has the same key
+    std::uint64_t h = 0xcbf29ce484222325ull ^ (static_cast<std::uint64_t>(prim) << 32 | vtxCount);
+    const auto mix = [&h](std::uint64_t w) {
+      h = (h ^ w) * 0x9E3779B97F4A7C15ull;
+      h ^= h >> 29;
+    };
+    size_t at = 0;
+    for (; at + 8 <= st.rawBytes; at += 8) {
+      std::uint64_t w;
+      std::memcpy(&w, vertices + at, 8);
+      mix(w);
+    }
+    std::uint64_t w = 0;
+    std::memcpy(&w, vertices + at, st.rawBytes - at);
+    mix(w);
+    for (const auto& a : st.arrays)
+      mix(reinterpret_cast<std::uintptr_t>(a.data));
+    d.motionKey = h | 1;
+    d.motionSingle = st.mtxCount == 1 ? 1 : 0;
+    if (st.mtxCount == 1) {
+      const auto& m = pnMtx[0].pos;
+      const Vec4<float>* rows[3] = {&m.m0, &m.m1, &m.m2};
+      for (int r = 0; r < 3; ++r)
+        d.motionMtx[r * 4] = rows[r]->x(), d.motionMtx[r * 4 + 1] = rows[r]->y(), d.motionMtx[r * 4 + 2] = rows[r]->z(), d.motionMtx[r * 4 + 3] = rows[r]->w();
+    }
+  }
   d.blendMode = st.blendMode, d.blendSrc = st.blendFacSrc, d.blendDst = st.blendFacDst;
   d.depthUpdate = st.depthUpdate, d.depthCompare = st.depthCompare, d.cull = st.cullMode, d.colorUpdate = st.colorUpdate;
   d.prim = prim, d.vtxCount = vtxCount;
@@ -848,6 +878,16 @@ void run_rules(live::Job& j) {
     tuning.texMeans = s_texAvg;
     tuning.texCount = MostTexAvg;
   }
+  if (s_motionOn) {
+    static std::mutex lock;
+    static MotionTracker tracker;
+    static thread_local std::vector<float> prev;
+    {
+      std::lock_guard l{lock};
+      tracker.step(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, j.copy, prev, j.motion);
+    }
+    tuning.prevPos = prev.data();
+  }
   build_frame(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, tuning, j.frame);
   smooth_lights(j.frame);
   j.drawable = j.frame.main != nullptr && !j.frame.verts.empty();
@@ -1056,7 +1096,7 @@ static void make_packet(u8* room, const size_t size, const u32 stages, const u32
   if (lit)
     std::memcpy(room + at, st.lights.data(), sizeof(Light) * GX::MaxLights);
   at += lit ? sizeof(Light) * GX::MaxLights : 0;
-  p.rawOffset = static_cast<u32>(at);
+  p.rawOffset = static_cast<u32>(at), p.rawBytes = rawBytes;
   std::memcpy(room + at, vertices, rawBytes);
 }
 
