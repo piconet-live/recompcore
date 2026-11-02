@@ -382,7 +382,6 @@ void before_present() {
     return;
   }
   const long long want = g_last_slot + 1;
-  ++g_shifted;
   const long long begin = g.start(want);
   const long long until = std::min(begin, t + period);
   const auto due = now + std::chrono::nanoseconds(until - t);
@@ -414,6 +413,7 @@ void before_present() {
   const auto end = Clock::now();
   ++g_held;
   g_let_go += let_go ? 1 : 0;
+  g_shifted += let_go ? 0 : 1;  // held to the next refresh's start
   g_last_hold_ms = std::chrono::duration<double, std::milli>(end - now).count();
   g_held_ms += g_last_hold_ms;
   g_last_slot = std::max(want, g.slot(std::chrono::duration_cast<std::chrono::nanoseconds>(end.time_since_epoch()).count()));
@@ -1184,7 +1184,7 @@ void run() {
                  static_cast<unsigned long long>(s->between_left_out),
                  static_cast<unsigned long long>(s->between_out_true_waits));
   if (pace::g_mode != 0)
-    std::fprintf(stderr, "[aurora-present] pace: pictures between held %llu (%.2f ms on average, %llu let go for a true frame), on time or late %llu, moved past an earlier present %llu\n",
+    std::fprintf(stderr, "[aurora-present] pace: pictures between held %llu (%.2f ms on average, %llu let go for a true frame), its refresh free %llu, held to the next refresh %llu\n",
                  static_cast<unsigned long long>(pace::g_held), pace::g_held ? pace::g_held_ms / static_cast<double>(pace::g_held) : 0.0,
                  static_cast<unsigned long long>(pace::g_let_go), static_cast<unsigned long long>(pace::g_on_time),
                  static_cast<unsigned long long>(pace::g_shifted));
