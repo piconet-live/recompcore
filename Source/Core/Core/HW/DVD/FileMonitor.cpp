@@ -18,6 +18,7 @@
 
 #include "DiscIO/Filesystem.h"
 #include "DiscIO/Volume.h"
+#include "DiscIO/VolumeDisc.h"
 
 #include "VideoCommon/AuroraPresent.h"
 
