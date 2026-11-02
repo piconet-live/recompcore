@@ -890,6 +890,30 @@ void note_sun_light(const Light& li, const M& mtx) {
     v /= len;
   n.draws = 1;
 }
+// and the draws with normals whose normal matrix turns them other than their position matrix does (by more than 5 degrees), lit or not
+u32 s_nrmDraws = 0, s_nrmOff = 0, s_nrmOffLit = 0, s_nrmOffVerts = 0;
+float s_nrmWorst = 0.f;
+template <typename P>
+void note_normal_matrix(const P& m, bool lit, u32 verts) {
+  const auto& a = m.pos;
+  const auto& b = m.nrm;
+  const float pa[3][3] = {{a.m0.x(), a.m0.y(), a.m0.z()}, {a.m1.x(), a.m1.y(), a.m1.z()}, {a.m2.x(), a.m2.y(), a.m2.z()}};
+  const float pb[3][3] = {{b.m0.x(), b.m0.y(), b.m0.z()}, {b.m1.x(), b.m1.y(), b.m1.z()}, {b.m2.x(), b.m2.y(), b.m2.z()}};
+  float worst = 1.f;
+  for (int c = 0; c < 3; ++c) {
+    float u[3], v[3];
+    for (int r = 0; r < 3; ++r)
+      u[r] = pa[r][c], v[r] = pb[r][c];
+    const float lu = std::sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]), lv = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    const float cosv = lu > 0.f && lv > 0.f ? (u[0] * v[0] + u[1] * v[1] + u[2] * v[2]) / (lu * lv) : -1.f;
+    worst = std::min(worst, cosv);
+  }
+  ++s_nrmDraws;
+  if (worst < 0.9962f) {
+    ++s_nrmOff, s_nrmOffLit += lit ? 1 : 0, s_nrmOffVerts += verts;
+    s_nrmWorst = std::max(s_nrmWorst, std::acos(std::max(-1.f, worst)) * 57.29578f);
+  }
+}
 u32 s_rulesTick = 0;
 u32 s_epoch = 0, s_baseDraw = 0, s_baseVert = 0, s_nextDraw = 0, s_nextVert = 0;
 
@@ -1592,6 +1616,8 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
   const auto liveStart = g_live ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 #if defined(AURORA_RT_LIVE)
   // The sun: the strongest light any draw of this frame asked for, as the stream has it
+  if (s_sunLog && st.vtxDesc[GX_VA_NRM] != GX_NONE && st.vtxDesc[GX_VA_PNMTXIDX] == GX_NONE)
+    note_normal_matrix(st.pnMtx[std::min<u32>(st.currentPnMtx, MaxPnMtx - 1)], g_gameLightOff ? g_gameLit[0] : st.colorChannelConfig[0].lightingEnabled, vtxCount);
   for (u32 c = 0; c < 2; ++c) {
     const bool asked = g_gameLightOff ? g_gameLit[c] : st.colorChannelConfig[c].lightingEnabled;
     if (!asked)
@@ -1731,8 +1757,8 @@ static void send_rays() noexcept {
       const SunSeen& n = s_sunSeen[i];
       std::fprintf(stderr, " | pos %.4g %.4g %.4g col %.3f %.3f %.3f draws %u model %.3f %.3f %.3f", n.pos[0], n.pos[1], n.pos[2], n.col[0], n.col[1], n.col[2], n.draws, n.model[0], n.model[1], n.model[2]);
     }
-    std::fprintf(stderr, "\n");
-    s_sunSeenCount = 0;
+    std::fprintf(stderr, " || normals: %u draws, %u turned otherwise (%u lit, %u vertices), worst %.1f deg\n", s_nrmDraws, s_nrmOff, s_nrmOffLit, s_nrmOffVerts, s_nrmWorst);
+    s_sunSeenCount = 0, s_nrmDraws = s_nrmOff = s_nrmOffLit = s_nrmOffVerts = 0, s_nrmWorst = 0.f;
   }
   job->copy = s_copyNow;
   s_captureMs = 0;
