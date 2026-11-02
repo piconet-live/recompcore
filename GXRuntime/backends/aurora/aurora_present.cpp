@@ -19,6 +19,7 @@
 #include <dolphin/vi.h>
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -358,6 +359,28 @@ bool ram_resolver(void*, u32 address, u32, DolGuestAddressSpace, DolGuestResourc
   return true;
 }
 
+// AURORA_REDRAW_SHOTS=a,b,c (a test, in order): a picture between from each of those copies on, to a file; each at the first picture
+// from that copy on (the render worker's)
+const std::vector<std::uint64_t>& redraw_shots() {
+  static const std::vector<std::uint64_t> shots = [] {
+    std::vector<std::uint64_t> out;
+    if (const char* v = std::getenv("AURORA_REDRAW_SHOTS"))
+      for (const char* at = v; *at != 0;) {
+        char* end = nullptr;
+        out.push_back(std::strtoull(at, &end, 10));
+        at = *end != 0 ? end + 1 : end;
+      }
+    return out;
+  }();
+  return shots;
+}
+std::atomic<std::size_t> g_redraw_shots_taken{0};
+bool redraw_shot_due(std::uint64_t copy) {
+  const auto& shots = redraw_shots();
+  const std::size_t taken = g_redraw_shots_taken.load();
+  return s != nullptr && !s->shot_prefix.empty() && taken < shots.size() && copy >= shots[taken];
+}
+
 bool is_shot(std::uint64_t copy) {
   return std::find(s->shots.begin(), s->shots.end(), copy) != s->shots.end();
 }
@@ -632,7 +655,8 @@ void run() {
         const double cost = s->redraw_cost_ms.load(std::memory_order_relaxed);
         const auto& pictures = redraw_for->pictures;
         const double since = ms(now - last_true);
-        while (redraw_next < pictures.size() && pictures[redraw_next].fraction * kFieldMs < since + cost - kFieldMs / (pictures.size() + 1)) {
+        // (a test's shot due: its picture is drawn late rather than passed)
+        while (!redraw_shot_due(redraw_copy) && redraw_next < pictures.size() && pictures[redraw_next].fraction * kFieldMs < since + cost - kFieldMs / (pictures.size() + 1)) {
           ++s->redraw_passed;
           ++redraw_next;
         }
@@ -659,21 +683,9 @@ void run() {
             return;
           }
           const auto began = Clock::now();
-          // AURORA_REDRAW_SHOTS=a,b,c (a test, in order): a picture between from each of those copies on, to a file
-          static const std::vector<std::uint64_t> shots = [] {
-            std::vector<std::uint64_t> out;
-            if (const char* v = std::getenv("AURORA_REDRAW_SHOTS"))
-              for (const char* at = v; *at != 0;) {
-                char* end = nullptr;
-                out.push_back(std::strtoull(at, &end, 10));
-                at = *end != 0 ? end + 1 : end;
-              }
-            return out;
-          }();
-          static std::size_t shots_taken = 0;  // each at the first picture from that copy on: a copy may have none
-          const bool shoot = !s->shot_prefix.empty() && shots_taken < shots.size() && copy >= shots[shots_taken];
+          const bool shoot = redraw_shot_due(copy);
           if (shoot)
-            ++shots_taken;
+            ++g_redraw_shots_taken;
           const auto save_shot = [&](const char* kind) {
             const std::uint8_t* rgba = nullptr;
             u32 w = 0, h = 0;
@@ -694,6 +706,9 @@ void run() {
             static constexpr aurora::gx::redraw::Matrix one{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
             p.camera = one;
             p.machine.fill(one);
+            char table[64];
+            std::snprintf(table, sizeof table, "-draws-%06llu.csv", static_cast<unsigned long long>(copy));
+            aurora::gx::redraw::table_next(s->shot_prefix + table);
             aurora_request_framebuffer_readback();
             aurora::gx::redraw::draw_picture(still, index);
             save_shot("still");
@@ -702,10 +717,27 @@ void run() {
           if (!aurora::gx::redraw::draw_picture(*request, index))
             return;
           const auto done = Clock::now();
-          if (shoot)
+          if (shoot) {
             save_shot("between");
+            // AURORA_REDRAW_TEST_TEXTURES=hex,hex (a test): the picture again with the draws of each first texture uncorrected (1: no
+            // vertex moved), each to a file of its own
+            if (const char* v = std::getenv("AURORA_REDRAW_TEST_TEXTURES"))
+              for (const char* at = v; *at != 0;) {
+                char* end = nullptr;
+                const auto texture = static_cast<u32>(std::strtoul(at, &end, 16));
+                at = *end != 0 ? end + 1 : end;
+                aurora::gx::redraw::test_uncorrected(texture);
+                aurora_request_framebuffer_readback();
+                aurora::gx::redraw::draw_picture(*request, index);
+                char kind[32];
+                std::snprintf(kind, sizeof kind, "test%08X", texture);
+                save_shot(kind);
+              }
+            aurora::gx::redraw::test_uncorrected(0);
+          }
           const double took = ms(done - began);
-          s->redraw_cost_ms.store(s->redraw_cost_ms.load(std::memory_order_relaxed) * 0.9 + took * 0.1, std::memory_order_relaxed);
+          if (!shoot)  // (a test's shot waits for its read-backs: not a picture's cost)
+            s->redraw_cost_ms.store(s->redraw_cost_ms.load(std::memory_order_relaxed) * 0.9 + took * 0.1, std::memory_order_relaxed);
           s->redraw_cost_sum += took;
           s->redraw_cost_most = std::max(s->redraw_cost_most, took);
           s->redraw_drawn.fetch_add(1, std::memory_order_relaxed);
@@ -894,12 +926,15 @@ void run() {
     aurora::gfx::render_worker::synchronize();
     const auto c = aurora::gx::redraw::counts();
     const auto drawn = s->redraw_drawn.load();
-    std::fprintf(stderr, "[aurora-present] redraw: requests taken %llu, pictures drawn %llu (cost mean %.2f ms, most %.2f on the render worker), passed by the clock %llu, worker busy waits %llu, stale %llu, frames without a request %llu, request ahead of its frame %llu, older than its frame %llu; classes per frame: world %.0f, machine %.0f, whole %.0f, icon %.0f, flat %.0f, offscreen %.0f; uniform bytes %llu; draws with a split matrix %llu\n",
+    std::fprintf(stderr, "[aurora-present] redraw: requests taken %llu, pictures drawn %llu (cost mean %.2f ms, most %.2f on the render worker), passed by the clock %llu, worker busy waits %llu, stale %llu, frames without a request %llu, request ahead of its frame %llu, older than its frame %llu; classes per frame: world %.0f, machine %.0f, whole %.0f, icon %.0f, flat %.0f, offscreen %.0f; uniform bytes %llu; draws with a split matrix %llu; view-space draws moved vertex by vertex %.0f a frame (%.0f vertices moved a picture, %.0f bytes written), with no float positions %.0f; flat draws over a machine (name tags) %.0f a frame\n",
                  (unsigned long long)s->redraw_asked, (unsigned long long)drawn, drawn ? s->redraw_cost_sum / drawn : 0.0, s->redraw_cost_most,
                  (unsigned long long)s->redraw_passed, (unsigned long long)s->redraw_busy, (unsigned long long)s->redraw_stale.load(),
                  (unsigned long long)s->redraw_no_request, (unsigned long long)s->redraw_far, (unsigned long long)s->redraw_old, c.frames ? double(c.world) / c.frames : 0.0,
                  c.frames ? double(c.machine) / c.frames : 0.0, c.frames ? double(c.whole) / c.frames : 0.0, c.frames ? double(c.icon) / c.frames : 0.0,
-                 c.frames ? double(c.flat) / c.frames : 0.0, c.frames ? double(c.offscreen) / c.frames : 0.0, (unsigned long long)c.uniformBytes, (unsigned long long)c.splits);
+                 c.frames ? double(c.flat) / c.frames : 0.0, c.frames ? double(c.offscreen) / c.frames : 0.0, (unsigned long long)c.uniformBytes, (unsigned long long)c.splits,
+                 c.frames ? double(c.byVertex) / c.frames : 0.0, c.pictures ? double(c.moved) / c.pictures : 0.0,
+                 c.pictures ? double(c.written) / c.pictures : 0.0, c.frames ? double(c.unreadable) / c.frames : 0.0,
+                 c.frames ? double(c.over) / c.frames : 0.0);
   }
   aurora::gfx::timewarp::stop();
   dol_aurora_shutdown();
@@ -959,6 +994,12 @@ void aurora_present_redraw(const AuroraRedrawRequest* request) {
   auto q = std::make_shared<aurora::gx::redraw::Request>();
   q->machines = request->machines;
   std::memcpy(q->at.data(), request->at, sizeof request->at);
+  // a seat with no machine (its place not a number, or out past any course) has no place: nothing is near it
+  for (std::uint32_t i = 0; i < AURORA_REDRAW_MACHINES; ++i) {
+    const auto& at = q->at[i];
+    if (!(std::fabs(at[0]) < 1e5f && std::fabs(at[1]) < 1e5f && std::fabs(at[2]) < 1e5f))
+      q->machines &= ~(1u << i);
+  }
   q->pictures.resize(std::min<uint32_t>(request->pictures, AURORA_REDRAW_MOST));
   for (std::size_t k = 0; k < q->pictures.size(); ++k) {
     auto& to = q->pictures[k];

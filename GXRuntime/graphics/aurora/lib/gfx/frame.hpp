@@ -39,6 +39,8 @@ void end_frame(EndFrameCallback callback);
 // presented as it was. False when no frame is held.
 bool redraw_held(const std::function<void(uint8_t* uniforms, size_t bytes)>& patch);
 bool redraw_pass_offscreen(uint32_t pass) noexcept;
+// AURORA_REDRAW: bytes into the frame's vertex buffer at `at` (both whole words), before a picture between is encoded
+void redraw_write_vertices(uint32_t at, const uint8_t* data, size_t bytes);
 uint32_t current_frame() noexcept;
 void gpu_synchronize();
 void after_present() noexcept;

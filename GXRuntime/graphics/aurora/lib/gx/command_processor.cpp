@@ -812,7 +812,7 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
 }
 
 // AURORA_REDRAW: what a picture between needs of this draw. A position sent as three floats in the vertex itself can be read.
-static void note_for_redraw(GXVtxFmt fmt, u16 vtxCount, const u8* vertices) noexcept {
+static void note_for_redraw(GXVtxFmt fmt, u16 vtxCount, const u8* vertices, gfx::Range vertRange) noexcept {
   const auto& vtxFmt = g_gxState.vtxFmts[fmt];
   u32 at = 0;
   for (int i = GX_VA_PNMTXIDX; i < GX_VA_POS; ++i) {
@@ -827,8 +827,14 @@ static void note_for_redraw(GXVtxFmt fmt, u16 vtxCount, const u8* vertices) noex
   }
   const bool floats = g_gxState.vtxDesc[GX_VA_POS] == GX_DIRECT && vtxFmt.attrs[GX_VA_POS].type == GX_F32 &&
                       vtxFmt.attrs[GX_VA_POS].cnt == GX_POS_XYZ;
-  redraw::note_draw(vtxCount, vertices, at, floats ? g_gxState.lastVtxSize : 0, sDrawCache.uniformRange.offset, sDrawCache.lineMode,
-                    gfx::detail::current_pass_index());
+  const u32 stride = vtxCount != 0 ? vertRange.size / vtxCount : 0;
+  const auto& stage0 = g_gxState.tevStages[0];
+  const u32 texture = g_gxState.numTevStages != 0 && static_cast<std::size_t>(stage0.texMapId) < g_gxState.loadedTextures.size()
+                          ? static_cast<u32>(reinterpret_cast<std::uintptr_t>(g_gxState.loadedTextures[stage0.texMapId].data) >> 2) ^
+                                g_gxState.loadedTextures[stage0.texMapId].image0
+                          : 0;
+  redraw::note_draw(vtxCount, vertices, at, floats && vertRange.size != 0 ? stride : 0, vertRange.offset, sDrawCache.uniformRange.offset,
+                    sDrawCache.lineMode, gfx::detail::current_pass_index(), texture, g_gxState.vtxDesc[GX_VA_PNMTXIDX] != GX_NONE);
 }
 
 static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& reader) noexcept {
@@ -908,13 +914,13 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
     lastDraw->vtxCount += vtxCount;
     lastDraw->indexCount += numIndices;
     gfx::detail::increment_merged_draw_count();
-    if (redraw::g_on) UNLIKELY { note_for_redraw(fmt, vtxCount, vertexData.data()); }
+    if (redraw::g_on) UNLIKELY { note_for_redraw(fmt, vtxCount, vertexData.data(), vertRange); }
     if (rt::g_capturing) UNLIKELY { rt::capture_draw(prim, fmt, vtxCount, vertexData.data(), vertexData.size()); }
     return;
   }
 
   handle_draw_unmerged(prim, fmt, vtxCount, vertRange);
-  if (redraw::g_on) UNLIKELY { note_for_redraw(fmt, vtxCount, vertexData.data()); }
+  if (redraw::g_on) UNLIKELY { note_for_redraw(fmt, vtxCount, vertexData.data(), vertRange); }
   if (rt::g_capturing) UNLIKELY { rt::capture_draw(prim, fmt, vtxCount, vertexData.data(), vertexData.size()); }
 }
 

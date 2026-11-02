@@ -699,6 +699,10 @@ void note_held_passes() {
 
 bool redraw_pass_offscreen(uint32_t pass) noexcept { return pass < g_heldOffscreen.size() && g_heldOffscreen[pass]; }
 
+void redraw_write_vertices(uint32_t at, const uint8_t* data, size_t bytes) {
+  g_queue.WriteBuffer(g_resources.vertexBuffer, at, data, bytes);
+}
+
 bool redraw_held(const std::function<void(uint8_t* uniforms, size_t bytes)>& patch) {
   if (!g_heldCallback || g_held.ops.empty()) {
     return false;
@@ -741,6 +745,7 @@ void end_frame(EndFrameCallback callback) {
     auto& packet = g_framePackets[frameSlot];
     if (gx::redraw::g_on) {
       g_heldUniforms.assign(packet.uniforms.data(), packet.uniforms.data() + packet.uniforms.size());
+      gx::redraw::keep_vertices(notes, packet.verts.data(), packet.verts.size());
     }
     g_stagingBuffers[stagingSlot].Unmap();
     g_mappingStates[stagingSlot].store(BufferMapState::Unmapped, std::memory_order_release);
