@@ -859,6 +859,37 @@ std::unique_ptr<live::Job> s_jobOwned;
 std::unique_ptr<Chunk> s_chunk;
 u32 s_viewDraws = 0;
 float s_sunPower = 0.f, s_sunPos[3]{}, s_sunCol[3]{};
+// AURORA_RT_SUN_LOG=1: the frame's distinct lights, a line a frame on stderr: view-space position, colour, how many draws asked
+// for it, and its direction in the first such draw's model space (the draw's matrix taken as rotation, its transpose)
+const bool s_sunLog = std::getenv("AURORA_RT_SUN_LOG") != nullptr;
+struct SunSeen {
+  float pos[3], col[3], model[3];
+  u32 draws;
+};
+SunSeen s_sunSeen[6];
+u32 s_sunSeenCount = 0;
+template <typename M>
+void note_sun_light(const Light& li, const M& mtx) {
+  for (u32 i = 0; i < s_sunSeenCount; ++i)
+    if (s_sunSeen[i].pos[0] == li.pos[0] && s_sunSeen[i].pos[1] == li.pos[1] && s_sunSeen[i].pos[2] == li.pos[2] && s_sunSeen[i].col[0] == li.color[0]) {
+      ++s_sunSeen[i].draws;
+      return;
+    }
+  if (s_sunSeenCount >= 6)
+    return;
+  SunSeen& n = s_sunSeen[s_sunSeenCount++];
+  const float r[3][3] = {{mtx.m0.x(), mtx.m0.y(), mtx.m0.z()}, {mtx.m1.x(), mtx.m1.y(), mtx.m1.z()}, {mtx.m2.x(), mtx.m2.y(), mtx.m2.z()}};
+  float len = 0.f;
+  for (int a = 0; a < 3; ++a) {
+    n.pos[a] = li.pos[a], n.col[a] = li.color[a];
+    n.model[a] = r[0][a] * li.pos[0] + r[1][a] * li.pos[1] + r[2][a] * li.pos[2];
+    len += n.model[a] * n.model[a];
+  }
+  len = std::max(std::sqrt(len), 1e-20f);
+  for (float& v : n.model)
+    v /= len;
+  n.draws = 1;
+}
 u32 s_rulesTick = 0;
 u32 s_epoch = 0, s_baseDraw = 0, s_baseVert = 0, s_nextDraw = 0, s_nextVert = 0;
 
@@ -1569,6 +1600,8 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
       if (st.colorChannelState[c].lightMask.test(l)) {
         const auto& li = st.lights[l];
         const float power = li.color[0] + li.color[1] + li.color[2];
+        if (s_sunLog)
+          note_sun_light(li, st.pnMtx[std::min<u32>(st.currentPnMtx, MaxPnMtx - 1)].pos);
         if (power > s_sunPower) {
           s_sunPower = power;
           for (int a = 0; a < 3; ++a)
@@ -1692,6 +1725,15 @@ static void send_rays() noexcept {
     job->sunColour[a] = sunLen > 0.f ? s_sunCol[a] : 0.f;
   }
   s_sunPower = 0.f;
+  if (s_sunLog) {
+    std::fprintf(stderr, "[rt] sun lights copy %llu:", static_cast<unsigned long long>(s_copyNow));
+    for (u32 i = 0; i < s_sunSeenCount; ++i) {
+      const SunSeen& n = s_sunSeen[i];
+      std::fprintf(stderr, " | pos %.4g %.4g %.4g col %.3f %.3f %.3f draws %u model %.3f %.3f %.3f", n.pos[0], n.pos[1], n.pos[2], n.col[0], n.col[1], n.col[2], n.draws, n.model[0], n.model[1], n.model[2]);
+    }
+    std::fprintf(stderr, "\n");
+    s_sunSeenCount = 0;
+  }
   job->copy = s_copyNow;
   s_captureMs = 0;
   // the guard the job began with: if the workers are already through, one of them runs the rules

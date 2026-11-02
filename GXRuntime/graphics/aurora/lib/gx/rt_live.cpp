@@ -744,6 +744,58 @@ void build_blas(Slot& s, u32 which, D3D12_GPU_VIRTUAL_ADDRESS addr, u32 count, u
 
 #include "rt_scene_live.inl"
 
+// The game's sun, d in view space as the frame's draws asked for it. AURORA_RT_SUN_FIXED=1 (off by default): the sun stays fixed in the
+// world for the whole course. Its world direction is the game's own, taken through this frame's camera (the static track's, rt_scene)
+// over the first frames of the course that have both, averaged; every frame after gets that direction back through its own camera.
+// A course whose game light is already fixed in the world is unchanged. Without the camera the frame keeps the game's direction.
+// AURORA_RT_SUN_LOG=1: a line a frame on stderr, the game's direction in view and world space, the camera's heading, what the rays get.
+void world_sun(const Job& job, float d[3]) {
+  static const bool on = post_setting("AURORA_RT_SUN_FIXED", 0.f) != 0.f, log = std::getenv("AURORA_RT_SUN_LOG") != nullptr;
+  static constexpr u32 TakeFrames = 8;  // the first frames with a camera that the course's direction is the average of
+  static const scene::Scene* course = nullptr;
+  static float sum[3]{};
+  static u32 taken = 0;
+  if (!on && !log)
+    return;
+  const bool known = job.world.known && job.world.scene != nullptr;
+  if (known && job.world.scene.get() != course)
+    course = job.world.scene.get(), taken = 0, sum[0] = sum[1] = sum[2] = 0.f;
+  const float* v = job.world.view;  // world to view, rows of 4
+  const auto normal = [](float* a) {
+    const float len = std::max(std::hypot(a[0], a[1], a[2]), 1e-20f);
+    for (int i = 0; i < 3; ++i)
+      a[i] /= len;
+  };
+  float w[3]{}, out[3] = {d[0], d[1], d[2]};
+  if (known) {
+    for (int c = 0; c < 3; ++c)
+      w[c] = v[c] * d[0] + v[4 + c] * d[1] + v[8 + c] * d[2];
+    normal(w);
+    if (taken < TakeFrames) {
+      for (int c = 0; c < 3; ++c)
+        sum[c] += w[c];
+      ++taken;
+    }
+    if (on) {
+      float k[3] = {sum[0], sum[1], sum[2]};
+      normal(k);
+      for (int r = 0; r < 3; ++r)
+        out[r] = v[r * 4] * k[0] + v[r * 4 + 1] * k[1] + v[r * 4 + 2] * k[2];
+      normal(out);
+    }
+  }
+  if (log) {
+    // the camera looks along view -z: in the world, minus the third row
+    const float fx = -v[8], fy = -v[9], fz = -v[10];
+    std::fprintf(stderr, "[rt] sun copy %llu known %d view %.4f %.4f %.4f world %.4f %.4f %.4f heading %.1f pitch %.1f taken %u rays %.4f %.4f %.4f\n",
+                 static_cast<unsigned long long>(job.copy), int(known), d[0], d[1], d[2], w[0], w[1], w[2],
+                 known ? std::atan2(fx, fz) * 57.29578f : 0.f, known ? std::atan2(fy, std::hypot(fx, fz)) * 57.29578f : 0.f, taken, out[0], out[1], out[2]);
+  }
+  if (on)
+    for (int a = 0; a < 3; ++a)
+      d[a] = out[a];
+}
+
 // The rays' part: this frame's structures and the trace itself
 void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   for (const auto& t : job.textures)
@@ -766,6 +818,8 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
     float d[3] = {own ? job.sunDir[0] : fixedDir[0], own ? job.sunDir[1] : fixedDir[1], own ? job.sunDir[2] : fixedDir[2]};
     if (!own && !fixed)
       d[0] = 0.35f, d[1] = 0.8f, d[2] = 0.45f;
+    if (own)
+      world_sun(job, d);
     const float len = std::max(std::hypot(d[0], d[1], d[2]), 1e-5f);
     EngineLight sun{{d[0] / len, d[1] / len, d[2] / len}, {gain, gain, gain}, 1.f};
     // the colour as the game's light has it, its brightest channel at 1; AURORA_RT_SUN_WHITE=1 leaves it white
