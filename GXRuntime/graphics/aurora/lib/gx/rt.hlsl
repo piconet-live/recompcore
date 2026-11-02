@@ -938,6 +938,9 @@ float3 term_of(Texture2D<float4> from, int2 c);
 #define FLARE_SHOW 0
 #define HOT_CORE_HALF 1.0
 #endif
+#ifndef GLOW_GAIN
+#define GLOW_GAIN 1.0
+#endif
 float3 glow_core(float3 raster);
 float3 glow_flare(int2 c);
 [numthreads(8, 8, 1)]
@@ -1058,7 +1061,11 @@ void flare_star(uint3 id : SV_DispatchThreadID) {
 }
 
 // What the glow adds to a pixel of the composed picture, over its raster
+// GLOW_GAIN (AURORA_RT_GLOW_GAIN, 1 by default): the light above white and the flare, brighter by this (with the glow on); below white nothing changes
 float3 glow_core(float3 raster) {
+#if HOT_CORE || FLARE
+  raster += max(raster - 1, 0) * (GLOW_GAIN - 1);
+#endif
 #if HOT_CORE
   float over = max3(raster) - 1;
   if (over > 0) raster = lerp(raster, max3(raster).xxx, saturate(over / (over + HOT_CORE_HALF)));
@@ -1068,7 +1075,7 @@ float3 glow_core(float3 raster) {
 float3 glow_flare(int2 c) {
 #if FLARE
   uint w, h; Final.GetDimensions(w, h);
-  return ReadA.SampleLevel(Edge, (c + 0.5) / float2(w, h), 0).rgb * FLARE_GAIN;
+  return ReadA.SampleLevel(Edge, (c + 0.5) / float2(w, h), 0).rgb * FLARE_GAIN * GLOW_GAIN;
 #else
   return 0;
 #endif

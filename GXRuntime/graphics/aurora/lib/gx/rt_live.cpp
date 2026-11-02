@@ -266,7 +266,7 @@ D3D12_GPU_DESCRIPTOR_HANDLE gpuh(u32 i) {
 // AURORA_RT_SHADER=<file>: the shader read from there instead of the build's own copy, to try a change without a build
 std::string s_shaderFile;
 // AURORA_RT_FLARE=1, AURORA_RT_HOT_CORE=1 (off by default): the glow (rt.hlsl, above flare_src). Its numbers, AURORA_RT_FLARE_<NAME> and
-// AURORA_RT_HOT_CORE_HALF, go to the shader as it compiles: no room is left in the root signature's words.
+// AURORA_RT_HOT_CORE_HALF, go to the shader as it compiles (AURORA_RT_GLOW_GAIN: the owner's brightness for both, 1 as the game): no room is left in the root signature's words.
 bool env_one(const char* name) {
   const char* v = std::getenv(name);
   return v != nullptr && v[0] == '1';
@@ -294,7 +294,8 @@ const std::vector<std::wstring>& shader_defines() {
                                          {"AURORA_RT_FLARE_HALF", L"FLARE_HALF", 1.f},   {"AURORA_RT_FLARE_ARMS", L"FLARE_ARMS", 0.5f},
                                          {"AURORA_RT_FLARE_HALO", L"FLARE_HALO", 0.6f},  {"AURORA_RT_FLARE_SAT", L"FLARE_SAT", 1.3f},
                                          {"AURORA_RT_FLARE_GAIN", L"FLARE_GAIN", 1.f},   {"AURORA_RT_FLARE_TAPS", L"FLARE_TAPS", 24.f},
-                                         {"AURORA_RT_FLARE_SHOW", L"FLARE_SHOW", 0.f},   {"AURORA_RT_HOT_CORE_HALF", L"HOT_CORE_HALF", 1.f}};
+                                         {"AURORA_RT_FLARE_SHOW", L"FLARE_SHOW", 0.f},   {"AURORA_RT_HOT_CORE_HALF", L"HOT_CORE_HALF", 1.f},
+                                         {"AURORA_RT_GLOW_GAIN", L"GLOW_GAIN", 1.f}};
     for (const auto& n : numbers) {
       const char* v = std::getenv(n.env);
       const float f = v != nullptr && v[0] != '\0' ? static_cast<float>(std::atof(v)) : n.otherwise;
