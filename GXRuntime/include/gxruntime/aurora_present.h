@@ -29,7 +29,7 @@
 extern "C" {
 #endif
 
-#define AURORA_PRESENT_ABI 4
+#define AURORA_PRESENT_ABI 5
 
 typedef struct AuroraPresentConfig {
   uint32_t abi;            // AURORA_PRESENT_ABI
@@ -66,6 +66,7 @@ typedef struct AuroraPresentStats {
   uint64_t overflow_drops;  // draws left out because a frame's buffer was full
   uint32_t fatal;           // 1: a fatal error of Aurora's stopped it (the thread is parked; the game goes on)
   uint32_t scale;           // the render scale in use
+  uint64_t pictures_between;  // pictures drawn between true frames from their draws (AURORA_REDRAW) and presented (ABI 5)
 } AuroraPresentStats;
 
 // The host's overlay, with the emulator drawing nothing: its own drawing (Dear ImGui's lists, flattened; no ImGui type

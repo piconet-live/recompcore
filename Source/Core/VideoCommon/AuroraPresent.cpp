@@ -39,7 +39,7 @@ namespace VideoCommon::AuroraPresent
 {
 namespace
 {
-// gxruntime/aurora_present.h, as the library exports it (ABI 4)
+// gxruntime/aurora_present.h, as the library exports it (ABI 5)
 struct LibConfig
 {
   u32 abi;
@@ -69,8 +69,9 @@ struct LibStats
   u64 overflow_drops;
   u32 fatal;
   u32 scale;
+  u64 pictures_between;
 };
-constexpr u32 LIB_ABI = 4;
+constexpr u32 LIB_ABI = 5;
 void* s_video_off_window = nullptr;  // SetVideoOffWindow
 u64 s_presents_counted = 0;
 // The hand-off's time on the thread that decodes (the report's last figure): the bursts kept, the calls swapped for
@@ -271,7 +272,7 @@ void Start()
                                (g_framebuffer_manager ? g_framebuffer_manager->GetEFBScale() : 1);
   if (!s_lib.start(&c))
   {
-    s_load_problem = "the library's interface is not this emulator's (ABI 4)";
+    s_load_problem = "the library's interface is not this emulator's (ABI 5)";
     s_on = false;
     return;
   }
@@ -554,13 +555,14 @@ void OnCommandEnd(const u8* data, u32 size)
   if (s_cut_fraction > 0 && s_lib.frame_between)
     s_lib.frame_between(s_cut_copy, s_cut_fraction);
   s_lib.frame(s_cut_copy);
-  // Dolphin presents nothing and draws no statistics then: its frame rate counts Aurora's presents
+  // Dolphin presents nothing and draws no statistics then: its frame rate counts Aurora's presents, the true frames'
+  // and the pictures drawn between them from their draws (the window strip's FPS)
   if (s_video_off_window)
   {
     LibStats st{};
     s_lib.stats(&st);
     auto& metrics = Core::System::GetInstance().GetPerfMetrics();
-    for (; s_presents_counted < st.frames_drawn; ++s_presents_counted)
+    for (; s_presents_counted < st.frames_drawn + st.pictures_between; ++s_presents_counted)
       metrics.CountFrame();
     metrics.UpdateCounters();
   }

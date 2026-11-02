@@ -1120,6 +1120,7 @@ void aurora_present_stats(AuroraPresentStats* out) {
   out->overflow_drops = aurora_overflow_drops();
   out->fatal = s->fatal ? 1 : 0;
   out->scale = s->scale;
+  out->pictures_between = s->redraw_drawn.load(std::memory_order_relaxed);
 }
 
 void aurora_present_stop(void) {
