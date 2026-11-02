@@ -51,6 +51,7 @@ struct Scene {
   std::vector<Placed> placed;
   std::unordered_map<std::uint64_t, std::vector<KeyHit>> keys;
   std::vector<std::vector<PlacedAt>> placementsOf;
+  std::vector<std::uint32_t> primitivesOf;  // a model's primitives in all, to tell a placement drawn in part
   std::uint64_t triangles = 0, trianglesPlaced = 0;
   std::uint32_t animated = 0, unresolved = 0, declined = 0;
   double loadMs = 0;

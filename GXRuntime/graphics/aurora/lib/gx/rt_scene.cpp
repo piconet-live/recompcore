@@ -335,6 +335,7 @@ std::shared_ptr<Scene> resolve() {
     if (fresh) {
       b.model = static_cast<u32>(scene->placementsOf.size());
       scene->placementsOf.emplace_back();
+      scene->primitivesOf.push_back(0);
     }
     const auto found = s_models.find(name);
     if (found == s_models.end())
@@ -360,8 +361,10 @@ std::shared_ptr<Scene> resolve() {
       }
       decode_lists(file, m, f, dec);
       for (const u64 key : dec.keys)
-        if (!b.done)
+        if (!b.done) {
           scene->keys[key].push_back({b.model, None});
+          ++scene->primitivesOf[b.model];
+        }
       if (!want || dec.positions.empty())
         continue;
       GpuMesh g{};
@@ -615,10 +618,13 @@ void match(const DrawRec* draws, u32 count, const Vertex* verts, const float (*t
     const DrawRec& d = draws[i];
     if (d.sceneKey == 0 || d.motionSingle == 0 || !mainView(d))
       continue;
+    ++out.draws;
+    // the camera needs only some of the frame: bigger draws are enough, and a few hundred of them (tuned)
+    if (d.vertices < 16 || votes.size() >= 512)
+      continue;
     const auto it = sc.keys.find(d.sceneKey);
     if (it == sc.keys.end())
       continue;
-    ++out.draws;
     for (const KeyHit& hit : it->second) {
       const auto& where = sc.placementsOf[hit.model];
       if (where.size() > 8)
@@ -657,6 +663,9 @@ void match(const DrawRec* draws, u32 count, const Vertex* verts, const float (*t
     float inv[12];
     invert(out.view, inv);
     u32 fogVerts = 0;
+    // draws of each placement against its model's primitives: a game that drew only part of an object leaves the rest out of the rays
+    static std::vector<u32> partCount, partModel;
+    partCount.assign(sc.placed.size(), 0), partModel.assign(sc.placed.size(), None);
     for (u32 i = 0; i < count; ++i) {
       const DrawRec& d = draws[i];
       if (!mainView(d))
@@ -681,6 +690,7 @@ void match(const DrawRec* draws, u32 count, const Vertex* verts, const float (*t
             diff = std::max(diff, std::fabs(world[k] - p.world[k]) / ((k % 4) == 3 ? 16.f : 1.f));
           if (diff < 0.03f) {
             found = true;
+            ++partCount[at->placed], partModel[at->placed] = hit.model;
             if (!out.drawn[at->placed]) {
               out.drawn[at->placed] = 1;
               ++out.drawnCount;
@@ -704,6 +714,9 @@ void match(const DrawRec* draws, u32 count, const Vertex* verts, const float (*t
       else
         ++out.moved;
     }
+    for (size_t i = 0; i < partCount.size(); ++i)
+      if (partModel[i] != None && partCount[i] < sc.primitivesOf[partModel[i]])
+        ++out.partial;
   }
   out.colours.resize(sc.meshes.size() + 1);
   if (!sc.meshes.empty())

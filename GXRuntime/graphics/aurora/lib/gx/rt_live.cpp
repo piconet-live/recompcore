@@ -151,7 +151,7 @@ struct State {
   ComPtr<ID3D12Resource> worldBlas;
   std::vector<u64> worldAt;
   u64 worldBytes = 0;
-  double worldKnown = 0, worldDrawn = 0, worldInstances = 0, worldDraws = 0, worldMatched = 0, worldMoved = 0, worldMs = 0;
+  double worldKnown = 0, worldDrawn = 0, worldInstances = 0, worldDraws = 0, worldMatched = 0, worldMoved = 0, worldMs = 0, worldPartial = 0;
   std::unique_ptr<Job> pending;
   bool drawThis = false;
   wgpu::CommandBuffer first;

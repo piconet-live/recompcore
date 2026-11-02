@@ -117,11 +117,11 @@ void world_instances(Slot& s, Job& job, std::vector<D3D12_RAYTRACING_INSTANCE_DE
 }
 void world_count(const Job& job) {
   const auto& w = job.world;
-  g.worldKnown += w.known ? 1 : 0, g.worldDrawn += w.drawnCount, g.worldDraws += w.draws, g.worldMatched += w.matched, g.worldMoved += w.moved, g.worldMs += w.matchMs;
+  g.worldKnown += w.known ? 1 : 0, g.worldDrawn += w.drawnCount, g.worldDraws += w.draws, g.worldMatched += w.matched, g.worldMoved += w.moved, g.worldMs += w.matchMs, g.worldPartial += w.partial;
 }
 void world_report(double n) {
   if (scene::on() && g.worldScene)
-    std::fprintf(stderr, "[rt] scene each frame: camera known %.2f, %.0f placements drawn of %zu, %.0f instances in the rays, draws by their bytes %.0f (%.0f placed where the file says, %.0f elsewhere), %.2f ms beside the rules; %.1f MB of structures\n",
-                 g.worldKnown / n, g.worldDrawn / n, g.worldScene->placed.size(), g.worldInstances / n, g.worldDraws / n, g.worldMatched / n, g.worldMoved / n, g.worldMs / n, g.worldBytes / 1048576.0);
-  g.worldKnown = g.worldDrawn = g.worldInstances = g.worldDraws = g.worldMatched = g.worldMoved = g.worldMs = 0;
+    std::fprintf(stderr, "[rt] scene each frame: camera known %.2f, %.0f placements drawn of %zu, %.0f instances in the rays, draws by their bytes %.0f (%.0f placed where the file says, %.0f elsewhere), %.2f ms beside the rules; %.1f MB of structures; %.1f placements drawn in part\n",
+                 g.worldKnown / n, g.worldDrawn / n, g.worldScene->placed.size(), g.worldInstances / n, g.worldDraws / n, g.worldMatched / n, g.worldMoved / n, g.worldMs / n, g.worldBytes / 1048576.0, g.worldPartial / n);
+  g.worldKnown = g.worldDrawn = g.worldInstances = g.worldDraws = g.worldMatched = g.worldMoved = g.worldMs = g.worldPartial = 0;
 }
