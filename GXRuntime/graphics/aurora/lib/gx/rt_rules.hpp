@@ -147,7 +147,8 @@ inline void draw_colour(const DrawRec& d, const Vertex* verts, const float (*tex
 struct GpuDraw {
   std::uint32_t stages, firstStage, cls;  // cls: 0 solid, 1 translucent, 2 additive, 3 ignored
   float strength;                         // reflection strength; machines boosted, scenery capped
-  std::uint32_t highlight;                // bit 0: has a stage looked up by the normal, the game's own shine; bit 1: glows, gives light; bit 2: outside the depth, drawn over the world, takes no light; bit 3: a blended layer writing no depth
+  std::uint32_t highlight;                // bit 0: has a stage looked up by the normal, the game's own shine; bit 1: glows, gives light; bit 2: outside the depth, drawn over the world, takes no light; bit 3: a blended layer writing no depth;
+                                          // bit 4: a card turned to the picture (faces_picture, AURORA_RT_HUD_SKIP): the camera's rays alone meet it, it takes no light and casts no shadow
   std::uint32_t fogType;
   float fog[3];
   float fogColour[3];
@@ -167,6 +168,7 @@ struct Tuning {
   std::array<int, 2> extraKey[4]{};
   std::uint64_t extraVerts[4]{};
   float largestFloor = 0.f;
+  bool overlayApart = false;  // AURORA_RT_HUD_SKIP=1: cards turned to the picture are the game's overlay in the world (faces_picture), not surfaces
 };
 struct Frame {
   std::vector<float> prevPos;       // each of verts in the last frame's view space, with motion data on (rt_motion.hpp)
@@ -209,7 +211,7 @@ inline void build_glows(const DrawRec* draws, std::uint32_t count, const Vertex*
   for (std::uint32_t i = 0; i < count; ++i) {
     const DrawRec& d = draws[i];
     GpuDraw& g = out.draws[i];
-    if (extent[i] < t.lightMaxSize || !d.colorUpdate || g.cls == 3 || sky(i))
+    if (extent[i] < t.lightMaxSize || !d.colorUpdate || g.cls == 3 || (g.highlight & 16) != 0 || sky(i))
       continue;
     float c[4];
     draw_colour(d, verts, t.texMeans, t.texCount, c);
@@ -284,6 +286,31 @@ inline void build_glows(const DrawRec* draws, std::uint32_t count, const Vertex*
     l.area = q.area, l.radius = std::sqrt(q.area / 3.14159f);
     out.glows.push_back(l);
   }
+}
+
+// A card turned to the picture: a draw that writes depth and every one of whose triangles lies in a plane parallel to the picture's. The game builds
+// such a sprite in view space, so it faces the camera exactly, every frame, wherever the camera turns (the place markers over the machines). A
+// surface of the world lies so only by chance, and never to this precision: a ten-thousandth of a radian. Cards that write no depth (dust, smoke,
+// glows) are the blended layers' and additive draws' rules, not this one.
+inline bool faces_picture(const DrawRec& d, const Vertex* verts) {
+  static constexpr float MostTilt = 1e-4f;
+  if (!d.depthUpdate || d.vertices < 3)
+    return false;
+  bool any = false;
+  for (std::uint32_t v = 0; v + 2 < d.vertices; v += 3) {
+    const float* p0 = verts[d.firstVertex + v].pos;
+    const float* p1 = verts[d.firstVertex + v + 1].pos;
+    const float* p2 = verts[d.firstVertex + v + 2].pos;
+    const float e1[3] = {p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]}, e2[3] = {p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]};
+    const float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+    const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    if (len <= 0.f)
+      continue;
+    if (std::fabs(n[0]) + std::fabs(n[1]) > MostTilt * len)
+      return false;
+    any = true;
+  }
+  return any;
 }
 
 // The main view is the perspective projection with the most triangles. Sky: the largest see-through shells around the view,
@@ -391,6 +418,10 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
     if (d.blendMode == 1 && !additive && !darkens && !opaqueBlend && !d.depthUpdate && g.cls < 2)
       g.highlight |= 8;
     const bool inView = d.projType == 0 && key(d) == best && d.vertices > 0;
+    // the game's overlay in the world (AURORA_RT_HUD_SKIP): drawn as the game draws it; primary rays meet it (assemble_frame), so what lies behind
+    // takes no light through it, and it takes none itself (bit 2); no other ray meets it: no shadow, no reflection, no light from it
+    if (t.overlayApart && inView && g.cls < 2 && faces_picture(d, verts))
+      g.highlight |= 16 | 4;
     if (strength > 0 && inView) {
       ++out.reflective;
       if (beside_engine_light(d, verts, out.machineLights)) {
@@ -420,7 +451,8 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
 }
 // The triangles the rays get: solid, what light passes through, blended layers writing no depth (only with layersApart, AURORA_RT_LAYER_PASS; else they stay
 // in the first two), sky, then what primary rays alone see. drop: a byte a draw, 1 where the static track already holds it, 2 where a static placement's
-// draw is for primary rays alone (AURORA_RT_SCENE_STEADY; a layer or the sky stays in its own) (may be null).
+// draw is for primary rays alone (AURORA_RT_SCENE_STEADY; a layer or the sky stays in its own) (may be null). A card turned to the picture (highlight
+// bit 4, AURORA_RT_HUD_SKIP) is for primary rays alone too.
 inline void assemble_frame(const DrawRec* draws, std::uint32_t count, const Vertex* verts, const std::uint8_t* drop, Frame& out, bool layersApart = false) {
   for (int pass = 0; pass < 5; ++pass) {
     if (pass == 1)
@@ -433,7 +465,7 @@ inline void assemble_frame(const DrawRec* draws, std::uint32_t count, const Vert
       out.primaryFirstVertex = static_cast<std::uint32_t>(out.verts.size());
     for (std::uint32_t i = 0; i < count; ++i) {
       int group = out.is_sky(i) ? 3 : layersApart && (out.draws[i].highlight & 8) != 0 ? 2 : out.draws[i].cls == 0 ? 0 : 1;
-      if (drop != nullptr && drop[i] == 2 && group < 2)
+      if ((drop != nullptr && drop[i] == 2 && group < 2) || ((out.draws[i].highlight & 16) != 0 && group < 3))
         group = 4;
       if (out.extent[i] <= 0.f || group != pass || (drop != nullptr && drop[i] == 1))
         continue;

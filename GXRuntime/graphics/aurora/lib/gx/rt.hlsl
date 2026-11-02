@@ -11,7 +11,7 @@ struct Draw {
   uint stages, firstStage;
   uint cls;       // 0 solid, 1 translucent, 2 additive, 3 ignored
   float strength; // the draw's own reflection strength
-  uint highlight; // the draw has a stage looked up by the normal: the game's own shine
+  uint highlight; // bit 0 the game's own shine, 1 glows, 2 outside the depth (takes no light), 3 a blended layer writing no depth, 4 a card turned to the picture (primary rays alone)
   uint fogType;
   float3 fog;
   float3 fogColour;
@@ -382,6 +382,11 @@ bool pair_gap_on() { return (P.stableShine & 4) != 0; }
 // leaves showing, and the layer itself takes only a soft share of the open sky's light, no sun and no shadow. A card's square edge, where its alpha is 0, fades
 // to the change on the surface behind; no edge of it can show.
 bool layer_pass_on() { return (P.stableShine & 8) != 0; }
+// How many looks a primary ray may take before it gives up on the pixel. Each draw it passes takes one (additive draws, see-through texels, a world copy with no
+// draw of it yet and its pair-gap window), and a pixel that ran out took no light at all: Sand Ocean's tunnel pillars and shift boards once lit, a glow shell
+// over a lit glass box over the surface, each there as the frame's draw and as its world copy, passed eight looks or not by how coplanar copies' rounding fell,
+// a pixel at a time: white and teal speckle. Looks past the surface cost nothing; only pixels behind many passes take more.
+static const int PrimaryLooks = 32;
 // Tuned by eye: how much of the open sky's light a layer in the air takes
 static const float LayerSkyShare = 0.5;
 // A dust column is many cards deep: passing them one look at a time ran out of looks, and where the count crossed the limit the cards' edges showed. So with
@@ -403,6 +408,9 @@ float layer_through(float3 org, float3 dir, float tMin, float tMax, float level)
 }
 // What the rays bring a surface: how open it is, what it sees as bounce, what it sees of the sky. xi: the first ray's place in the hemisphere, the rest follow by a fixed sequence.
 // A hit counts as closed by distance, all of it near and nothing at lightReach, so a far wall leaves the open track as it is. Glows and additive draws are seen through, adding their light. Reach tuned.
+// An additive draw lying on the surface itself, within the pair gap's window of its plane, is a glow pass drawn over this very surface (Sand Ocean's tunnel
+// walls and pillars once their lights are on): its look is already in the raster and it is no light from elsewhere, so rays pass it and add nothing. Before, a
+// ray took its whole colour at no distance, and where the pass lay at the rays' start offset a pixel took it or not by a hair.
 void light_rays(float3 pos, float3 N, float dist, float2 xi, out float open, out float3 bounce, out float3 skySeen) {
   float3 T = normalize(abs(N.y) < 0.9 ? cross(N, float3(0, 1, 0)) : cross(N, float3(1, 0, 0))), B = cross(N, T);
   float3 org = pos + N * (0.03 + dist * 0.0005);
@@ -441,6 +449,7 @@ void light_rays(float3 pos, float3 N, float dist, float2 xi, out float open, out
         if (cls != 3) c = shade(h, 3.0);
       }
       if (cls == 3) continue;
+      if (cls == 2 && dot(org + dir * t - pos, N) < PairGapLeast + dist * PairGapShare) continue;
       if (cls == 2) { rayBounce += through * c.rgb * saturate(c.a); continue; }
       if (cls == 1) { float al = saturate(c.a); rayBounce += through * c.rgb * al; through *= 1 - al; continue; }
       // a bright surface lights from any distance, whatever else is near closes only within reach; so lava lights what faces it from far away
@@ -581,7 +590,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     float gapAt = -1;  // AURORA_RT_PAIR_GAP: >= 0 when this look is the window for draws around a drawn placement's hit there
     float surfT = 100000;  // AURORA_RT_LAYER_PASS: where the pixel's surface is, for the layers in front of it
     const float3 lightBefore = light;
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < PrimaryLooks; ++i) {
       RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
       const bool gapLook = gapAt >= 0;
       const float gapT = gapAt, gapR = PairGapLeast + gapAt * PairGapShare;
@@ -611,6 +620,8 @@ void main(uint3 id : SV_DispatchThreadID) {
       }
       hitDepth = t;
       surfT = t;
+      // a card turned to the picture, the game's overlay in the world (AURORA_RT_HUD_SKIP, rt_rules.hpp faces_picture): no light, no reflection; only this ray meets it
+      if ((d.highlight & 16) != 0) break;
       float3 N = h.nrm;
       if (dot(N, v) > 0) N = -N;
       if (P.mode == 3) { dbg += N * 0.5 + 0.5; break; }
@@ -752,7 +763,7 @@ void light_pass(uint3 id : SV_DispatchThreadID) {
   float3 prevAt = pp;
   float prevZ = 0, smear = 1;
   float gapAt = -1;  // AURORA_RT_PAIR_GAP, as main's
-  for (int i = 0; i < 8; ++i) {
+  for (int i = 0; i < PrimaryLooks; ++i) {
     RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
     const bool gapLook = gapAt >= 0;
     const float gapT = gapAt, gapR = PairGapLeast + gapAt * PairGapShare;

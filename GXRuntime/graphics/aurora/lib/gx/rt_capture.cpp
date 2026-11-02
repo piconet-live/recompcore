@@ -340,6 +340,7 @@ struct Packet {
   VtxFmt vf;
   Mat3x4<float> texMtx[MaxUv], ptTexMtx[MaxUv];
   u32 currentPnMtx;
+  u32 gameLit;  // bit c: the game asked for lights on colour channel c (kept apart from AURORA_RT_GAME_LIGHT=0, which turns them off in the state)
 };
 
 u32 triangle_vertices(GXPrimitive prim, u32 n) {
@@ -539,7 +540,7 @@ void translate(const Packet& st, DrawRec& d, Vertex* outVerts) noexcept {
         d.nrmMtx[r * 3] = nrows[r]->x(), d.nrmMtx[r * 3 + 1] = nrows[r]->y(), d.nrmMtx[r * 3 + 2] = nrows[r]->z();
     }
   }
-  d.lit = st.colorChannelConfig[GX_COLOR0 + chan].lightingEnabled;
+  d.lit = (st.gameLit >> chan) & 1u;  // as the game asked, whatever AURORA_RT_GAME_LIGHT=0 did to the state
   {
     const auto& cc = st.colorChannelConfig[GX_ALPHA0 + chan];
     d.fading = s_fadeAsDraw && cc.matSrc != GX_SRC_VTX && !cc.lightingEnabled && st.colorChannelState[GX_ALPHA0 + chan].matColor[3] < 0.99f ? 1 : 0;
@@ -1064,6 +1065,45 @@ static bool layers_apart() {
   }();
   return on;
 }
+// AURORA_RT_DRAWSTATE (diagnostic): one line a draw of the main view
+static void log_draw_states(const DrawRec* draws, u32 count, const Vertex* verts, const Frame& fr, const std::uint8_t* drop, u64 copy) {
+  for (u32 i = 0; i < count; ++i) {
+    const DrawRec& d = draws[i];
+    if (fr.extent[i] <= 0.f)
+      continue;
+    float c[3]{}, face = 0.f, tilt = 0.f, area = 0.f;
+    for (u32 v = 0; v < d.vertices; ++v)
+      for (int a = 0; a < 3; ++a)
+        c[a] += verts[d.firstVertex + v].pos[a] / static_cast<float>(d.vertices);
+    for (u32 v = 0; v + 2 < d.vertices; v += 3) {
+      const float* p0 = verts[d.firstVertex + v].pos;
+      const float* p1 = verts[d.firstVertex + v + 1].pos;
+      const float* p2 = verts[d.firstVertex + v + 2].pos;
+      const float e1[3] = {p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]}, e2[3] = {p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]};
+      const float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+      const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+      if (len <= 0.f)
+        continue;
+      const float m[3] = {(p0[0] + p1[0] + p2[0]) / 3, (p0[1] + p1[1] + p2[1]) / 3, (p0[2] + p1[2] + p2[2]) / 3};
+      const float ml = std::sqrt(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
+      face += std::fabs(n[0] * m[0] + n[1] * m[1] + n[2] * m[2]) / std::max(ml, 1e-6f);  // |n . view ray|, by area
+      tilt = std::max(tilt, (std::fabs(n[0]) + std::fabs(n[1])) / len);                    // the most a triangle leans off the picture's plane: 0 on it
+      area += len;
+    }
+    const float* p = d.proj;
+    const float w = p[12] * c[0] + p[13] * c[1] + p[14] * c[2] + p[15];
+    const float sx = w != 0 ? ((p[0] * c[0] + p[1] * c[1] + p[2] * c[2] + p[3]) / w * 0.5f + 0.5f) : -1.f;
+    const float sy = w != 0 ? (0.5f - (p[4] * c[0] + p[5] * c[1] + p[6] * c[2] + p[7]) / w * 0.5f) : -1.f;
+    const GpuDraw& g = fr.draws[i];
+    std::fprintf(stderr,
+                 "[rt] dstate copy %llu #%u cls %u hl %u blend %u %u %u z %u%u cull %u col %u lit %u nrm %u vc %u fade %u st %u refl %d verts %u ext %.2f at %.1f %.1f %.1f "
+                 "screen %.3f %.3f face %.3f tilt %.6f vp %.0f %.0f %.0f %.0f %.3f %.3f fog %u key %d drop %u tex0 %d\n",
+                 static_cast<unsigned long long>(copy), i, g.cls, g.highlight, d.blendMode, d.blendSrc, d.blendDst, d.depthUpdate, d.depthCompare, d.cull, d.colorUpdate, d.lit,
+                 d.hasNormal, d.hasColor, d.fading, d.stages, d.stages > 0 ? static_cast<int>(d.stage[0].reflection) : -1, d.vertices, fr.extent[i], c[0], c[1], c[2], sx, sy,
+                 area > 0 ? face / area : -1.f, area > 0 ? tilt : -1.f, d.viewport[0], d.viewport[1], d.viewport[2], d.viewport[3], d.viewport[4], d.viewport[5], d.fogType,
+                 d.sceneKey != 0 ? 1 : 0, drop != nullptr ? drop[i] : 255u, d.stages > 0 ? static_cast<int>(d.stage[0].tex) : -1);
+  }
+}
 void run_rules(live::Job& j) {
   const auto t0 = std::chrono::steady_clock::now();
   Tuning tuning;
@@ -1078,6 +1118,13 @@ void run_rules(live::Job& j) {
       tuning.maxGlows = static_cast<u32>(std::atoi(most));
   }
   tuning.machineCap = s_machineCap, tuning.sceneryCap = s_sceneryCap, tuning.machineGain = s_machineGain;
+  // AURORA_RT_HUD_SKIP=1 (off by default): cards turned to the picture, the game's overlay in the world (the place markers), are left out of every ray but the
+  // camera's (rt_rules.hpp faces_picture). AURORA_RT_HUD_LOG=1: each such draw on stderr, a line each, every 30th copy, and the count of copies that had any
+  static const bool overlayApart = [] {
+    const char* v = std::getenv("AURORA_RT_HUD_SKIP");
+    return v != nullptr && std::atof(v) != 0;
+  }();
+  tuning.overlayApart = overlayApart;
   if (j.glow > 0.f) {
     tuning.texMeans = s_texAvg;
     tuning.texCount = MostTexAvg;
@@ -1171,6 +1218,48 @@ void run_rules(live::Job& j) {
     assemble_frame(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, nullptr, j.frame, layers_apart());
     if (scene::on() && !staticScene && j.frame.main != nullptr)
       scene::match(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, s_texAvg, MostTexAvg, j.frame.main->proj[0], j.frame.main->proj[5], j.world);
+  }
+  {
+    static const bool hudLog = std::getenv("AURORA_RT_HUD_LOG") != nullptr;
+    static u64 copiesWith = 0, drawsTaken = 0, copiesSeen = 0;
+    if (hudLog && overlayApart) {
+      u32 n = 0;
+      for (u32 i = 0; i < j.drawCount; ++i) {
+        if ((j.frame.draws[i].highlight & 16) == 0)
+          continue;
+        ++n;
+        if (j.copy % 30 == 0) {
+          const DrawRec& d = j.draws[j.baseDraw + i];
+          const Vertex& v0 = j.verts[j.baseVert + d.firstVertex];
+          const float* p = d.proj;
+          const float w = p[12] * v0.pos[0] + p[13] * v0.pos[1] + p[14] * v0.pos[2] + p[15];
+          std::fprintf(stderr, "[rt] hud copy %llu #%u cls %u blend %u %u %u z %u%u lit %u nrm %u verts %u ext %.2f at %.1f %.1f %.1f screen %.3f %.3f tex0 %d stages %u\n",
+                       static_cast<unsigned long long>(j.copy), i, j.frame.draws[i].cls, d.blendMode, d.blendSrc, d.blendDst, d.depthUpdate, d.depthCompare, d.lit, d.hasNormal,
+                       d.vertices, j.frame.extent[i], v0.pos[0], v0.pos[1], v0.pos[2],
+                       w != 0 ? (p[0] * v0.pos[0] + p[1] * v0.pos[1] + p[2] * v0.pos[2] + p[3]) / w * 0.5f + 0.5f : -1.f,
+                       w != 0 ? 0.5f - (p[4] * v0.pos[0] + p[5] * v0.pos[1] + p[6] * v0.pos[2] + p[7]) / w * 0.5f : -1.f, d.stages > 0 ? static_cast<int>(d.stage[0].tex) : -1, d.stages);
+        }
+      }
+      ++copiesSeen, copiesWith += n > 0 ? 1 : 0, drawsTaken += n;
+      if (copiesSeen % 300 == 0)
+        std::fprintf(stderr, "[rt] hud so far: %llu of %llu copies had cards turned to the picture, %llu draws in all\n", static_cast<unsigned long long>(copiesWith),
+                     static_cast<unsigned long long>(copiesSeen), static_cast<unsigned long long>(drawsTaken));
+    }
+  }
+  // AURORA_RT_DRAWSTATE=first,last (diagnostic): on those copies, each draw of the main view with its state, where it is on the picture, how it faces
+  // the view, and what the rules made of it: what tells one kind of draw from another
+  {
+    static u64 dsFirst = 0, dsLast = 0;
+    static const bool dsOn = [] {
+      const char* v = std::getenv("AURORA_RT_DRAWSTATE");
+      if (v == nullptr || std::strchr(v, ',') == nullptr)
+        return false;
+      dsFirst = std::strtoull(v, nullptr, 10), dsLast = std::strtoull(std::strchr(v, ',') + 1, nullptr, 10);
+      return true;
+    }();
+    if (dsOn && j.copy >= dsFirst && j.copy <= dsLast)
+      log_draw_states(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, j.frame,
+                      staticScene && j.world.drop.size() == j.drawCount ? j.world.drop.data() : nullptr, j.copy);
   }
   if (motion.joinable() || motionPosted) {
     {
@@ -1593,6 +1682,8 @@ static void make_packet(u8* room, const size_t size, const u32 stages, const u32
   at += lit ? sizeof(Light) * GX::MaxLights : 0;
   p.rawOffset = static_cast<u32>(at), p.rawBytes = rawBytes;
   p.samplesCopy = samples_copy() ? 1 : 0;
+  p.gameLit = g_gameLightOff ? (g_gameLit[0] ? 1u : 0u) | (g_gameLit[1] ? 2u : 0u)
+                             : (st.colorChannelConfig[GX_COLOR0].lightingEnabled ? 1u : 0u) | (st.colorChannelConfig[GX_COLOR1].lightingEnabled ? 2u : 0u);
   p.stateKey = s_stateKeyNow;
   std::memcpy(room + at, vertices, rawBytes);
 }
