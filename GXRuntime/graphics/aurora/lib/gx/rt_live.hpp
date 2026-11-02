@@ -17,6 +17,7 @@ struct Job {
   // filled by the translation workers, each draw in the slot its packet names; these are the only frame buffers, recycled
   std::unique_ptr<DrawRec[]> draws;
   std::unique_ptr<Vertex[]> verts;
+  std::unique_ptr<LightNote[]> notes;  // only with AURORA_RT_LIGHTFACTS
   std::uint32_t baseDraw = 0, baseVert = 0, drawCount = 0;
   std::atomic<std::uint32_t> pending{0}, epoch{0};
   std::atomic<std::uint64_t> translateUs{0};
@@ -26,6 +27,7 @@ struct Job {
   std::vector<LiveTexture> textures;
   float proj[16], viewport[4];
   float road, light, glow, calm, wet;
+  float sunDir[3], sunColour[3];  // the game's own strongest light of the frame in view space, colour 0 if it had none
   double captureMs, rulesMs;
   std::uint64_t copy = 0;
   std::uint32_t mergedLights = 0, lightPicks = 0;

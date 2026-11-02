@@ -6,6 +6,9 @@
 
 namespace aurora::gx::rt {
 extern bool g_neutral;    // AURORA_RT=1: the game's fake reflection stages pass through; rays stand in for them
+extern bool g_gameLightOff;  // AURORA_RT_GAME_LIGHT=0: no game lights in the picture (never anything the game reads)
+extern bool g_noVertexColour;  // AURORA_RT_VERTEX_COLOUR=0: colour channels ignore vertex colour, to see how much light is baked there
+extern bool g_gameLit[2];     // with g_gameLightOff: whether the game asked for lights on this colour channel
 extern bool g_capturing;  // this frame's draws are being written (AURORA_RT_CAPTURE=<file>, AURORA_RT_CAPTURE_AT=<display copy>)
 
 // AURORA_RT_NO_HUD=1 (for the composite's mask): orthographic draws after the frame's first perspective draw are left out

@@ -31,6 +31,9 @@
 //   DrawRec[draws], Vertex[vertices] (three to a triangle), then each texture: u32 w, h, wrapS, wrapT, RGBA8 w*h*4
 namespace aurora::gx::rt {
 bool g_neutral = false;
+bool g_gameLightOff = false;
+bool g_noVertexColour = false;
+bool g_gameLit[2]{};
 bool g_capturing = false;
 bool g_noHud = false;
 bool g_live = false;
@@ -208,6 +211,10 @@ void start() noexcept {
     s_path = path;
   if (const char* at = std::getenv("AURORA_RT_CAPTURE_AT"))
     s_at = std::strtoull(at, nullptr, 10);
+  if (const char* v = std::getenv("AURORA_RT_GAME_LIGHT"); v != nullptr && v[0] == '0')
+    g_gameLightOff = true;
+  if (const char* v = std::getenv("AURORA_RT_VERTEX_COLOUR"); v != nullptr && v[0] == '0')
+    g_noVertexColour = true;
   const char* noHud = std::getenv("AURORA_RT_NO_HUD");
   g_noHud = noHud != nullptr && noHud[0] == '1';
   if (const char* at = std::getenv("AURORA_RT_CAPTURE_COPY"))
@@ -458,6 +465,8 @@ void translate(const Packet& st, DrawRec& d, Vertex* outVerts) noexcept {
     if (fields[clrAttr].type != GX_NONE)
       if (const u8* s = source(clrAttr, v))
         rd_color(s, vf.attrs[clrAttr].type, vc);
+    if (g_noVertexColour)
+      vc[0] = vc[1] = vc[2] = 1.f;
     const auto lit = [&](u32 ctrl, int first, int last) {
       const auto& cc = st.colorChannelConfig[ctrl];
       const auto& cs = st.colorChannelState[ctrl];
@@ -601,6 +610,114 @@ void translate(const Packet& st, DrawRec& d, Vertex* outVerts) noexcept {
 }
 
 #if defined(AURORA_RT_LIVE)
+// AURORA_RT_LIGHTFACTS=<file>: what each draw's light is made of, measured: GX lights, vertex colours or neither. Reads, writes nothing the picture or the game uses.
+void light_note(const Packet& st, LightNote& n) noexcept {
+  const auto* base = reinterpret_cast<const u8*>(&st);
+  const auto* stages = reinterpret_cast<const TevStage*>(base + st.stagesOffset);
+  const u32 count = std::min<u32>(st.numTevStages, 16u);
+  u32 chan = 0;
+  n.readsRas = n.readsReg = 0;
+  for (u32 i = 0; i < count; ++i) {
+    const auto& g = stages[i];
+    if (g.channelId == GX_COLOR1A1 || g.channelId == GX_COLOR1 || g.channelId == GX_ALPHA1)
+      chan = 1;
+    const u32 c[4] = {g.colorPass.a, g.colorPass.b, g.colorPass.c, g.colorPass.d};
+    for (const u32 a : c)
+      n.readsRas |= a == GX_CC_RASC ? 1 : 0, n.readsReg |= (a <= GX_CC_A2 && a >= GX_CC_C0) ? 1 : 0;
+  }
+  const auto& cc = st.colorChannelConfig[GX_COLOR0 + chan];
+  const auto& cs = st.colorChannelState[GX_COLOR0 + chan];
+  n.enabled = cc.lightingEnabled ? 1 : 0, n.ambVtx = cc.ambSrc == GX_SRC_VTX ? 1 : 0, n.matVtx = cc.matSrc == GX_SRC_VTX ? 1 : 0, n.diffFn = cc.diffFn;
+  n.vtxColour = st.vtxDesc[GX_VA_CLR0 + chan] != GX_NONE ? 1 : 0;
+  n.mask = 0;
+  for (int c = 0; c < 4; ++c)
+    n.amb[c] = cs.ambColor[c], n.mat[c] = cs.matColor[c];
+  if (!cc.lightingEnabled)
+    return;
+  const auto* lights = reinterpret_cast<const Light*>(base + st.lightsOffset);
+  for (u32 l = 0; l < 8; ++l) {
+    if (!cs.lightMask.test(l))
+      continue;
+    n.mask |= 1u << l;
+    for (int c = 0; c < 3; ++c)
+      n.pos[l][c] = lights[l].pos[c], n.col[l][c] = lights[l].color[c];
+  }
+}
+// One frame in s_factsEvery: a line a draw of the main view, a line a light in use, the road's normal beside the player's machine
+FILE* s_facts = nullptr;
+u32 s_factsEvery = 30;
+void log_facts(const live::Job& j, const Frame& f) {
+  static u32 n = 0;
+  if (++n % s_factsEvery != 0 || !j.notes || f.main == nullptr)
+    return;
+  const DrawRec* draws = j.draws.get() + j.baseDraw;
+  const Vertex* verts = j.verts.get() + j.baseVert;
+  const LightNote* notes = j.notes.get() + j.baseDraw;
+  const float px = f.main->proj[0], py = f.main->proj[5], ox = f.main->proj[2], oy = f.main->proj[6];
+  std::fprintf(s_facts, "F,%llu,%u,%zu\n", static_cast<unsigned long long>(j.copy), j.drawCount, f.machineLights.size());
+  std::map<std::tuple<u32, int, int, int, int, int, int>, u32> seen;
+  double nearN[3]{};
+  for (u32 i = 0; i < j.drawCount; ++i) {
+    const DrawRec& d = draws[i];
+    if (d.vertices < 3 || d.projType != 0 || d.proj[0] != f.main->proj[0] || d.proj[5] != f.main->proj[5])
+      continue;
+    const LightNote& o = notes[i];
+    double solid = 0, nx = 0, ny = 0, nz = 0, lumSum = 0;
+    float lo = 1e9f, hi = -1e9f;
+    float mn[3] = {1e30f, 1e30f, 1e30f}, mx[3] = {-1e30f, -1e30f, -1e30f};
+    double rgb[3]{};
+    for (u32 v = 0; v < d.vertices; ++v) {
+      const Vertex& a = verts[d.firstVertex + v];
+      const float l = a.ras[0] * 0.3f + a.ras[1] * 0.59f + a.ras[2] * 0.11f;
+      lo = std::min(lo, l), hi = std::max(hi, l), lumSum += l;
+      for (int c = 0; c < 3; ++c)
+        mn[c] = std::min(mn[c], a.pos[c]), mx[c] = std::max(mx[c], a.pos[c]), rgb[c] += a.ras[c];
+    }
+    for (u32 v = 0; v + 2 < d.vertices; v += 3) {
+      const float* p0 = verts[d.firstVertex + v].pos;
+      const float* p1 = verts[d.firstVertex + v + 1].pos;
+      const float* p2 = verts[d.firstVertex + v + 2].pos;
+      const double e1[3] = {p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]}, e2[3] = {p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]};
+      double cr[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+      const double m[3] = {(p0[0] + p1[0] + p2[0]) / 3.0, (p0[1] + p1[1] + p2[1]) / 3.0, (p0[2] + p1[2] + p2[2]) / 3.0};
+      if (m[2] >= -0.1)
+        continue;
+      const double dist = std::sqrt(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
+      // towards the view, whichever way the triangle was wound
+      const double side = cr[0] * m[0] + cr[1] * m[1] + cr[2] * m[2];
+      if (side > 0)
+        cr[0] = -cr[0], cr[1] = -cr[1], cr[2] = -cr[2];
+      nx += cr[0], ny += cr[1], nz += cr[2];
+      const double sx = m[0] / -m[2] * px + ox, sy = m[1] / -m[2] * py + oy;
+      if (std::abs(sx) < 1.2 && std::abs(sy) < 1.2)
+        solid += std::abs(side) / 2 / (dist * dist * dist);
+      if (d.depthUpdate && d.blendMode != 1 && dist < 30) {
+        // the track close by, its normal by area
+        nearN[0] += cr[0], nearN[1] += cr[1], nearN[2] += cr[2];
+      }
+    }
+    const double len = std::max(std::sqrt(nx * nx + ny * ny + nz * nz), 1e-9);
+    const double dn = static_cast<double>(d.vertices);
+    const bool machine = beside_engine_light(d, verts, f.machineLights);
+    const float ext = std::max({mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]});
+    u32 tex = 0;
+    for (u32 s = 0; s < std::min<u32>(d.stages, 16u); ++s)
+      tex += d.stage[s].tex != UINT32_MAX && d.stage[s].map != GX_TEXMAP_NULL ? 1 : 0;
+    std::fprintf(s_facts, "D,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%.1f,%.1f,%.1f,%.1f,%u,%.5f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u\n", i, o.enabled, o.vtxColour, o.ambVtx, o.matVtx, o.mask, o.diffFn, o.readsRas, o.readsReg, d.blendMode, d.blendSrc, d.blendDst,
+                 d.depthUpdate, d.colorUpdate, machine ? 1 : 0, ext, (mn[0] + mx[0]) / 2, (mn[1] + mx[1]) / 2, (mn[2] + mx[2]) / 2, d.vertices / 3, solid, lumSum / dn, lo, hi, rgb[0] / dn, rgb[1] / dn, rgb[2] / dn, nx / len, ny / len,
+                 nz / len, tex, d.stages);
+    for (u32 l = 0; l < 8; ++l)
+      if ((o.mask >> l) & 1) {
+        const auto key = std::make_tuple(l, static_cast<int>(o.pos[l][0]), static_cast<int>(o.pos[l][1]), static_cast<int>(o.pos[l][2]), static_cast<int>(o.col[l][0] * 255), static_cast<int>(o.col[l][1] * 255), static_cast<int>(o.col[l][2] * 255));
+        if (seen[key]++ == 0)
+          std::fprintf(s_facts, "L,%u,%g,%g,%g,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", l, o.pos[l][0], o.pos[l][1], o.pos[l][2], o.col[l][0], o.col[l][1], o.col[l][2], o.amb[0], o.amb[1], o.amb[2]);
+      }
+  }
+  const double len = std::max(std::sqrt(nearN[0] * nearN[0] + nearN[1] * nearN[1] + nearN[2] * nearN[2]), 1e-9);
+  std::fprintf(s_facts, "G,%.3f,%.3f,%.3f\n", nearN[0] / len, nearN[1] / len, nearN[2] / len);
+  std::fflush(s_facts);
+}
+
 // Translation beside the stream: chunks of packets to a couple of workers, each draw into the slot the stream gave it
 constexpr size_t ChunkSize = 256 * 1024;
 constexpr u32 MostDraws = 32768, MostVerts = 1500000;
@@ -618,6 +735,7 @@ live::Job* s_job = nullptr;
 std::unique_ptr<live::Job> s_jobOwned;
 std::unique_ptr<Chunk> s_chunk;
 u32 s_viewDraws = 0;
+float s_sunPower = 0.f, s_sunPos[3]{}, s_sunCol[3]{};
 u32 s_epoch = 0, s_baseDraw = 0, s_baseVert = 0, s_nextDraw = 0, s_nextVert = 0;
 
 // A light's middle hops as the draws in it change from frame to frame: half a step towards where it was, when it was near
@@ -756,6 +874,8 @@ void run_rules(live::Job& j) {
     log_lights(j, j.frame);
   if (s_lateCheck)
     late_compare(j);
+  if (s_facts != nullptr && j.drawable)
+    log_facts(j, j.frame);
   j.done.set_value();
 }
 
@@ -783,7 +903,11 @@ void worker() {
     for (size_t at = 0; at < c->used;) {
       const auto& p = *reinterpret_cast<const Packet*>(c->data.get() + at);
       if (p.epoch == j.epoch.load(std::memory_order_relaxed))
+      {
         translate(p, j.draws[p.drawSlot], j.verts.get() + p.vertSlot);
+        if (s_facts != nullptr)
+          light_note(p, j.notes[p.drawSlot]);
+      }
       at += p.size;
     }
     j.translateUs.fetch_add(static_cast<u64>(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count()),
@@ -821,6 +945,8 @@ void start_workers() {
         std::setvbuf(s_lightLog, nullptr, _IOFBF, 1 << 20);
     }
     s_lateCheck = std::getenv("AURORA_RT_LATECHECK") != nullptr;
+    if (const char* path = std::getenv("AURORA_RT_LIGHTFACTS"))
+      s_facts = std::fopen(path, "wb");
     for (int i = 0; i < std::max(n, 1); ++i)
       std::thread([] {
         live::name_thread();
@@ -839,6 +965,8 @@ u8* packet_room(size_t need) {
     if (!s_job->draws) {
       s_job->draws.reset(new DrawRec[MostDraws]);
       s_job->verts.reset(new Vertex[MostVerts]);
+      if (s_facts != nullptr)
+        s_job->notes.reset(new LightNote[MostDraws]);
     }
     s_job->pending.store(1, std::memory_order_relaxed);
     s_job->epoch.store(0, std::memory_order_relaxed);
@@ -933,6 +1061,24 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
   if (g_live && st.projType != GX_PERSPECTIVE)
     return;
   const auto liveStart = g_live ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+#if defined(AURORA_RT_LIVE)
+  // The sun: the strongest light any draw of this frame asked for, as the stream has it
+  for (u32 c = 0; c < 2; ++c) {
+    const bool asked = g_gameLightOff ? g_gameLit[c] : st.colorChannelConfig[c].lightingEnabled;
+    if (!asked)
+      continue;
+    for (u32 l = 0; l < 8; ++l)
+      if (st.colorChannelState[c].lightMask.test(l)) {
+        const auto& li = st.lights[l];
+        const float power = li.color[0] + li.color[1] + li.color[2];
+        if (power > s_sunPower) {
+          s_sunPower = power;
+          for (int a = 0; a < 3; ++a)
+            s_sunPos[a] = li.pos[a], s_sunCol[a] = li.color[a];
+        }
+      }
+  }
+#endif
   const u32 stages = std::min<u32>(st.numTevStages, 16u);
   const u32 mtxCount = st.vtxDesc[GX_VA_PNMTXIDX] != GX_NONE ? MaxPnMtx : 1;
   bool lit = false;
@@ -1006,6 +1152,7 @@ static void send_rays() noexcept {
       return;
     auto look = live::take_job();
     look->postOnly = true, look->drawable = true;
+    look->sunColour[0] = look->sunColour[1] = look->sunColour[2] = 0.f;
     look->captureMs = 0, look->rulesMs = 0, look->road = look->light = look->glow = look->calm = look->wet = 0;
     look->copy = s_copyNow;
     look->done = std::promise<void>();
@@ -1021,6 +1168,12 @@ static void send_rays() noexcept {
   job->baseDraw = s_baseDraw, job->baseVert = s_baseVert, job->drawCount = draws;
   job->road = s_road, job->light = s_light, job->glow = s_glow, job->calm = s_calm, job->wet = s_wet;
   job->captureMs = s_captureMs;
+  const float sunLen = std::sqrt(s_sunPos[0] * s_sunPos[0] + s_sunPos[1] * s_sunPos[1] + s_sunPos[2] * s_sunPos[2]);
+  for (int a = 0; a < 3; ++a) {
+    job->sunDir[a] = sunLen > 0.f ? s_sunPos[a] / sunLen : 0.f;
+    job->sunColour[a] = sunLen > 0.f ? s_sunCol[a] : 0.f;
+  }
+  s_sunPower = 0.f;
   job->copy = s_copyNow;
   s_captureMs = 0;
   // the guard the job began with: if the workers are already through, one of them runs the rules

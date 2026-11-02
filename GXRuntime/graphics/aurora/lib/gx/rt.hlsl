@@ -43,6 +43,8 @@ struct Params {
   float glowGain;
   uint glowShow;
   float wet;
+  uint lightRays;    // the surface's light from rays, this many a pixel; 0 off
+  float skyGain, lightReach, bounce, visFloor;
 };
 struct Light { float3 pos; float3 colour; float reach; };
 struct GlowLight { float3 pos; float area; float3 colour; float radius; };
@@ -265,6 +267,52 @@ float3 glow_light(float3 pos, float3 N) {
   q.Proceed();
   return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? sum - topLight * 0.85 : sum;
 }
+// The surface's light from rays (AURORA_RT_LIGHTING=rays): sun x N.L x one shadow ray + sky x how much of the surroundings it sees + what it sees, as bounce. Returned as a factor on the picture: 1 is today's level.
+// A hit counts as closed by distance, all of it near and nothing at lightReach, so a far wall leaves the open track as it is. Glows and additive draws are seen through, adding their light. Reach, floor, gains tuned.
+float3 lighting(float3 pos, float3 N, float dist, inout uint seed) {
+  float3 T = normalize(abs(N.y) < 0.9 ? cross(N, float3(0, 1, 0)) : cross(N, float3(1, 0, 0))), B = cross(N, T);
+  float3 org = pos + N * (0.03 + dist * 0.0005);
+  float open = 0;
+  float3 bounce = 0;
+  for (uint r = 0; r < P.lightRays; ++r) {
+    float u = rnd(seed), a = rnd(seed) * 6.28318;
+    float3 dir = normalize(T * (cos(a) * sqrt(u)) + B * (sin(a) * sqrt(u)) + N * sqrt(max(1 - u, 0)));
+    float through = 1, tmin = 0.02;
+    bool ended = false;
+    for (int i = 0; i < 4 && !ended; ++i) {
+      RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
+      RayDesc ray; ray.Origin = org; ray.Direction = dir; ray.TMin = tmin; ray.TMax = P.lightReach;
+      q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskSeen, ray);
+      q.Proceed();
+      if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) break;
+      float t = q.CommittedRayT();
+      Hit h = fetch(q.CommittedInstanceID() + q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
+      Draw d = Draws[h.draw];
+      tmin = t + 0.02;
+      if (d.cls == 3) continue;
+      float4 c = shade(h, 3.0);
+      if (d.cls == 2) { bounce += through * c.rgb * saturate(c.a); continue; }
+      if (d.cls == 1) { float al = saturate(c.a); bounce += through * c.rgb * al; through *= 1 - al; continue; }
+      float near = t / P.lightReach, closed = saturate(1 - near * near);
+      bounce += through * c.rgb * closed;
+      through *= 1 - closed;
+      ended = true;
+    }
+    open += through;
+  }
+  open /= P.lightRays, bounce /= P.lightRays;
+  float3 result = P.skyGain * max(open, P.visFloor) + P.bounce * bounce;
+  Light sun = Lights[P.lightCount];
+  float ndl = saturate(dot(N, sun.pos));
+  if (ndl > 0 && dot(sun.colour, 1.xxx) > 0) {
+    RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
+    RayDesc ray; ray.Origin = org; ray.Direction = sun.pos; ray.TMin = 0.02; ray.TMax = 100000;
+    q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskSolid, ray);
+    q.Proceed();
+    if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) result += sun.colour * ndl;
+  }
+  return result;
+}
 // Tuned by eye, the material rule's numbers
 static const float MatGapLow = 0.45, MatGapHigh = 0.95; // own brightness against the texture around it: where shine starts and is full
 static const float MatMatte = 0.2, MatPale = 0.1;      // how far Fresnel rises at a grazing view: any surface, and more if pale
@@ -333,6 +381,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         if (P.lightGain > 0 && (d.highlight & 4) == 0) light += engine_light(h.pos, N) * P.lightGain * bareM;
         if (P.glowGain > 0 && (d.highlight & 6) == 0) light += glow_light(h.pos, N) * P.glowGain * bareM;
         if (P.glowShow != 0 && (d.highlight & 2) != 0) { sum = float3(1, -1, 1); light = 0; break; }
+        if (P.lightRays > 0 && (d.highlight & 6) == 0) light += (lighting(h.pos, N, t, seed) - 1) * bareM;
         if (P.mode == 2) { dbg += fr.xxx; break; }
         if (fr > 0.002) {
           float3 R = reflect(v, N);

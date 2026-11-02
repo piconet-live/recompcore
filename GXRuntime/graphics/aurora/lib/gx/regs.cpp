@@ -926,6 +926,11 @@ void xf_chan_ctrl(u8 reg, u32 value) noexcept {
   auto& chan = g_gxState.colorChannelConfig[chanId];
   chan.matSrc = static_cast<GXColorSrc>(reg_get(value, 1, 0));
   chan.lightingEnabled = reg_get(value, 1, 1) != 0;
+  // AURORA_RT_GAME_LIGHT=0: the picture without the game's lights. What the draw asked for stays known, for the sun; only colour channels: alpha may carry a fade.
+  if (rt::g_gameLightOff && chanId < 2) UNLIKELY {
+    rt::g_gameLit[chanId] = chan.lightingEnabled;
+    chan.lightingEnabled = false;
+  }
   u32 lightsLo = reg_get(value, 4, 2);
   chan.ambSrc = static_cast<GXColorSrc>(reg_get(value, 1, 6));
   chan.diffFn = static_cast<GXDiffuseFn>(reg_get(value, 2, 7));

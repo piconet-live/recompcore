@@ -5,6 +5,7 @@
 #include "../webgpu/gpu.hpp"
 #include "gx.hpp"
 #include "gx_fmt.hpp"
+#include "rt_capture.hpp"
 #include "shader_info.hpp"
 
 #include <cstdlib>
@@ -799,7 +800,7 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
   }
 
   if (cc.matSrc == GX_SRC_VTX) {
-    matSrc = vtx_attr(config, static_cast<GXAttr>(GX_VA_CLR0 + i));
+    matSrc = rt::g_noVertexColour && !alpha ? std::string("vec4f(1.0)") : std::string(vtx_attr(config, static_cast<GXAttr>(GX_VA_CLR0 + i)));
   } else if (cc.matSrc == GX_SRC_REG) {
     matSrc = fmt::format("ubuf.cc{0}{1}_mat", i, alpha ? "a"sv : ""sv);
   }

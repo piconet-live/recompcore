@@ -61,6 +61,9 @@ struct Params {
   float glowGain;
   u32 glowShow;
   float wet;
+  // AURORA_RT_LIGHTING=1: the surface's light from rays (rt.hlsl lighting()). rays 0: off
+  u32 lightRays;
+  float skyGain, lightReach, bounce, visFloor;
 };
 
 constexpr u32 Frames = 3, SlotDescriptors = 12, MaxTextures = 8192, PostLevels = 6;
@@ -590,6 +593,30 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   ID3D12GraphicsCommandList4* cl = s.cl.Get();
   if (fr.lights.empty())
     fr.lights.push_back({{0, 0, 1e6f}, {0, 0, 0}, 1.f});
+  const u32 lightCount = static_cast<u32>(fr.lights.size());
+  // one element past the engine lights: the sun, its direction in view space; AURORA_RT_SUN=x,y,z sets a direction fixed to the view, for the test where the game has no light
+  {
+    static const float gain = post_setting("AURORA_RT_SUN_GAIN", 0.f), white = post_setting("AURORA_RT_SUN_WHITE", 0.f);
+    static float fixedDir[3]{};
+    static const bool fixed = [] {
+      const char* v = std::getenv("AURORA_RT_SUN");
+      return v != nullptr && std::sscanf(v, "%f,%f,%f", &fixedDir[0], &fixedDir[1], &fixedDir[2]) == 3;
+    }();
+    const float power = job.sunColour[0] + job.sunColour[1] + job.sunColour[2];
+    const bool own = !fixed && power > 0.f;
+    float d[3] = {own ? job.sunDir[0] : fixedDir[0], own ? job.sunDir[1] : fixedDir[1], own ? job.sunDir[2] : fixedDir[2]};
+    if (!own && !fixed)
+      d[0] = 0.35f, d[1] = 0.8f, d[2] = 0.45f;
+    const float len = std::max(std::hypot(d[0], d[1], d[2]), 1e-5f);
+    EngineLight sun{{d[0] / len, d[1] / len, d[2] / len}, {gain, gain, gain}, 1.f};
+    // the colour as the game's light has it, its brightest channel at 1; AURORA_RT_SUN_WHITE=1 leaves it white
+    if (own && white == 0.f) {
+      const float most = std::max({job.sunColour[0], job.sunColour[1], job.sunColour[2]});
+      for (int a = 0; a < 3; ++a)
+        sun.colour[a] = gain * job.sunColour[a] / most;
+    }
+    fr.lights.push_back(sun);
+  }
   if (fr.stages.empty())
     fr.stages.push_back({});
   stage(s, s.verts, fr.verts.data(), fr.verts.size() * sizeof(Vertex));
@@ -679,7 +706,24 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   p.textures = g.textures;
   p.conserve = 0.7f;
   p.lightGain = job.light;
-  p.lightCount = static_cast<u32>(fr.lights.size());
+  p.lightCount = lightCount;
+  static const u32 lightRays = static_cast<u32>(post_setting("AURORA_RT_LIGHTING", 0.f));
+  static const float skyGain = post_setting("AURORA_RT_SKY", 1.f), reach = post_setting("AURORA_RT_REACH", 150.f), bounce = post_setting("AURORA_RT_BOUNCE", 0.f), floorV = post_setting("AURORA_RT_VIS_FLOOR", 0.3f);
+  // AURORA_RT_LIGHTING_SHOTS=rays,copy,copy..: that many rays on those test pictures only, so a run reaches them at speed
+  static std::vector<u64> shotCopies;
+  static const u32 shotRays = [] {
+    u32 rays = 0;
+    if (const char* v = std::getenv("AURORA_RT_LIGHTING_SHOTS")) {
+      rays = static_cast<u32>(std::atoi(v));
+      for (const char* c = std::strchr(v, ','); c != nullptr; c = std::strchr(c + 1, ','))
+        shotCopies.push_back(std::strtoull(c + 1, nullptr, 10));
+    }
+    return rays;
+  }();
+  bool atShot = false;
+  for (const u64 c : shotCopies)
+    atShot = atShot || (job.copy + 1 >= c && job.copy <= c + 1);
+  p.lightRays = lightRays > 0 && atShot ? shotRays : lightRays, p.skyGain = skyGain, p.lightReach = reach, p.bounce = bounce, p.visFloor = floorV;
   static const float range = [] {
     const char* v = std::getenv("AURORA_RT_LIGHT_RANGE");
     return v != nullptr ? static_cast<float>(std::atof(v)) : 4.f;

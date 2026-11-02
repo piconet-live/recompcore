@@ -34,4 +34,9 @@ struct DrawRec {
   float lightPos[3], lightExtent, lightColour[3], lightBright;
   StageRec stage[16];
 };
+// A draw's lighting as the stream set it, kept beside the draw (AURORA_RT_LIGHTFACTS only)
+struct LightNote {
+  std::uint32_t enabled, vtxColour, ambVtx, matVtx, mask, diffFn, readsRas, readsReg;
+  float amb[4], mat[4], pos[8][3], col[8][3];
+};
 } // namespace aurora::gx::rt
