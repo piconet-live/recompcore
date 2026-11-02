@@ -267,9 +267,10 @@ float3 glow_light(float3 pos, float3 N) {
 }
 // Tuned by eye, the material rule's numbers
 static const float MatGapLow = 0.45, MatGapHigh = 0.95; // own brightness against the texture around it: where shine starts and is full
-static const float MatMatte = 0.3, MatPale = 0.1;      // how far Fresnel rises at a grazing view: any surface, and more if pale
-static const float MatMetal = 0.25;                      // base reflectance a full reflection layer adds to 0.04
-static const float MatMetalDim = 0.5;                   // how much of the surface a full layer gives up to its reflection, never all: no black chrome
+static const float MatMatte = 0.2, MatPale = 0.1;      // how far Fresnel rises at a grazing view: any surface, and more if pale
+static const float MatLayerRise = 0.6;                  // how far Fresnel rises on a full reflection layer: the layer is already the game's own shine
+static const float MatMetal = 0.15;                      // base reflectance a full reflection layer adds to 0.04
+static const float MatMetalDim = 0.7;                   // how much of the surface a full layer gives up to its reflection, never all: no black chrome
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
   float3 raster = Raster[id.xy].rgb;
@@ -325,7 +326,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         float most = max(around.r, max(around.g, around.b)), least = min(around.r, min(around.g, around.b));
         float pale = smoothstep(0.5, 0.9, most) * (1 - saturate((most - least) / max(most, 0.02)));
         float layer = saturate(k);
-        float gloss = lerp(MatMatte + MatPale * pale, 1, layer);
+        float gloss = lerp(MatMatte + MatPale * pale, MatLayerRise, layer);
         float f0 = 0.04 + MatMetal * layer;
         float fr = (f0 + max(gloss - f0, 0) * pow(1 - cosv, 5)) * shine;
         float bareM = 1 - smoothstep(0.15, 0.45, lum(raster) - ownL);
