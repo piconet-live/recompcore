@@ -45,7 +45,7 @@ struct Params {
   float wet;
   uint lightRays;    // the surface's light from rays, this many a pixel; 0 off
   float skyGain, lightReach, bounce, visFloor;
-  uint stableShine;
+  uint stableShine;  // bit 0 stable shine, bit 1 Before holds a picture
 };
 struct Light { float3 pos; float3 colour; float reach; };
 struct GlowLight { float3 pos; float area; float3 colour; float radius; };
@@ -68,6 +68,7 @@ RaytracingAccelerationStructure Scene : register(t0);
 StructuredBuffer<Vertex> Verts : register(t1);
 StructuredBuffer<Draw> Draws : register(t2);
 Texture2D<float4> Raster : register(t3);
+Texture2D<float4> Before : register(t13);  // AURORA_RT_BEFORE_BLENDS=1: the picture before the frame's last blended draws; Raster again if there was no such moment
 StructuredBuffer<Light> Lights : register(t4);
 StructuredBuffer<Stage> Stages : register(t5);
 RWTexture2D<float4> Out : register(u0);
@@ -529,7 +530,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         float3 around = shade(h, 4).rgb;
         float ownL = lum(own), aroundL = lum(around);
         // darker than the texture around it (a gap in a grating, a seam): no shine there
-        float shine = smoothstep(MatGapLow, MatGapHigh, (P.stableShine != 0 ? lum(shade(h, MatShineSofter).rgb) : ownL) / max(aroundL, 0.02));
+        float shine = smoothstep(MatGapLow, MatGapHigh, ((P.stableShine & 1) != 0 ? lum(shade(h, MatShineSofter).rgb) : ownL) / max(aroundL, 0.02));
         // bright and unsaturated, on the whole: its texture reads as specular
         float most = max(around.r, max(around.g, around.b)), least = min(around.r, min(around.g, around.b));
         float pale = smoothstep(0.5, 0.9, most) * (1 - saturate((most - least) / max(most, 0.02)));
@@ -537,7 +538,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         float gloss = lerp(MatMatte + MatPale * pale, MatLayerRise, layer);
         float f0 = 0.04 + MatMetal * layer;
         float fr = (f0 + max(gloss - f0, 0) * pow(1 - cosv, 5)) * shine;
-        float bareM = 1 - smoothstep(0.15, 0.45, lum(raster) - ownL);
+        float bareM = 1 - smoothstep(0.15, 0.45, lum((P.stableShine & 2) != 0 ? Before[id.xy].rgb : raster) - ownL);
         if (P.lightGain > 0 && (d.highlight & 4) == 0) light += engine_light(h.pos, N) * P.lightGain * bareM;
         if (P.glowGain > 0 && (d.highlight & 6) == 0) light += glow_light(h.pos, N) * P.glowGain * bareM;
         if (P.glowShow != 0 && (d.highlight & 2) != 0) { sum = float3(1, -1, 1); light = 0; break; }
@@ -564,7 +565,7 @@ void main(uint3 id : SV_DispatchThreadID) {
           float3 lit = max(seen - under, 0);
           float3 metal = tint * seen - MatMetalDim * under;
           term = fr * lerp(lit, metal, layer) * bareM;
-          if (P.stableShine != 0) term = min(term, max(lum(under), MatAddFloor) * MatAddMost);
+          if ((P.stableShine & 1) != 0) term = min(term, max(lum(under), MatAddFloor) * MatAddMost);
         }
         break;
       }
@@ -605,7 +606,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
     sum += term;
   }
-  if (P.mode == 8) { Out[id.xy] = float4(sum + raster * light, hitDepth); return; }
+  // own light falls on the surface: on what lies under the last blended effects, not on them. They are drawn over as they are.
+  if (P.mode == 8) { Out[id.xy] = float4(sum + ((P.stableShine & 2) != 0 ? Before[id.xy].rgb : raster) * light, hitDepth); return; }
   if (P.mode >= 6) { Out[id.xy] = float4(dbg, 1); return; }
   if (P.mode >= 2) { Out[id.xy] = float4(dbg / P.spp, 1); return; }
   float3 refl = sum / P.spp;

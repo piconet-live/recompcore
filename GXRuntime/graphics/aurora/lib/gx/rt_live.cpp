@@ -67,10 +67,10 @@ struct Params {
   // AURORA_RT_LIGHTING=1: the surface's light from rays (rt.hlsl lighting()). rays 0: off
   u32 lightRays;
   float skyGain, lightReach, bounce, visFloor;
-  u32 stableShine;  // AURORA_RT_SHINE_STABLE=1
+  u32 stableShine;  // bit 0: AURORA_RT_SHINE_STABLE=1; bit 1: t13 holds the picture from before the last blends. The root signature has no room for more words
 };
 
-constexpr u32 Frames = 3, SlotDescriptors = 12, MaxTextures = 8192, PostLevels = 6;
+constexpr u32 Frames = 3, SlotDescriptors = 13, MaxTextures = 8192, PostLevels = 6;
 // As rt.hlsl's PostParams
 struct PostParams {
   float texel[2], range, bloom, dt, grade;
@@ -143,9 +143,11 @@ struct State {
 
   u32 w = 0, h = 0;
   wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
-  ComPtr<ID3D12Resource> inputRes, outputRes, termRes;
-  wgpu::SharedTextureMemory inputMem, outputMem;
-  wgpu::Texture input, output;
+  ComPtr<ID3D12Resource> inputRes, outputRes, termRes, beforeRes;
+  wgpu::SharedTextureMemory inputMem, outputMem, beforeMem;
+  wgpu::Texture input, output, before;
+  bool beforeThis = false;
+  gfx::EncoderTaskId beforeTask = gfx::InvalidEncoderTask;
   wgpu::BindGroup bind;
   wgpu::RenderPipeline pipeline;
   u64 pipelineKey = 0;
@@ -317,7 +319,7 @@ void init_device() {
   r1[1].OffsetInDescriptorsFromTableStart = 8;
   r1[1].Flags = r1[0].Flags;
   r1[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;  // t11, t12: the whole track's meshes and their attributes (rt_scene_live.inl)
-  r1[2].NumDescriptors = 2;
+  r1[2].NumDescriptors = 3;
   r1[2].BaseShaderRegister = 11;
   r1[2].OffsetInDescriptorsFromTableStart = 10;
   r1[2].Flags = r1[0].Flags;
@@ -439,6 +441,13 @@ ComPtr<ID3D12Resource> shared_texture(u32 w, u32 h, DXGI_FORMAT fmt, D3D12_RESOU
   return r;
 }
 
+bool before_setting() {
+  static const bool on = [] {
+    const char* v = std::getenv("AURORA_RT_BEFORE_BLENDS");
+    return v != nullptr && v[0] == '1';
+  }();
+  return on;
+}
 bool denoise_on() {
   static const bool on = [] {
     const char* v = std::getenv("AURORA_RT_DENOISE");
@@ -519,6 +528,8 @@ void make_targets(u32 w, u32 h, wgpu::TextureFormat format) {
   const DXGI_FORMAT dxgi = format == wgpu::TextureFormat::RGBA16Float ? DXGI_FORMAT_R16G16B16A16_FLOAT : format == wgpu::TextureFormat::BGRA8Unorm ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
   g.inputRes = shared_texture(w, h, dxgi, D3D12_RESOURCE_FLAG_NONE, g.inputMem, g.input);
   g.outputRes = shared_texture(w, h, output_format(), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, g.outputMem, g.output);
+  if (before_setting())
+    g.beforeRes = shared_texture(w, h, dxgi, D3D12_RESOURCE_FLAG_NONE, g.beforeMem, g.before);
   if (g.failed)
     return;
   D3D12_HEAP_PROPERTIES hp{};
@@ -838,7 +849,7 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   p.bodyCalm = job.calm;
   p.wet = job.wet;
   static const u32 stableShine = post_setting("AURORA_RT_SHINE_STABLE", 0.f) != 0.f ? 1 : 0;
-  p.stableShine = stableShine;
+  p.stableShine = stableShine | (g.beforeThis ? 2u : 0u);
   p.skyFirst = fr.skyFirstVertex;
   p.glowCount = glowCount;
   p.glowGain = job.glow;
@@ -1049,6 +1060,7 @@ void run_rays(Job& job) {
     sv.Format = g.inputRes->GetDesc().Format;
     sv.Texture2D.MipLevels = 1;
     g.dev->CreateShaderResourceView(g.inputRes.Get(), &sv, cpuh(base + 3));
+    g.dev->CreateShaderResourceView(g.beforeThis ? g.beforeRes.Get() : g.inputRes.Get(), &sv, cpuh(base + 12));
     sv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     g.dev->CreateShaderResourceView(g.termRes.Get(), &sv, cpuh(base + 6));
     D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
@@ -1165,6 +1177,21 @@ void task(const gfx::EncoderTaskContext& ctx, const wgpu::CommandEncoder& cmd, c
   g.pending = std::move(job);
 }
 
+void before_task(const gfx::EncoderTaskContext&, const wgpu::CommandEncoder& cmd, const void* payload, size_t, void*) {
+  TaskPayload p;
+  std::memcpy(&p, payload, sizeof p);
+  const wgpu::Texture color = wgpu::Texture::Acquire(p.color);
+  if (!g.ready || g.failed)
+    return;
+  make_targets(p.w, p.h, static_cast<wgpu::TextureFormat>(p.format));
+  if (g.failed || !g.before)
+    return;
+  const wgpu::TexelCopyTextureInfo src{.texture = color}, dst{.texture = g.before};
+  const wgpu::Extent3D size{.width = p.w, .height = p.h, .depthOrArrayLayers = 1};
+  cmd.CopyTextureToTexture(&src, &dst, &size);
+  g.beforeThis = true;
+}
+
 void draw(const gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass, const void*, size_t, void*) {
   if (g.failed || !g.bind || !g.drawThis)
     return;
@@ -1227,6 +1254,20 @@ std::unique_ptr<Job> take_job() {
   return job;
 }
 
+bool before_on() noexcept { return before_setting(); }
+void snapshot_before() {
+  if (g.failed || !g.ready)
+    return;
+  if (g.beforeTask == gfx::InvalidEncoderTask)
+    g.beforeTask = gfx::register_encoder_task_type({.label = "ray tracing: before blends", .callback = before_task});
+  const gx::fifo::HoldDrain hold;
+  gfx::ResolvedTargets targets;
+  if (!gfx::resolve_pass({.color = true}, targets) || !targets.colorTexture)
+    return;
+  TaskPayload p{nullptr, targets.colorTexture.MoveToCHandle(), targets.width, targets.height, static_cast<u32>(targets.colorFormat)};
+  gfx::push_encoder_task(g.beforeTask, &p, sizeof p);
+}
+
 bool submit_job(std::unique_ptr<Job> job) {
   if (g.failed) {
     job->rules.wait();
@@ -1257,10 +1298,15 @@ void before_frame_submit() {
   if (!g.pending || g.failed)
     return;
   begin_access(g.inputMem, g.input);
+  if (g.before)
+    begin_access(g.beforeMem, g.before);
   webgpu::g_queue.Submit(1, &g.first);
   g.first = {};
   end_access(g.inputMem, g.input);
+  if (g.before)
+    end_access(g.beforeMem, g.before);
   run_rays(*g.pending);
+  g.beforeThis = false;
   give_back(std::move(g.pending));
   begin_access(g.outputMem, g.output);
   g.outputOpen = true;

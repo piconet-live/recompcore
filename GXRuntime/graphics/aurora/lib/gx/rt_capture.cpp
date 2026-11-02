@@ -1459,6 +1459,8 @@ static void send_rays() noexcept {
 }
 #endif
 
+static u32 s_zNow = 0, s_zLast = 0;
+static bool s_beforeTaken = false;
 void before_draw() noexcept {
 #if defined(AURORA_RT_LIVE)
   // AURORA_RT_LIGHTFACTS: where the frame's orthographic draws fall against the scene
@@ -1474,6 +1476,16 @@ void before_draw() noexcept {
   if (g_gxState.projType == GX_PERSPECTIVE) {
     s_seenPerspective = true;
     ++s_viewDraws;
+    // AURORA_RT_BEFORE_BLENDS=1: the frame's last blended draws come after its last depth-writing draw; last frame's count of those says when
+    static const bool beforeOn = live::before_on();
+    if (beforeOn && g_capturing) {
+      if (g_gxState.depthUpdate)
+        ++s_zNow;
+      else if (!s_beforeTaken && s_zLast > 0 && s_zNow >= s_zLast) {
+        s_beforeTaken = true;
+        live::snapshot_before();
+      }
+    }
   } else if (s_seenPerspective)
     send_rays();
 #endif
@@ -1482,6 +1494,7 @@ void before_draw() noexcept {
 void efb_cleared() noexcept {
   if (!g_hook || s_rayed)
     return;
+  s_zNow = 0, s_beforeTaken = false;
 #if defined(AURORA_RT_LIVE)
   forget_draws();
 #endif
@@ -1508,6 +1521,7 @@ void frame_end() noexcept {
   if (g_hook) {
     if (s_seenPerspective)
       send_rays();
+    s_zLast = s_zNow, s_zNow = 0, s_beforeTaken = false;
     s_rayed = false;
     s_seenPerspective = false;
     forget_draws();
