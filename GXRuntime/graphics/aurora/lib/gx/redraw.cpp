@@ -20,6 +20,7 @@
 #include "redraw.hpp"
 
 #include "../gfx/frame.hpp"
+#include "../gfx/upload_read.hpp"
 #include "rt_capture.hpp"
 #include "rt_live.hpp"
 
@@ -605,7 +606,8 @@ void keep_vertices(Notes& notes, const u8* vertices, std::size_t size) noexcept 
     s.alignedAt = static_cast<u32>(from);
     s.alignedBytes = static_cast<u32>(to - from);
     s.bytesAt = static_cast<u32>(notes.bytes.size());
-    notes.bytes.insert(notes.bytes.end(), vertices + from, vertices + to);
+    notes.bytes.resize(notes.bytes.size() + (to - from));
+    gfx::copy_from_upload(notes.bytes.data() + s.bytesAt, vertices + from, to - from);
   }
 }
 

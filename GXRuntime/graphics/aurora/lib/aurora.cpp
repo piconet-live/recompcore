@@ -428,7 +428,11 @@ void end_frame() noexcept {
     }
     webgpu::gpu_prof::frame_end(encoder);
     const wgpu::CommandBufferDescriptor cmdBufDescriptor{.label = "Redraw command buffer"};
-    const auto buffer = encoder.Finish(&cmdBufDescriptor);
+    wgpu::CommandBuffer buffer;
+    {
+      gfx::stagelog::Scope finishTime{"ef_finish"};
+      buffer = encoder.Finish(&cmdBufDescriptor);
+    }
     {
       ZoneScopedN("Queue Submit");
       if (gfx::g_beforeFrameSubmit != nullptr)
@@ -443,8 +447,11 @@ void end_frame() noexcept {
                                     g_timingGpuDoneNs.store(timing_now_ns(), std::memory_order_release);
                                   });
     }
-    webgpu::gpu_prof::after_submit();
-    gfx::efb_readback::after_submit();
+    {
+      gfx::stagelog::Scope readbackTime{"ef_readback"};
+      webgpu::gpu_prof::after_submit();
+      gfx::efb_readback::after_submit();
+    }
     if (canPresent && g_surface) {
       ZoneScopedN("Present");
       wgpu::ConvertibleStatus status = wgpu::Status::Error;

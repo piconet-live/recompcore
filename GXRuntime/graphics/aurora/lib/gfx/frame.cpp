@@ -1,4 +1,5 @@
 #include "stagelog.hpp"
+#include "upload_read.hpp"
 #include "efb_readback.hpp"
 #include "frame.hpp"
 
@@ -748,10 +749,15 @@ void end_frame(EndFrameCallback callback) {
   render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, callback = std::move(callback), notes = std::move(notes)]() mutable {
     auto& packet = g_framePackets[frameSlot];
     if (gx::redraw::g_on) {
-      g_heldUniforms.assign(packet.uniforms.data(), packet.uniforms.data() + packet.uniforms.size());
+      stagelog::Scope keepTime{"ef_keep"};
+      g_heldUniforms.resize(packet.uniforms.size());
+      copy_from_upload(g_heldUniforms.data(), packet.uniforms.data(), packet.uniforms.size());
       gx::redraw::keep_vertices(notes, packet.verts.data(), packet.verts.size());
     }
-    g_stagingBuffers[stagingSlot].Unmap();
+    {
+      stagelog::Scope unmapTime{"ef_unmap"};
+      g_stagingBuffers[stagingSlot].Unmap();
+    }
     g_mappingStates[stagingSlot].store(BufferMapState::Unmapped, std::memory_order_release);
     auto encoder = std::move(packet.encoder);
     const auto stats = packet.stats;
@@ -771,11 +777,15 @@ void end_frame(EndFrameCallback callback) {
     g_resources.stats.lastStorageSize = stats.lastStorageSize;
     g_resources.stats.lastTextureUploadSize = stats.lastTextureUploadSize;
     if (callback) {
+      stagelog::Scope callbackTime{"ef_callback"};
       callback(encoder, std::move(afterSubmitCallbacks));
     }
     g_frameSlots.release(frameSlot);
-    expire_cached_bind_groups();
-    map_staging_buffer(stagingSlot, true);
+    {
+      stagelog::Scope remapTime{"ef_remap"};
+      expire_cached_bind_groups();
+      map_staging_buffer(stagingSlot, true);
+    }
     stagelog::Scope eventsTime{"process_events"};
     process_events();
   });
