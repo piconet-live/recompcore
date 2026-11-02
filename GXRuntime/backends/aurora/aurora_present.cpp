@@ -674,12 +674,7 @@ void run() {
           const bool shoot = !s->shot_prefix.empty() && shots_taken < shots.size() && copy >= shots[shots_taken];
           if (shoot)
             ++shots_taken;
-          if (shoot)
-            aurora_request_framebuffer_readback();
-          if (!aurora::gx::redraw::draw_picture(*request, index))
-            return;
-          const auto done = Clock::now();
-          if (shoot) {
+          const auto save_shot = [&](const char* kind) {
             const std::uint8_t* rgba = nullptr;
             u32 w = 0, h = 0;
             for (int attempt = 0; attempt < 8000 && !aurora_take_framebuffer_readback(&rgba, &w, &h); ++attempt) {
@@ -688,10 +683,27 @@ void run() {
             }
             if (rgba != nullptr) {
               char path[64];
-              std::snprintf(path, sizeof path, "-between-%06llu-%zu.png", static_cast<unsigned long long>(copy), index);
+              std::snprintf(path, sizeof path, "-%s-%06llu-%zu.png", kind, static_cast<unsigned long long>(copy), index);
               write_png(s->shot_prefix + path, rgba, w, h);
             }
+          };
+          if (shoot) {
+            // the frame again with no correction first: this picture against its own true frame, by the same way
+            aurora::gx::redraw::Request still = *request;
+            auto& p = still.pictures[index];
+            static constexpr aurora::gx::redraw::Matrix one{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+            p.camera = one;
+            p.machine.fill(one);
+            aurora_request_framebuffer_readback();
+            aurora::gx::redraw::draw_picture(still, index);
+            save_shot("still");
+            aurora_request_framebuffer_readback();
           }
+          if (!aurora::gx::redraw::draw_picture(*request, index))
+            return;
+          const auto done = Clock::now();
+          if (shoot)
+            save_shot("between");
           const double took = ms(done - began);
           s->redraw_cost_ms.store(s->redraw_cost_ms.load(std::memory_order_relaxed) * 0.9 + took * 0.1, std::memory_order_relaxed);
           s->redraw_cost_sum += took;

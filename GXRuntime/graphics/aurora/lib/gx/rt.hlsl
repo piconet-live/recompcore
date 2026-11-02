@@ -453,7 +453,9 @@ static const float MatMetal = 0.15;                      // base reflectance a f
 static const float MatMetalDim = 0.7;                   // how much of the surface a full layer gives up to its reflection, never all: no black chrome
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
-  float3 raster = Raster[id.xy].rgb;
+  float2 rasterDim;
+  Raster.GetDimensions(rasterDim.x, rasterDim.y);
+  float3 raster = Raster[int2((id.xy + 0.5) * rasterDim / P.size)].rgb;  // (the rays may run at half the picture's size: AURORA_RT_HALF)
   float3 sum = 0;
   float3 light = 0;
   float3 dbg = 0;
@@ -759,6 +761,7 @@ void atrous(uint3 id : SV_DispatchThreadID) {
 }
 
 // Live: one ray a pixel, so the term is noisy and its edges jagged: a small cross, kept to the same surface by depth, then over the raster
+float3 term_of(Texture2D<float4> from, int2 c);
 [numthreads(8, 8, 1)]
 void compose(uint3 id : SV_DispatchThreadID) {
   int2 c = id.xy;
@@ -772,16 +775,8 @@ void compose(uint3 id : SV_DispatchThreadID) {
     Final[c] = float4(o, 1);
     return;
   }
-  float4 mid = Term[c];
-  float3 sum = mid.rgb;
+  float3 sum = term_of(Term, c);
   float weight = 1;
-  static const int2 off[8] = {int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1), int2(1, 1), int2(-1, 1), int2(1, -1), int2(-1, -1)};
-  for (int i = 0; i < 8; ++i) {
-    float4 o = Term[c + off[i]];
-    float w = (i < 4 ? 0.6 : 0.35) * saturate(1 - abs(o.a - mid.a) / max(mid.a * 0.02, 0.02));
-    sum += o.rgb * w;
-    weight += w;
-  }
 #if KEEP_RANGE
   Final[c] = float4(max(Raster[c].rgb + sum / weight, 0), 1);
 #else
@@ -799,6 +794,27 @@ RWTexture2D<float> Expo : register(u3);
 SamplerState Edge : register(s1);
 
 float3 term_of(Texture2D<float4> from, int2 c) {
+  uint fw, fh, rw, rh;
+  from.GetDimensions(fw, fh);
+  Raster.GetDimensions(rw, rh);
+  if (fw != rw) {
+    // half-size rays: four taps of the term, weighted by how alike the full-size picture is there and here (tuned: 8)
+    const float2 k = float2(rw, rh) / float2(fw, fh);
+    const float2 h = (c + 0.5) / k - 0.5;
+    const int2 i = int2(floor(h));
+    const float2 f = h - i;
+    const float here = lum(Raster[c].rgb);
+    float3 sum = 0;
+    float weight = 0;
+    for (int y = 0; y < 2; ++y)
+      for (int x = 0; x < 2; ++x) {
+        const int2 t = clamp(i + int2(x, y), 0, int2(fw, fh) - 1);
+        const float w = (x ? f.x : 1 - f.x) * (y ? f.y : 1 - f.y) * exp(-8 * abs(here - lum(Raster[int2((t + 0.5) * k)].rgb))) + 1e-4;
+        sum += from[t].rgb * w;
+        weight += w;
+      }
+    return sum / weight;
+  }
   float4 mid = from[c];
   float3 sum = mid.rgb;
   float weight = 1;
@@ -824,7 +840,7 @@ struct BetweenParams {
   float4 camera[3];
   BetweenMachine machine[30];
 };
-ConstantBuffer<BetweenParams> BW : register(b3);
+ConstantBuffer<BetweenParams> BW : register(b2);  // (between_warp alone reads this: DP has the same place, in the other passes)
 [numthreads(8, 8, 1)]
 void between_warp(uint3 id : SV_DispatchThreadID) {
   const float2 x = id.xy + 0.5;

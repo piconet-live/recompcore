@@ -140,6 +140,7 @@ struct State {
   float lastView[10]{};  // viewport's and projection's numbers of the true frame: rect wh, vp xy, vp wh, scale, offset
   BetweenParams betweenParams{};
   ComPtr<ID3D12Resource> termBetween;
+  u32 rw = 0, rh = 0;  // the rays' size
   double msBetweenGpu = 0, msBetweenCpu = 0;
   u64 betweenCount = 0, betweenGpuCount = 0;
   // Light across frames (AURORA_RT_DENOISE=1): textures for this frame and the last; a texture with its descriptors written per step
@@ -358,7 +359,7 @@ void init_device() {
     one[i].BaseShaderRegister = i < 2 ? 8 + i : i;  // t8, t9, u2, u3
     one[i].Flags = r1[0].Flags;
   }
-  D3D12_ROOT_PARAMETER1 rp[11]{};
+  D3D12_ROOT_PARAMETER1 rp[10]{};
   rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   rp[0].Constants.Num32BitValues = sizeof(Params) / 4;
   rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -381,9 +382,6 @@ void init_device() {
   rp[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
   rp[9].Descriptor.ShaderRegister = 2;
   rp[9].Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE;
-  rp[10].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-  rp[10].Descriptor.ShaderRegister = 3;
-  rp[10].Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE;
   D3D12_STATIC_SAMPLER_DESC ss[2]{};
   ss[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
   ss[0].AddressU = ss[0].AddressV = ss[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -394,7 +392,7 @@ void init_device() {
   ss[1].AddressU = ss[1].AddressV = ss[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
   D3D12_VERSIONED_ROOT_SIGNATURE_DESC rs{};
   rs.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
-  rs.Desc_1_1.NumParameters = 11;
+  rs.Desc_1_1.NumParameters = 10;
   rs.Desc_1_1.pParameters = rp;
   rs.Desc_1_1.NumStaticSamplers = 2;
   rs.Desc_1_1.pStaticSamplers = ss;
@@ -534,6 +532,9 @@ void make_targets(u32 w, u32 h, wgpu::TextureFormat format) {
     WaitForSingleObject(g.event, INFINITE);
   }
   g.w = w, g.h = h, g.format = format;
+  // AURORA_RT_HALF=1: rays and their light at half the picture's size each way, and made full-size at the composite
+  static const bool half = post_setting("AURORA_RT_HALF", 0.f) != 0.f;
+  g.rw = half ? std::max(w / 2, 1u) : w, g.rh = half ? std::max(h / 2, 1u) : h;
   const DXGI_FORMAT dxgi = format == wgpu::TextureFormat::RGBA16Float ? DXGI_FORMAT_R16G16B16A16_FLOAT : format == wgpu::TextureFormat::BGRA8Unorm ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
   g.inputRes = shared_texture(w, h, dxgi, D3D12_RESOURCE_FLAG_NONE, g.inputMem, g.input);
   g.outputRes = shared_texture(w, h, output_format(), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, g.outputMem, g.output);
@@ -543,8 +544,8 @@ void make_targets(u32 w, u32 h, wgpu::TextureFormat format) {
   hp.Type = D3D12_HEAP_TYPE_DEFAULT;
   D3D12_RESOURCE_DESC d{};
   d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-  d.Width = w;
-  d.Height = h;
+  d.Width = g.rw;
+  d.Height = g.rh;
   d.DepthOrArraySize = 1;
   d.MipLevels = 1;
   d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -568,7 +569,7 @@ void make_targets(u32 w, u32 h, wgpu::TextureFormat format) {
   if (post_on())
     make_post_targets(w, h);
   if (redraw::g_on) {
-    g.termBetween = post_texture(w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, ViewBetween);
+    g.termBetween = post_texture(g.rw, g.rh, DXGI_FORMAT_R16G16B16A16_FLOAT, ViewBetween);
     if (g.termRes) {
       D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
       sv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -820,7 +821,7 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   srv_buffer(s.worldMeshes.gpu.Get(), static_cast<u32>(std::max<size_t>(job.world.colours.size(), 1)), sizeof(scene::GpuMesh), base + 10);
   srv_buffer(scene::static_on() && job.world.scene == g.worldScene ? g.worldAttrs.Get() : nullptr, g.worldScene ? static_cast<u32>(g.worldScene->attrs.size()) : 1, sizeof(scene::WorldAttr), base + 11);
   Params p{};
-  p.size[0] = static_cast<float>(g.w), p.size[1] = static_cast<float>(g.h);
+  p.size[0] = static_cast<float>(g.rw), p.size[1] = static_cast<float>(g.rh);
   p.rectWH[0] = 640.f, p.rectWH[1] = 528.f;  // the EFB as the snapshot holds it, all of it
   p.vpXY[0] = job.viewport[0], p.vpXY[1] = job.viewport[1], p.vpWH[0] = job.viewport[2], p.vpWH[1] = job.viewport[3];
   p.pScale[0] = job.proj[0], p.pScale[1] = job.proj[5], p.pOffset[0] = job.proj[2], p.pOffset[1] = job.proj[6];
@@ -930,13 +931,13 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
     dp.denoised = 1;
     bind({g.guide[now].Get(), g.motion.Get(), g.noisyOpen.Get(), g.noisySky.Get()});
     cl->SetPipelineState(g.lightPass.Get());
-    cl->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
+    cl->Dispatch((g.rw + 7) / 8, (g.rh + 7) / 8, 1);
     barrier();
     cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot + 2);
     bind({g.guide[now].Get(), g.motion.Get(), g.noisyOpen.Get(), g.noisySky.Get(), g.guide[old].Get(), g.histOpen[old].Get(), g.histSky[old].Get(), g.moments[old].Get(),
           g.tmpOpen[0].Get(), g.tmpSky[0].Get(), g.moments[now].Get()});
     cl->SetPipelineState(g.temporal.Get());
-    cl->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
+    cl->Dispatch((g.rw + 7) / 8, (g.rh + 7) / 8, 1);
     barrier();
     // the first step's result is the next frame's history; then back and forth
     ID3D12Resource* fromO = g.tmpOpen[0].Get();
@@ -947,7 +948,7 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
       ID3D12Resource* toS = i == 0 ? g.histSky[now].Get() : g.tmpSky[i & 1].Get();
       dp.step = 1u << i;
       bind({g.guide[now].Get(), nullptr, fromO, fromS, nullptr, nullptr, nullptr, nullptr, toO, toS});
-      cl->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
+      cl->Dispatch((g.rw + 7) / 8, (g.rh + 7) / 8, 1);
       barrier();
       fromO = toO, fromS = toS;
     }
@@ -966,7 +967,7 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   if (show == 4 && lit) litOpen = g.noisyOpen.Get(), litSky = g.noisySky.Get();
   bind({lit ? g.guide[now].Get() : nullptr, lit ? g.motion.Get() : nullptr, litOpen, litSky, nullptr, nullptr, nullptr, lit ? g.moments[now].Get() : nullptr});
   cl->SetPipelineState(g.trace.Get());
-  cl->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
+  cl->Dispatch((g.rw + 7) / 8, (g.rh + 7) / 8, 1);
   barrier();
   cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot + 4);
 }
@@ -1060,7 +1061,7 @@ void run_between() {
     RT_HR(s.betweenConstants->Map(0, nullptr, &s.betweenMap));
   }
   BetweenParams& b = g.betweenParams;
-  b.size[0] = static_cast<float>(g.w), b.size[1] = static_cast<float>(g.h);
+  b.size[0] = static_cast<float>(g.rw), b.size[1] = static_cast<float>(g.rh);
   b.rectXY[0] = b.rectXY[1] = 0;
   b.rectWH[0] = g.lastView[0], b.rectWH[1] = g.lastView[1];
   b.vpXY[0] = g.lastView[2], b.vpXY[1] = g.lastView[3], b.vpWH[0] = g.lastView[4], b.vpWH[1] = g.lastView[5];
@@ -1097,12 +1098,12 @@ void run_between() {
   const bool rayed = g.haveTerm;
   transition(g.termRes.Get(), true);
   if (rayed) {
-    cl->SetComputeRootConstantBufferView(10, s.betweenConstants->GetGPUVirtualAddress());
+    cl->SetComputeRootConstantBufferView(9, s.betweenConstants->GetGPUVirtualAddress());
     cl->SetPipelineState(g.betweenWarp.Get());
     cl->SetComputeRootDescriptorTable(4, gpuh(ViewBetweenTrue));
     cl->SetComputeRootDescriptorTable(5, gpuh(ViewBetweenTrue));
     cl->SetComputeRootDescriptorTable(6, gpuh(ViewBetween + 1));
-    cl->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
+    cl->Dispatch((g.rw + 7) / 8, (g.rh + 7) / 8, 1);
   }
   cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot + 1);
   for (u32 q = 2; q < 5; ++q)
