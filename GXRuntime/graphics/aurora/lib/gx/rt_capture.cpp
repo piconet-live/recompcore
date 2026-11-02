@@ -1159,6 +1159,8 @@ void run_rules(live::Job& j) {
       scene::match_static(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, s_texAvg, MostTexAvg, j.frame.main->proj[0], j.frame.main->proj[5], j.frame, j.world);
     }
     // AURORA_RT_SCENE_TOGGLES=1: what changed of the static track this frame, a line a frame (scene::Frame's turnedOn and the rest)
+    if (!j.world.viewLog.empty())
+      std::fprintf(stderr, "[rt] view copy %llu %s\n", static_cast<unsigned long long>(j.copy), j.world.viewLog.c_str());
     static const bool toggles = std::getenv("AURORA_RT_SCENE_TOGGLES") != nullptr;
     if (toggles && j.world.known)
       std::fprintf(stderr, "[rt] toggles copy %llu: drawn %u, on %u, off %u, other level %u, static draws kept %u\n", static_cast<unsigned long long>(j.copy), j.world.drawnCount,

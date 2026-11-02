@@ -17,6 +17,7 @@
 #include <array>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -173,6 +174,7 @@ struct Frame {
   // AURORA_RT_SCENE_TOGGLES=1, a line a frame: placements drawn now and not the frame before, the other way, placements drawn at another level
   // than the scene holds, and the frame's draws of static placements kept for the rays (steady: for primary rays alone)
   std::uint32_t turnedOn = 0, turnedOff = 0, lowLevel = 0, staticDraws = 0;
+  std::string viewLog;  // AURORA_RT_VIEW_LOG=1, diagnostic: the frame's line
 };
 // The rules thread, once for each frame in the frame's order or not: the camera, what was drawn. proj0, proj5: the main view's.
 void match(const DrawRec* draws, std::uint32_t count, const Vertex* verts, const float (*texMeans)[4], std::uint32_t texCount,

@@ -657,7 +657,17 @@ std::shared_ptr<Scene> resolve() {
           scene->merged[kind].push_back({blas.firstMesh + k, blas.firstGeometry + k, p});
       }
   scene->learned.assign(scene->meshes.size(), 0);
-  scene->loadMs = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+  // AURORA_RT_VIEW_LOG=1 (diagnostic): each merged element by its index in the world buffer, with its placement and model
+  if (std::getenv("AURORA_RT_VIEW_LOG") != nullptr && merge_on()) {
+    u32 at = static_cast<u32>(scene->meshes.size()) + 1;
+    for (int kind = 0; kind < 2; ++kind)
+      for (const Scene::MergedGeo& g : scene->merged[kind]) {
+        const Placed& p = scene->placed[g.placed];
+        std::fprintf(stderr, "[rt] merged %u kind %d mesh %u cls %u placed %u %s at %.0f %.0f %.0f\n", at++, kind, g.mesh, scene->meshes[g.mesh].cls, g.placed,
+                     g.placed < placedNames.size() ? placedNames[g.placed].c_str() : "?", p.world[3], p.world[7], p.world[11]);
+      }
+  }
+  scene->loadMs =std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
   std::fprintf(stderr, "[rt] scene: %zu placed, %u move, %u names no file holds, %zu models' structures, %zu meshes, %llu triangles (%llu placed), %u meshes declined, %.0f ms\n",
                scene->placed.size(), scene->animated, scene->unresolved, scene->blases.size(), scene->meshes.size(), (unsigned long long)scene->triangles,
                (unsigned long long)scene->trianglesPlaced, scene->declined, scene->loadMs);
@@ -1358,6 +1368,13 @@ void match_static(const DrawRec* draws, u32 count, const Vertex* verts, const fl
   for (u32 i = 0; i < out.streamViews; ++i)
     if (out.stream[i].key == key && out.stream[i].known)
       v = &out.stream[i];
+  // AURORA_RT_VIEW_LOG=1 (diagnostic): how far the world copy of each drawn static placement lies from its draw, in units, at the draw's own
+  // vertices; the draws of static models found at no placement and how far the nearest one is; the camera each matched draw alone gives against the stream's
+  static const bool viewLog = std::getenv("AURORA_RT_VIEW_LOG") != nullptr;
+  out.viewLog.clear();
+  std::vector<float> vErr;
+  float worstAngle = 0.f, worstMovedNear = 0.f, worstErr = 0.f;
+  u32 movedStatic = 0, movedVerts = 0, worstMovedPlaced = None, worstErrPlaced = None;
   if (v != nullptr) {
     out.known = true;
     std::memcpy(out.view, v->view, 48);
@@ -1391,6 +1408,50 @@ void match_static(const DrawRec* draws, u32 count, const Vertex* verts, const fl
         // A draw mid-fade stays a draw this frame: it says nothing of the list, which fades by the state the draw is drawn with, not by its bytes
         if (d.fading == 0 && L.state.load(std::memory_order_relaxed) != ListState::Keep && observe(sc, L, i, d, verts, texMeans, texCount, fr))
           out.drop[i] = 1;
+        if (viewLog) {
+          // the world copy's vertex: view x placement x inverse(draw's matrix) x the draw's vertex
+          float vp[12];
+          Rigid a;
+          multiply(v->view, sc.placed[p].world, vp);
+          if (rigid_a_over_b(vp, d.motionMtx, a)) {
+            float e = 0.f;
+            for (u32 k = 0; k < d.vertices; ++k) {
+              float q[3];
+              rigid_apply(a, verts[d.firstVertex + k].pos, q);
+              const float* o = verts[d.firstVertex + k].pos;
+              e = std::max(e, std::sqrt((q[0] - o[0]) * (q[0] - o[0]) + (q[1] - o[1]) * (q[1] - o[1]) + (q[2] - o[2]) * (q[2] - o[2])));
+            }
+            vErr.push_back(e);
+            if (e > worstErr)
+              worstErr = e, worstErrPlaced = p;
+          }
+          // the camera this draw alone gives, against the stream's: the angle between their rotations
+          float vi[12];
+          Rigid r;
+          if (rigid_a_over_b(d.motionMtx, sc.placed[p].world, r)) {
+            std::memcpy(vi, r.m, 48);
+            const float tr = vi[0] * v->view[0] + vi[1] * v->view[1] + vi[2] * v->view[2] + vi[4] * v->view[4] + vi[5] * v->view[5] + vi[6] * v->view[6] + vi[8] * v->view[8] +
+                             vi[9] * v->view[9] + vi[10] * v->view[10];
+            worstAngle = std::max(worstAngle, std::acos(std::clamp((tr - 1.f) * 0.5f, -1.f, 1.f)) * 57.29578f);
+          }
+        }
+      }
+      if (viewLog && !found) {
+        // a static model's draw at no placement: the nearest placement of any of its lists' models, by position
+        float best = 1e30f;
+        u32 bestP = None;
+        for (u32 n = 0; n < g->count; ++n)
+          for (const PlacedAt& w : sc.placementsOf[sc.lists[g->first + n].model]) {
+            const float* pw = sc.placed[w.placed].world;
+            const float dd = std::hypot(world[3] - pw[3], world[7] - pw[7], world[11] - pw[11]);
+            if (dd < best)
+              best = dd, bestP = w.placed;
+          }
+        if (bestP != None) {
+          ++movedStatic, movedVerts += d.vertices;
+          if (d.vertices >= 16 && best > worstMovedNear)
+            worstMovedNear = best, worstMovedPlaced = bestP;
+        }
       }
       if (found)
         ++out.matched;
@@ -1427,6 +1488,34 @@ void match_static(const DrawRec* draws, u32 count, const Vertex* verts, const fl
       fr.draws.back().firstStage += base;
     }
     fr.stages.insert(fr.stages.end(), sc.staticStages.begin(), sc.staticStages.end());
+    float pairErr = 0.f;
+    if (viewLog)
+      for (const DrawnPair& q : v->drawn) {
+        // a placement the stream skipped: its matrix against the copy's, at its origin and 300 units off it along each view axis
+        float vp[12];
+        Rigid a;
+        multiply(v->view, sc.placed[q.placed].world, vp);
+        if (!rigid_a_over_b(vp, q.m, a))
+          continue;
+        for (int k = 0; k < 7; ++k) {
+          float o[3] = {q.m[3], q.m[7], q.m[11]}, r[3];
+          if (k > 0)
+            o[(k - 1) / 2] += (k & 1) ? 300.f : -300.f;
+          rigid_apply(a, o, r);
+          pairErr = std::max(pairErr, std::hypot(r[0] - o[0], r[1] - o[1], r[2] - o[2]));
+        }
+      }
+    if (viewLog) {
+      std::sort(vErr.begin(), vErr.end());
+      const float* vw = v->view;
+      // the camera in the world: minus the rotation's transpose times its translation; it looks along view -z
+      const float cx = -(vw[0] * vw[3] + vw[4] * vw[7] + vw[8] * vw[11]), cy = -(vw[1] * vw[3] + vw[5] * vw[7] + vw[9] * vw[11]), cz = -(vw[2] * vw[3] + vw[6] * vw[7] + vw[10] * vw[11]);
+      char line[600];
+      std::snprintf(line, sizeof line, "cam %.0f %.0f %.0f up %.2f %.2f %.2f heading %.1f; matched %zu: copy-vs-draw units median %.3f p90 %.3f max %.3f (placed %d), camera angle worst %.3f deg; static-model draws at no placement %u (%u verts), farthest nearest %.0f (placed %d); stream pairs %zu worst %.3f units",
+                    cx, cy, cz, vw[4], vw[5], vw[6], std::atan2(-vw[8], -vw[10]) * 57.29578f, vErr.size(), vErr.empty() ? 0.f : vErr[vErr.size() / 2], vErr.empty() ? 0.f : vErr[vErr.size() * 9 / 10], worstErr,
+                    worstErrPlaced == None ? -1 : int(worstErrPlaced), worstAngle, movedStatic, movedVerts, worstMovedNear, worstMovedPlaced == None ? -1 : int(worstMovedPlaced), v->drawn.size(), pairErr);
+      out.viewLog = line;
+    }
   }
   const size_t firstMerged = sc.meshes.size() + 1;
   out.colours.resize(firstMerged + sc.merged[0].size() + sc.merged[1].size());
