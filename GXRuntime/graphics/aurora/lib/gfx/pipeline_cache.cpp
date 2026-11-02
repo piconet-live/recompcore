@@ -1,3 +1,4 @@
+#include "../thread.hpp"
 #include "stagelog.hpp"
 #include "pipeline_cache.hpp"
 
@@ -1044,6 +1045,13 @@ static void pipeline_worker() {
       }
     }
     const bool wanted = wantedByDraw;
+    // AURORA_PIPELINE_QUIET=1: compiling ahead (thousands of forms all through a race) gives way to the game's threads; a draw's own at normal
+    static const bool quiet = [] {
+      const char* v = std::getenv("AURORA_PIPELINE_QUIET");
+      return v != nullptr && v[0] == '1';
+    }();
+    if (quiet)
+      thread::set_background(!wanted);
     const auto compileStart = std::chrono::steady_clock::now();
     auto result = pending.create();
     const auto compileEnd = std::chrono::steady_clock::now();

@@ -51,4 +51,7 @@ private:
   std::jthread mThread;
 };
 
+// This thread only while it runs work nothing is waiting for: under the game threads when the PC is short of CPU
+void set_background(bool background) noexcept;
+
 } // namespace aurora::thread

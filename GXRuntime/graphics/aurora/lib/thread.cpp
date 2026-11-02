@@ -295,4 +295,12 @@ void set_current(const Options& options) noexcept {
   }
 }
 
+void set_background(bool background) noexcept {
+#if defined(_WIN32)
+  SetThreadPriority(GetCurrentThread(), background ? THREAD_PRIORITY_LOWEST : THREAD_PRIORITY_NORMAL);
+#else
+  (void)background;
+#endif
+}
+
 } // namespace aurora::thread
