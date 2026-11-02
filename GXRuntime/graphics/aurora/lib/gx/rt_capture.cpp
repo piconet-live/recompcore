@@ -231,9 +231,12 @@ void start() noexcept {
   g_noHud = noHud != nullptr && noHud[0] == '1';
   if (const char* at = std::getenv("AURORA_RT_CAPTURE_COPY"))
     s_atCopy = std::strtoull(at, nullptr, 10);
-  g_capturing = g_live || (!s_path.empty() && s_at == 0 && s_atCopy == 0);
+  // the live pass captures from the first frame after its compile is done, see frame_end
+  g_capturing = !g_live && !s_path.empty() && s_at == 0 && s_atCopy == 0;
 #if defined(AURORA_RT_LIVE)
   g_hook = g_live || live::look_on();
+  if (g_hook)
+    live::start_compile();
 #endif
   // AURORA_RT_LOOK=1, the overhaul look: reflections you can't miss. Each number can still be set by its own switch below. All tuned by eye.
   if (const char* v = std::getenv("AURORA_RT_LOOK"); v != nullptr && v[0] == '1') {
@@ -1421,7 +1424,7 @@ void frame_end() noexcept {
     s_seenPerspective = false;
     forget_draws();
     s_viewDraws = 0;
-    g_capturing = g_live && !live::failed();
+    g_capturing = g_live && !live::failed() && live::ready();
     return;
   }
 #endif

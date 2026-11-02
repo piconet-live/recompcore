@@ -18,13 +18,16 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <future>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "../webgpu/gpu.hpp"
@@ -107,7 +110,8 @@ struct Slot {
   u32 tris = 0, lightCount = 0, uploads = 0;
 };
 struct State {
-  bool failed = false, ready = false;
+  // ready: the compile thread has finished, everything below it is the render worker's from then on
+  std::atomic<bool> failed{false}, ready{false};
   ComPtr<ID3D12Device5> dev;
   ComPtr<ID3D12CommandQueue> queue;
   ComPtr<ID3D12Fence> fence;
@@ -220,7 +224,12 @@ D3D12_GPU_DESCRIPTOR_HANDLE gpuh(u32 i) {
 
 // AURORA_RT_SHADER=<file>: the shader read from there instead of the build's own copy, to try a change without a build
 std::string s_shaderFile;
-ComPtr<IDxcBlob> compile(IDxcCompiler3* comp, const wchar_t* entry) {
+ComPtr<IDxcBlob> compile(const DxcCreateInstanceProc create, const wchar_t* entry) {
+  // a compiler for each entry: they run side by side, and one compiler is not for two threads. Below the game's threads.
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+  ComPtr<IDxcCompiler3> comp;
+  if (FAILED(create(CLSID_DxcCompiler, IID_PPV_ARGS(&comp))))
+    return nullptr;
   DxcBuffer src{kShader, sizeof kShader, DXC_CP_UTF8};
   if (!s_shaderFile.empty())
     src.Ptr = s_shaderFile.data(), src.Size = s_shaderFile.size();
@@ -242,7 +251,7 @@ ComPtr<IDxcBlob> compile(IDxcCompiler3* comp, const wchar_t* entry) {
   return out;
 }
 
-// On the render worker, once
+// On its own thread, once, from the start: the compile takes seconds, and nothing else waits for it. The frames show the game's own picture until g.ready.
 void init_device() {
   const auto t0 = std::chrono::steady_clock::now();
   if (webgpu::g_backendType != wgpu::BackendType::D3D12)
@@ -279,8 +288,7 @@ void init_device() {
   if (!dxc)
     return fail("no dxcompiler.dll");
   const auto create = reinterpret_cast<DxcCreateInstanceProc>(GetProcAddress(dxc, "DxcCreateInstance"));
-  ComPtr<IDxcCompiler3> comp;
-  if (!create || FAILED(create(CLSID_DxcCompiler, IID_PPV_ARGS(&comp))))
+  if (!create)
     return fail("no shader compiler");
   if (const char* path = std::getenv("AURORA_RT_SHADER"))
     if (FILE* f = std::fopen(path, "rb")) {
@@ -289,10 +297,10 @@ void init_device() {
         s_shaderFile.append(buf, n);
       std::fclose(f);
     }
-  auto traceCs = compile(comp.Get(), L"main"), composeCs = compile(comp.Get(), L"compose");
-  auto hdrCs = compile(comp.Get(), L"hdr_in"), downCs = compile(comp.Get(), L"bloom_down"), upCs = compile(comp.Get(), L"bloom_up"),
-       expoCs = compile(comp.Get(), L"exposure"), toneCs = compile(comp.Get(), L"tone");
-  auto lightCs = compile(comp.Get(), L"light_pass"), temporalCs = compile(comp.Get(), L"temporal"), atrousCs = compile(comp.Get(), L"atrous");
+  const auto start = [&](const wchar_t* entry) { return std::async(std::launch::async, compile, create, entry); };
+  auto traceF = start(L"main"), composeF = start(L"compose"), hdrF = start(L"hdr_in"), downF = start(L"bloom_down"), upF = start(L"bloom_up"), expoF = start(L"exposure"), toneF = start(L"tone"),
+       lightF = start(L"light_pass"), temporalF = start(L"temporal"), atrousF = start(L"atrous");
+  auto traceCs = traceF.get(), composeCs = composeF.get(), hdrCs = hdrF.get(), downCs = downF.get(), upCs = upF.get(), expoCs = expoF.get(), toneCs = toneF.get(), lightCs = lightF.get(), temporalCs = temporalF.get(), atrousCs = atrousF.get();
   if (!lightCs || !temporalCs || !atrousCs ||
       !traceCs || !composeCs || !hdrCs || !downCs || !upCs || !expoCs || !toneCs)
     return fail("the shader does not compile");
@@ -395,9 +403,9 @@ void init_device() {
       std::fprintf(g.timeLog, "copy,build_ms,light_ms,denoise_ms,reflect_ms,compose_ms,tris,lights,uploads\n");
     }
   }
-  g.ready = true;
-  std::fprintf(stderr, "[rt] live pass ready on Dawn's device, %.0f ms\n",
+  std::fprintf(stderr, "[rt] live pass ready on Dawn's device, %.0f ms, beside the game\n",
                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+  g.ready = true;
 }
 
 ComPtr<ID3D12Resource> shared_texture(u32 w, u32 h, DXGI_FORMAT fmt, D3D12_RESOURCE_FLAGS flags, wgpu::SharedTextureMemory& mem, wgpu::Texture& tex) {
@@ -1135,15 +1143,12 @@ void task(const gfx::EncoderTaskContext& ctx, const wgpu::CommandEncoder& cmd, c
   std::unique_ptr<Job> job{p.job};
   const wgpu::Texture color = wgpu::Texture::Acquire(p.color);
   job->rules.wait();
-  g.drawThis = job->drawable;
+  // not compiled yet: this frame keeps the game's own picture
+  g.drawThis = job->drawable && g.ready && !g.failed;
   if (!g.drawThis) {
     give_back(std::move(job));
     return;
   }
-  if (!g.ready && !g.failed)
-    init_device();
-  if (g.failed)
-    return;
   make_targets(p.w, p.h, static_cast<wgpu::TextureFormat>(p.format));
   if (g.failed)
     return;
@@ -1262,6 +1267,10 @@ void after_frame_submit() {
   }
 }
 bool failed() noexcept { return g.failed; }
+bool ready() noexcept { return g.ready; }
+void start_compile() noexcept {
+  std::thread(init_device).detach();
+}
 bool look_on() noexcept { return post_on(); }
 void name_thread() noexcept { SetThreadDescription(GetCurrentThread(), L"Aurora RT"); }
 } // namespace aurora::gx::rt::live

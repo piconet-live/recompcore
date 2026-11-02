@@ -43,6 +43,9 @@ bool submit_job(std::unique_ptr<Job> job);
 void before_frame_submit();
 void after_frame_submit();
 bool failed() noexcept;
+// The shader and the device's objects, on a thread of their own from the start of the run; no job is taken before ready
+void start_compile() noexcept;
+bool ready() noexcept;
 bool look_on() noexcept;  // AURORA_LOOK_POST=1
 // The name Aurora's fault handler knows its own threads by
 void name_thread() noexcept;
