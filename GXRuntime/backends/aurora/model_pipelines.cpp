@@ -16,7 +16,8 @@
 //
 // Order is what makes this work in a load's time: nearly all the cost of a pipeline is its shader (about 200 ms uncached,
 // against about 1.5 ms for one more pipeline of a shader already made). So the first form of each shader goes first, then the
-// rest (Tier below). The tiers only say when: no form is left out for any model.
+// rest (Tier below). The tiers only say when: no form is left out for any model. Only new shaders get every compile thread;
+// the rest runs on Behind threads, since it runs during the race and a draw's own pipeline wants a free thread.
 //
 // Files are told apart by their contents, not their names: LZ, a U8 archive (a machine's models come in one), a model file.
 // Only the course file goes by its name, the name the game itself opens: it has no mark of its own.
@@ -32,6 +33,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -297,8 +299,8 @@ void plan(const PipelineConfig& base, uint8_t fog, int post, bool small) {
   const bool first = s_shaders.insert(std::move(shader)).second;
   const Tier tier = post != 0 ? (small && c.dstAlpha != UINT32_MAX ? PostSmall : Rest)
                     : first && c.dstAlpha != UINT32_MAX ? First
-                    : c.dstAlpha == 255 ? Same
-                                        : Rest;
+                    : first || c.dstAlpha == 255 ? Same
+                                                 : Rest;
   s_tiers[tier].push_back(Form{c, true, false});
   s_tiers[Rest].push_back(Form{c, false, true});
 }
@@ -482,6 +484,10 @@ void run() {
   }
   if (const char* dump = std::getenv("AURORA_TEST_MODEL_DUMP")) s_dump = std::fopen(dump, "wb");
   const auto t0 = Clock::now();
+  static const unsigned behind = [] {
+    const char* v = std::getenv("AURORA_PIPELINE_BEHIND");
+    return v != nullptr && std::atoi(v) > 0 ? unsigned(std::atoi(v)) : 3u;
+  }();
   constexpr size_t Short = 32;  // the compile queue counts as short: later work never stands in front of a file being read
   bool told = true, told_first = true;
   for (;;) {
@@ -491,6 +497,7 @@ void run() {
       std::unique_lock g{s_lock};
       if (s_quit) break;
       if (!s_files.empty()) {
+        aurora::gfx::set_background_compile_threads(UINT_MAX);
         f = std::move(s_files.front());
         s_files.pop_front();
         have = true;
@@ -500,6 +507,7 @@ void run() {
           std::fprintf(stderr, "[pipelines] every shader so far made: %zu shaders, %.0f ms after the first file\n", s_shaders.size(),
                        std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
         }
+        aurora::gfx::set_background_compile_threads(s_tiers[First].empty() ? behind : UINT_MAX);
         const bool more = !tiers_empty() || !s_disc_files.empty();
         const size_t waiting = aurora::gfx::pipelines_waiting();
         if (waiting >= Short || (waiting != 0 && !more)) {

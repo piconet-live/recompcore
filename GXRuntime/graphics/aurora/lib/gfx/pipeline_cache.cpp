@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <climits>
 #include <chrono>
 #include <cstdio>
 #include <condition_variable>
@@ -996,6 +997,15 @@ static void report_skipped_draws() {
   g_frameSkippedDraws = 0;
 }
 
+// How many compile threads may work on the background queue at once; a draw's pipeline can always take any thread
+static std::atomic_uint g_backgroundLimit{UINT_MAX};
+static unsigned g_backgroundWorking = 0;  // under g_pipelineMutex
+
+void set_background_compile_threads(unsigned count) {
+  g_backgroundLimit = count;
+  g_pipelineQueueCv.notify_all();
+}
+
 static void pipeline_worker() {
 #ifdef TRACY_ENABLE
   tracy::SetThreadName("Pipeline compilation thread");
@@ -1014,7 +1024,8 @@ static void pipeline_worker() {
       std::unique_lock lock{g_pipelineMutex};
       if (g_hasPipelineThread) {
         g_pipelineQueueCv.wait(lock, [] {
-          return !g_pipelineQueue.empty() || !g_backgroundPipelineQueue.empty() || g_pipelineThreadEnd;
+          return !g_pipelineQueue.empty() || g_pipelineThreadEnd ||
+                 (!g_backgroundPipelineQueue.empty() && g_backgroundWorking < g_backgroundLimit);
         });
       } else if (g_pipelineQueue.empty() && g_backgroundPipelineQueue.empty()) {
         return;
@@ -1026,6 +1037,9 @@ static void pipeline_worker() {
       auto& source = !g_pipelineQueue.empty() ? g_pipelineQueue : g_backgroundPipelineQueue;
       pending = std::move(source.front());
       source.pop_front();
+      if (!wantedByDraw) {
+        ++g_backgroundWorking;
+      }
     }
     const bool wanted = wantedByDraw;
     const auto compileStart = std::chrono::steady_clock::now();
@@ -1041,6 +1055,12 @@ static void pipeline_worker() {
       std::lock_guard lock{g_pipelineMutex};
       g_pipelines.try_emplace(pending.hash, std::move(result));
       g_pendingPipelines.erase(pending.hash);
+      if (!wanted) {
+        --g_backgroundWorking;
+      }
+    }
+    if (!wanted) {
+      g_pipelineQueueCv.notify_one();
     }
     if (!g_hasPipelineThread) {
       g_pipelinesPerFrame += std::max(1u, pipelineCount);

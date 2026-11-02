@@ -43,6 +43,7 @@ PipelineRef find_pipeline(const rmlui::PipelineConfig& config);
 // A GX pipeline a draw will want, compiled ahead on the compile threads. Any thread.
 void precompile_pipeline(const gx::PipelineConfig& config, bool scene_target = true, bool other_target = true);
 size_t pipelines_waiting();
+void set_background_compile_threads(unsigned count);
 size_t pipelines_compiled();
 
 bool get_pipeline(PipelineRef ref, CompiledPipeline& pipeline);
