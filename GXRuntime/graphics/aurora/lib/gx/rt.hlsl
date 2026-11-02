@@ -45,7 +45,7 @@ struct Params {
   float wet;
   uint lightRays;    // the surface's light from rays, this many a pixel; 0 off
   float skyGain, lightReach, bounce, visFloor;
-  uint stableShine;  // bit 0 stable shine, bit 1 Before holds a picture
+  uint stableShine;  // bit 0 stable shine, bit 1 Before holds a picture, bit 2 AURORA_RT_PAIR_GAP
 };
 struct Light { float3 pos; float3 colour; float reach; };
 struct GlowLight { float3 pos; float area; float3 colour; float radius; };
@@ -358,6 +358,12 @@ float3 glow_light(float3 pos, float3 N) {
 static const float LitStrongLow = 0.5, LitStrongHigh = 0.9, LitSkyTint = 0.4, LitMost = 1.25;
 // Tuned: the most one ray can bring, so one lucky ray at a bright source doesn't sparkle
 static const float LitRayMost = 2.0;
+// AURORA_RT_PAIR_GAP=1 (bit 2 of stableShine), for the static track (AURORA_RT_SCENE_STATIC=1): a primary ray that meets a placement the game drew, on a
+// triangle with no draw of it yet (a part still drawn: its draw is in the rays), went on from 0.02 past it. That draw lies on the same surface, transformed
+// another way: where it lies a hair behind, the step skipped it too and the pixel took no light, a pixel at a time (speckle on far dunes) or a whole facet.
+// With this, the next look is for draws alone, in a window around that hit as wide as the two transforms part: a share of the distance. Nothing found: as before.
+static const float PairGapLeast = 0.02, PairGapShare = 0.002;
+bool pair_gap_on() { return (P.stableShine & 4) != 0; }
 // What the rays bring a surface: how open it is, what it sees as bounce, what it sees of the sky. xi: the first ray's place in the hemisphere, the rest follow by a fixed sequence.
 // A hit counts as closed by distance, all of it near and nothing at lightReach, so a far wall leaves the open track as it is. Glows and additive draws are seen through, adding their light. Reach tuned.
 void light_rays(float3 pos, float3 N, float dist, float2 xi, out float open, out float3 bounce, out float3 skySeen) {
@@ -529,19 +535,23 @@ void main(uint3 id : SV_DispatchThreadID) {
         return;
       }
     }
+    float gapAt = -1;  // AURORA_RT_PAIR_GAP: >= 0 when this look is the window for draws around a drawn placement's hit there
     for (int i = 0; i < 8; ++i) {
       RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
-      RayDesc ray; ray.Origin = 0; ray.Direction = v; ray.TMin = tmin; ray.TMax = 100000;
-      q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskPrimary, ray);
+      const bool gapLook = gapAt >= 0;
+      const float gapT = gapAt, gapR = PairGapLeast + gapAt * PairGapShare;
+      gapAt = -1;
+      RayDesc ray; ray.Origin = 0; ray.Direction = v; ray.TMin = gapLook ? max(gapT - gapR, 0.01) : tmin; ray.TMax = gapLook ? gapT + gapR : 100000;
+      q.TraceRayInline(Scene, RAY_FLAG_NONE, gapLook ? MaskSeen : MaskPrimary, ray);
       q.Proceed();
-      if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) break;
+      if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) { if (gapLook) continue; break; }
       float t = q.CommittedRayT();
       Hit h;
       const bool worldHit = q.CommittedInstanceID() >= WorldId;
       if (worldHit) {
         WorldMesh wm = world_mesh(q.CommittedInstanceID(), q.CommittedGeometryIndex());
         // a part still drawn: its draw is in the rays; a part never drawn: the raster has nothing of it here
-        if (!world_fetch(wm, q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), q.CommittedObjectToWorld3x4(), h)) { tmin = t + 0.02; continue; }
+        if (!world_fetch(wm, q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), q.CommittedObjectToWorld3x4(), h)) { tmin = t + 0.02; if (pair_gap_on()) gapAt = t; continue; }
       } else {
         h = fetch(q.CommittedInstanceID() + q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
       }
@@ -687,12 +697,16 @@ void light_pass(uint3 id : SV_DispatchThreadID) {
   float3 pp = float3(dot(DP.cam[0], float4(v, 0)), dot(DP.cam[1], float4(v, 0)), dot(DP.cam[2], float4(v, 0))) * 10000;
   float3 prevAt = pp;
   float prevZ = 0, smear = 1;
+  float gapAt = -1;  // AURORA_RT_PAIR_GAP, as main's
   for (int i = 0; i < 8; ++i) {
     RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
-    RayDesc ray; ray.Origin = 0; ray.Direction = v; ray.TMin = tmin; ray.TMax = 100000;
-    q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskPrimary, ray);
+    const bool gapLook = gapAt >= 0;
+    const float gapT = gapAt, gapR = PairGapLeast + gapAt * PairGapShare;
+    gapAt = -1;
+    RayDesc ray; ray.Origin = 0; ray.Direction = v; ray.TMin = gapLook ? max(gapT - gapR, 0.01) : tmin; ray.TMax = gapLook ? gapT + gapR : 100000;
+    q.TraceRayInline(Scene, RAY_FLAG_NONE, gapLook ? MaskSeen : MaskPrimary, ray);
     q.Proceed();
-    if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) break;
+    if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) { if (gapLook) continue; break; }
     float t = q.CommittedRayT();
     uint prim = q.CommittedInstanceID() + q.CommittedPrimitiveIndex();
     float2 bary = q.CommittedTriangleBarycentrics();
@@ -700,7 +714,7 @@ void light_pass(uint3 id : SV_DispatchThreadID) {
     const bool worldHit = q.CommittedInstanceID() >= WorldId;
     if (worldHit) {
       WorldMesh wm = world_mesh(q.CommittedInstanceID(), q.CommittedGeometryIndex());
-      if (!world_fetch(wm, q.CommittedPrimitiveIndex(), bary, q.CommittedObjectToWorld3x4(), h)) { tmin = t + 0.02; continue; }
+      if (!world_fetch(wm, q.CommittedPrimitiveIndex(), bary, q.CommittedObjectToWorld3x4(), h)) { tmin = t + 0.02; if (pair_gap_on()) gapAt = t; continue; }
     } else {
       h = fetch(prim, bary);
     }

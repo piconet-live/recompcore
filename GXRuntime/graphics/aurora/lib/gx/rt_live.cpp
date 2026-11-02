@@ -69,7 +69,7 @@ struct Params {
   // AURORA_RT_LIGHTING=1: the surface's light from rays (rt.hlsl lighting()). rays 0: off
   u32 lightRays;
   float skyGain, lightReach, bounce, visFloor;
-  u32 stableShine;  // bit 0: AURORA_RT_SHINE_STABLE=1; bit 1: t13 holds the picture from before the last blends. The root signature has no room for more words
+  u32 stableShine;  // bit 0: AURORA_RT_SHINE_STABLE=1; bit 1: t13 holds the picture from before the last blends; bit 2: AURORA_RT_PAIR_GAP=1. The root signature has no room for more words
 };
 
 constexpr u32 Frames = 3, SlotDescriptors = 13, MaxTextures = 8192, PostLevels = 6;
@@ -913,7 +913,9 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   p.bodyCalm = job.calm;
   p.wet = job.wet;
   static const u32 stableShine = post_setting("AURORA_RT_SHINE_STABLE", 0.f) != 0.f ? 1 : 0;
-  p.stableShine = stableShine | (g.beforeThis ? 2u : 0u);
+  // AURORA_RT_PAIR_GAP=1 (rt.hlsl pair_gap_on): a primary ray past a drawn placement's triangle with no draw of it looks for that draw just around it
+  static const u32 pairGap = post_setting("AURORA_RT_PAIR_GAP", 0.f) != 0.f ? 4 : 0;
+  p.stableShine = stableShine | (g.beforeThis ? 2u : 0u) | pairGap;
   p.skyFirst = fr.skyFirstVertex;
   p.glowCount = glowCount;
   p.glowGain = job.glow;
