@@ -80,6 +80,8 @@ void complete_map(wgpu::MapAsyncStatus status, wgpu::StringView message) {
         g_readyHeight = g_copyHeight;
         g_ready = true;
         g_buffer.Unmap();
+        g_retiredBuffer = std::move(g_buffer);
+        g_inFlight = false;
         return;
       }
       for (uint32_t y = 0; y < g_copyHeight; ++y) {
