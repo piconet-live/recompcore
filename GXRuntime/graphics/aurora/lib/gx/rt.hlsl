@@ -919,6 +919,27 @@ void atrous(uint3 id : SV_DispatchThreadID) {
 
 // Live: one ray a pixel, so the term is noisy and its edges jagged: a small cross, kept to the same surface by depth, then over the raster
 float3 term_of(Texture2D<float4> from, int2 c);
+// The glow (AURORA_RT_FLARE, AURORA_RT_HOT_CORE: see flare_src below); its numbers come from rt_live.cpp as the shader compiles
+#ifndef FLARE
+#define FLARE 0
+#endif
+#ifndef HOT_CORE
+#define HOT_CORE 0
+#endif
+#ifndef FLARE_KNEE
+#define FLARE_KNEE 1.0
+#define FLARE_REACH 0.03
+#define FLARE_HALF 1.0
+#define FLARE_ARMS 0.5
+#define FLARE_HALO 0.6
+#define FLARE_SAT 1.3
+#define FLARE_GAIN 1.0
+#define FLARE_TAPS 24
+#define FLARE_SHOW 0
+#define HOT_CORE_HALF 1.0
+#endif
+float3 glow_core(float3 raster);
+float3 glow_flare(int2 c);
 [numthreads(8, 8, 1)]
 void compose(uint3 id : SV_DispatchThreadID) {
   int2 c = id.xy;
@@ -934,10 +955,12 @@ void compose(uint3 id : SV_DispatchThreadID) {
   }
   float3 sum = term_of(Term, c);
   float weight = 1;
+  float3 shown = glow_core(Raster[c].rgb) + sum / weight + glow_flare(c);
+  if (FLARE_SHOW > 0.5) shown = glow_flare(c);  // AURORA_RT_FLARE_SHOW=1: the glow alone
 #if KEEP_RANGE
-  Final[c] = float4(max(Raster[c].rgb + sum / weight, 0), 1);
+  Final[c] = float4(max(shown, 0), 1);
 #else
-  Final[c] = float4(saturate(Raster[c].rgb + sum / weight), 1);
+  Final[c] = float4(saturate(shown), 1);
 #endif
 }
 
@@ -964,6 +987,92 @@ float3 term_of(Texture2D<float4> from, int2 c) {
   return sum / weight;
 }
 float3 term_at(int2 c) { return term_of(Term, c); }
+
+// Glow (AURORA_RT_FLARE=1, AURORA_RT_HOT_CORE=1, both off by default): engines, sparks and every other light the game stacks above white, given
+// the character the original's clipped 8-bit picture gave it and our raw, hue-holding HDR picture smooths away. Chosen by the picture alone, so
+// any course and any custom track take it the same way: one draw's colour is its TEV's, so in the raw picture (AURORA_LOOK_RAW=1) only light
+// blended over light passes white: additive cards, glows over glows, sparks. A lit wall, the sky and the rays' own light (Term) stay below and
+// never flare.
+//   Hot core (HOT_CORE): above white the light turns towards white at the same brightness, by how far it is over; its falloff below white keeps
+//   the game's own saturated colour.
+//   Flare (FLARE): the game's own star: four arms, across and up, at a quarter of the picture's size, each arm the brightest source along it
+//   fading by distance (a max, not a sum, so a wide boost flame gives an arm as bright as a point, not hundreds of times brighter), and a halo
+//   that bleeds outwards. Only what lies outside a source is added: the inside of a flame never changes. Brighter sources reach further, so as
+//   the game's own glow sprites flicker in alpha and size from frame to frame the arms breathe with them; nothing random.
+float max3(float3 v) { return max(v.r, max(v.g, v.b)); }
+float3 over_white(float3 c) { return max(c - FLARE_KNEE, 0); }
+
+// A quarter-size copy of the light above white: each texel the mean of its 4x4 pixels
+[numthreads(8, 8, 1)]
+void flare_src(uint3 id : SV_DispatchThreadID) {
+  uint w, h; Raster.GetDimensions(w, h);
+  int2 b = int2(id.xy) * 4, most = int2(w, h) - 1;
+  float3 sum = 0;
+  for (int y = 0; y < 4; ++y)
+    for (int x = 0; x < 4; ++x) sum += over_white(Raster[min(b + int2(x, y), most)].rgb);
+  Dest[id.xy] = float4(sum / 16, 1);
+}
+
+// The arms and the halo at a quarter of the size. Taps 2 texels apart, each between two texels (the sampler's linear filter), so no source of one
+// texel is skipped.
+[numthreads(8, 8, 1)]
+void flare_star(uint3 id : SV_DispatchThreadID) {
+  float2 at = id.xy + 0.5;
+  float3 self = ReadA.SampleLevel(Edge, at * PP.texel, 0).rgb;
+  float reachMost = FLARE_REACH / PP.texel.x;  // a share of the picture's width, in quarter texels
+  static const float2 dirs[4] = {float2(1, 0), float2(-1, 0), float2(0, 1), float2(0, -1)};
+  // tuned by eye: the arms up and down as long as this share of those across (a wide picture's star, as a lens draws it)
+  static const float Upright = 0.7;
+  float3 arms = 0;
+  for (int k = 0; k < 4; ++k) {
+    float best = 0;
+    float3 bestC = 0;
+    for (int i = 1; i <= FLARE_TAPS; ++i) {
+      float d = 2 * i - 0.5;
+      float3 e = ReadA.SampleLevel(Edge, (at + dirs[k] * d) * PP.texel, 0).rgb;
+      float m = max3(e);
+      // brighter reaches further: the arm's length follows the source's own brightness
+      float reach = reachMost * (k < 2 ? 1 : Upright) * sqrt(m / (m + FLARE_HALF));
+      // and every arm fades to nothing by the last tap, so none ends in a cut
+      float taper = saturate(1 - d / (2 * FLARE_TAPS));
+      float v = m * exp(-d / max(reach, 1e-3)) * taper * taper;
+      if (v > best) best = v, bestC = e * (v / max(m, 1e-6));
+    }
+    // the pixel's own light is no arm: only what reaches past it, so the inside of a wide flame never changes while an arm still
+    // crosses the soft edge of a glow
+    arms += max(bestC - self, 0);
+  }
+  float3 halo = 0;
+  float hw = 0;
+  for (int y = -2; y <= 2; ++y)
+    for (int x = -2; x <= 2; ++x) {
+      float g = exp(-(x * x + y * y) / 3.0);
+      halo += g * ReadA.SampleLevel(Edge, (at + float2(x, y)) * PP.texel, 0).rgb;
+      hw += g;
+    }
+  halo = max(halo / hw - self, 0);
+  float3 o = arms * FLARE_ARMS + halo * FLARE_HALO;
+  // the game's colour, more of it: no grey arms
+  float l = dot(o, float3(0.3, 0.59, 0.11));
+  Dest[id.xy] = float4(max(lerp(l.xxx, o, FLARE_SAT), 0), 1);
+}
+
+// What the glow adds to a pixel of the composed picture, over its raster
+float3 glow_core(float3 raster) {
+#if HOT_CORE
+  float over = max3(raster) - 1;
+  if (over > 0) raster = lerp(raster, max3(raster).xxx, saturate(over / (over + HOT_CORE_HALF)));
+#endif
+  return raster;
+}
+float3 glow_flare(int2 c) {
+#if FLARE
+  uint w, h; Final.GetDimensions(w, h);
+  return ReadA.SampleLevel(Edge, (c + 0.5) / float2(w, h), 0).rgb * FLARE_GAIN;
+#else
+  return 0;
+#endif
+}
 
 // Pictures between (AURORA_REDRAW with rays): light and reflections once per true frame, carried to each picture. Each pixel looks for the
 // true frame's pixel that lands on it: from a guess, that pixel's own hit distance gives its place in the true view; the place decides
@@ -1017,10 +1126,12 @@ void between_hdr(uint3 id : SV_DispatchThreadID) {
 [numthreads(8, 8, 1)]
 void between_compose(uint3 id : SV_DispatchThreadID) {
   int2 c = id.xy;
+  float3 shown = glow_core(Raster[c].rgb) + term_of(ReadB, c) + glow_flare(c);
+  if (FLARE_SHOW > 0.5) shown = glow_flare(c);  // AURORA_RT_FLARE_SHOW=1: the glow alone
 #if KEEP_RANGE
-  Final[c] = float4(max(Raster[c].rgb + term_of(ReadB, c), 0), 1);
+  Final[c] = float4(max(shown, 0), 1);
 #else
-  Final[c] = float4(saturate(Raster[c].rgb + term_of(ReadB, c)), 1);
+  Final[c] = float4(saturate(shown), 1);
 #endif
 }
 

@@ -95,6 +95,8 @@ constexpr u32 DenoiseSteps = 8, DenoiseViews = 13, DenoiseIterations = 4;
 constexpr u32 ConstantStride = 256;
 constexpr u32 ViewBetweenTrue = PostFirst + PostDescriptors - BetweenDescriptors, ViewBetween = ViewBetweenTrue + 1;
 constexpr u32 ViewHdr = PostFirst, ViewDown = ViewHdr + 2, ViewUp = ViewDown + 2 * PostLevels, ViewExpo = ViewUp + 2 * (PostLevels - 1);
+// The glow's two quarter-size textures (AURORA_RT_FLARE=1), each a read view then a write view, after the look's
+constexpr u32 FlareDescriptors = 4, ViewFlare = PostFirst + PostDescriptors;
 
 struct Slot {
   ComPtr<ID3D12CommandAllocator> alloc;
@@ -143,6 +145,10 @@ struct State {
   UINT inc = 0;
   ComPtr<ID3D12RootSignature> root;
   ComPtr<ID3D12PipelineState> trace, compose, lightPass, temporal, atrous, betweenWarp, betweenHdr, betweenCompose;
+  // The glow (AURORA_RT_FLARE=1): the light above white at a quarter of the size, then its arms and halo; compose adds them
+  ComPtr<ID3D12PipelineState> flareSrc, flareStar;
+  ComPtr<ID3D12Resource> flareRes[2];
+  u32 flareW = 0, flareH = 0;
   // pictures between: the true frame's colour texture and view for its rays; this picture's corrections; what they cost
   wgpu::Texture lastColor;
   bool haveTerm = false, pendingBetween = false;
@@ -259,6 +265,46 @@ D3D12_GPU_DESCRIPTOR_HANDLE gpuh(u32 i) {
 
 // AURORA_RT_SHADER=<file>: the shader read from there instead of the build's own copy, to try a change without a build
 std::string s_shaderFile;
+// AURORA_RT_FLARE=1, AURORA_RT_HOT_CORE=1 (off by default): the glow (rt.hlsl, above flare_src). Its numbers, AURORA_RT_FLARE_<NAME> and
+// AURORA_RT_HOT_CORE_HALF, go to the shader as it compiles: no room is left in the root signature's words.
+bool env_one(const char* name) {
+  const char* v = std::getenv(name);
+  return v != nullptr && v[0] == '1';
+}
+bool flare_on() {
+  static const bool on = env_one("AURORA_RT_FLARE");
+  return on;
+}
+bool hot_core_on() {
+  static const bool on = env_one("AURORA_RT_HOT_CORE");
+  return on;
+}
+const std::vector<std::wstring>& shader_defines() {
+  static const std::vector<std::wstring> defines = [] {
+    // KEEP_RANGE: the rays' picture keeps what is above white, for the float display copy (hdr.hpp); otherwise cut as ever
+    std::vector<std::wstring> d{webgpu::hdr::float_copy() ? L"KEEP_RANGE=1" : L"KEEP_RANGE=0", flare_on() ? L"FLARE=1" : L"FLARE=0",
+                                hot_core_on() ? L"HOT_CORE=1" : L"HOT_CORE=0"};
+    // tuned by eye; what each means is at its use in rt.hlsl
+    struct Number {
+      const char* env;
+      const wchar_t* name;
+      float otherwise;
+    };
+    static constexpr Number numbers[] = {{"AURORA_RT_FLARE_KNEE", L"FLARE_KNEE", 1.f},   {"AURORA_RT_FLARE_REACH", L"FLARE_REACH", 0.03f},
+                                         {"AURORA_RT_FLARE_HALF", L"FLARE_HALF", 1.f},   {"AURORA_RT_FLARE_ARMS", L"FLARE_ARMS", 0.5f},
+                                         {"AURORA_RT_FLARE_HALO", L"FLARE_HALO", 0.6f},  {"AURORA_RT_FLARE_SAT", L"FLARE_SAT", 1.3f},
+                                         {"AURORA_RT_FLARE_GAIN", L"FLARE_GAIN", 1.f},   {"AURORA_RT_FLARE_TAPS", L"FLARE_TAPS", 24.f},
+                                         {"AURORA_RT_FLARE_SHOW", L"FLARE_SHOW", 0.f},   {"AURORA_RT_HOT_CORE_HALF", L"HOT_CORE_HALF", 1.f}};
+    for (const auto& n : numbers) {
+      const char* v = std::getenv(n.env);
+      const float f = v != nullptr && v[0] != '\0' ? static_cast<float>(std::atof(v)) : n.otherwise;
+      d.push_back(std::wstring(n.name) + L"=" + std::to_wstring(f));
+    }
+    return d;
+  }();
+  return defines;
+}
+
 ComPtr<IDxcBlob> compile(const DxcCreateInstanceProc create, const wchar_t* entry) {
   // a compiler for each entry: they run side by side, and one compiler is not for two threads. Below the game's threads.
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
@@ -268,10 +314,11 @@ ComPtr<IDxcBlob> compile(const DxcCreateInstanceProc create, const wchar_t* entr
   DxcBuffer src{kShader, sizeof kShader, DXC_CP_UTF8};
   if (!s_shaderFile.empty())
     src.Ptr = s_shaderFile.data(), src.Size = s_shaderFile.size();
-  // KEEP_RANGE: the rays' picture keeps what is above white, for the float display copy (hdr.hpp); otherwise cut as ever
-  LPCWSTR args[] = {L"-T", L"cs_6_5", L"-E", entry, L"-O3", L"-HV", L"2021", L"-D", webgpu::hdr::float_copy() ? L"KEEP_RANGE=1" : L"KEEP_RANGE=0"};
+  std::vector<LPCWSTR> args{L"-T", L"cs_6_5", L"-E", entry, L"-O3", L"-HV", L"2021"};
+  for (const auto& d : shader_defines())
+    args.push_back(L"-D"), args.push_back(d.c_str());
   ComPtr<IDxcResult> res;
-  if (FAILED(comp->Compile(&src, args, _countof(args), nullptr, IID_PPV_ARGS(&res))))
+  if (FAILED(comp->Compile(&src, args.data(), static_cast<UINT32>(args.size()), nullptr, IID_PPV_ARGS(&res))))
     return nullptr;
   ComPtr<IDxcBlobUtf8> errs;
   res->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errs), nullptr);
@@ -303,7 +350,7 @@ void init_device() {
   g.event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
   D3D12_DESCRIPTOR_HEAP_DESC hd{};
   hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-  hd.NumDescriptors = Frames * SlotDescriptors + MaxTextures + PostDescriptors + Frames * DenoiseSteps * DenoiseViews;
+  hd.NumDescriptors = Frames * SlotDescriptors + MaxTextures + PostDescriptors + FlareDescriptors + Frames * DenoiseSteps * DenoiseViews;
   hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   RT_HR(g.dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g.heap)));
   g.inc = g.dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -336,6 +383,10 @@ void init_device() {
   auto traceF = start(L"main"), composeF = start(L"compose"), hdrF = start(L"hdr_in"), downF = start(L"bloom_down"), upF = start(L"bloom_up"), expoF = start(L"exposure"), toneF = start(L"tone"),
        warpF = start(L"between_warp"), betweenHdrF = start(L"between_hdr"), betweenComposeF = start(L"between_compose"),
        lightF = start(L"light_pass"), temporalF = start(L"temporal"), atrousF = start(L"atrous");
+  // the glow's passes only when it is on: a shader file from before them still serves without it
+  std::future<ComPtr<IDxcBlob>> flareSrcF, flareStarF;
+  if (flare_on())
+    flareSrcF = start(L"flare_src"), flareStarF = start(L"flare_star");
   auto traceCs = traceF.get(), composeCs = composeF.get(), hdrCs = hdrF.get(), downCs = downF.get(), upCs = upF.get(), expoCs = expoF.get(), toneCs = toneF.get(), lightCs = lightF.get(), temporalCs = temporalF.get(), atrousCs = atrousF.get();
   auto warpCs = warpF.get(), betweenHdrCs = betweenHdrF.get(), betweenComposeCs = betweenComposeF.get();
   if (!warpCs || !betweenHdrCs || !betweenComposeCs || !lightCs || !temporalCs || !atrousCs ||
@@ -432,6 +483,15 @@ void init_device() {
   for (const auto& [pso, cs] : posts) {
     pd.CS = {cs->GetBufferPointer(), cs->GetBufferSize()};
     RT_HR(g.dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(pso->GetAddressOf())));
+  }
+  if (flare_on()) {
+    const auto flareSrcCs = flareSrcF.get(), flareStarCs = flareStarF.get();
+    if (!flareSrcCs || !flareStarCs)
+      return fail("the shader's glow does not compile");
+    pd.CS = {flareSrcCs->GetBufferPointer(), flareSrcCs->GetBufferSize()};
+    RT_HR(g.dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.flareSrc)));
+    pd.CS = {flareStarCs->GetBufferPointer(), flareStarCs->GetBufferSize()};
+    RT_HR(g.dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.flareStar)));
   }
   if (const char* path = std::getenv("AURORA_RT_TIMELOG")) {
     g.timeLog = std::fopen(path, "wb");
@@ -613,6 +673,11 @@ void make_targets(u32 w, u32 h, wgpu::TextureFormat format) {
   }
   if (post_on())
     make_post_targets(w, h);
+  if (flare_on()) {
+    g.flareW = (w + 3) / 4, g.flareH = (h + 3) / 4;
+    for (u32 i = 0; i < 2; ++i)
+      g.flareRes[i] = post_texture(g.flareW, g.flareH, DXGI_FORMAT_R16G16B16A16_FLOAT, ViewFlare + 2 * i);
+  }
   if (redraw::g_on) {
     g.termBetween = post_texture(g.rw, g.rh, DXGI_FORMAT_R16G16B16A16_FLOAT, ViewBetween);
     if (g.termRes) {
@@ -994,7 +1059,7 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
     RT_HR(s.constants->Map(0, nullptr, &s.constantsMap));
   }
   DenoiseParams dp{};
-  const u32 denoiseFirst = PostFirst + PostDescriptors + g.slot * DenoiseSteps * DenoiseViews;
+  const u32 denoiseFirst = PostFirst + PostDescriptors + FlareDescriptors + g.slot * DenoiseSteps * DenoiseViews;
   u32 stepAt = 0;
   // A step's textures by the order of rt.hlsl's registers u4 on; a null where it reads nothing
   const auto bind = [&](std::initializer_list<ID3D12Resource*> uavs) {
@@ -1089,6 +1154,41 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
 }
 
 // The look: the frame's high range, a bloom chain, exposure, the tone curve. On the frame's own queue: no frame waits for it.
+// The glow's two passes from this picture's raster (t3), true or between; leaves the arms and halo readable at table 4 (t8) for compose,
+// which adds them. flare_after puts both textures back as they were.
+void run_flare(ID3D12GraphicsCommandList4* cl) {
+  PostParams pp{};
+  pp.texel[0] = 1.f / g.flareW, pp.texel[1] = 1.f / g.flareH;
+  const auto barrier = [&](ID3D12Resource* r, bool toRead) {
+    D3D12_RESOURCE_BARRIER b{};
+    b.Transition.pResource = r;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = toRead ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    b.Transition.StateAfter = toRead ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    cl->ResourceBarrier(1, &b);
+  };
+  cl->SetComputeRoot32BitConstants(3, sizeof(PostParams) / 4, &pp, 0);
+  cl->SetPipelineState(g.flareSrc.Get());
+  cl->SetComputeRootDescriptorTable(6, gpuh(ViewFlare + 1));
+  cl->Dispatch((g.flareW + 7) / 8, (g.flareH + 7) / 8, 1);
+  barrier(g.flareRes[0].Get(), true);
+  cl->SetPipelineState(g.flareStar.Get());
+  cl->SetComputeRootDescriptorTable(4, gpuh(ViewFlare));
+  cl->SetComputeRootDescriptorTable(6, gpuh(ViewFlare + 3));
+  cl->Dispatch((g.flareW + 7) / 8, (g.flareH + 7) / 8, 1);
+  barrier(g.flareRes[0].Get(), false);
+  barrier(g.flareRes[1].Get(), true);
+  cl->SetComputeRootDescriptorTable(4, gpuh(ViewFlare + 2));
+}
+void flare_after(ID3D12GraphicsCommandList4* cl) {
+  D3D12_RESOURCE_BARRIER b{};
+  b.Transition.pResource = g.flareRes[1].Get();
+  b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  b.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  cl->ResourceBarrier(1, &b);
+}
+
 void run_post(Slot& s, Job& job) {
   ID3D12GraphicsCommandList4* cl = s.cl.Get();
   static const float range = post_setting("AURORA_LOOK_RANGE", 12.f), bloom = post_setting("AURORA_LOOK_BLOOM", 0.18f), grade = post_setting("AURORA_LOOK_GRADE", 1.f);
@@ -1246,9 +1346,14 @@ void run_between() {
     transition(g.hdrRes.Get(), false);
     transition(g.upRes[0].Get(), false);
   } else {
+    const bool flare = flare_on() && g.flareSrc;
+    if (flare)
+      run_flare(cl);
     cl->SetPipelineState(g.betweenCompose.Get());
     cl->SetComputeRootDescriptorTable(5, gpuh(ViewBetween));
     cl->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
+    if (flare)
+      flare_after(cl);
   }
   transition(g.termBetween.Get(), false);
   transition(g.termRes.Get(), false);
@@ -1354,8 +1459,13 @@ void run_rays(Job& job) {
   if (post_on()) {
     run_post(s, job);
   } else {
+    const bool flare = flare_on() && g.flareSrc;
+    if (flare)
+      run_flare(cl);
     cl->SetPipelineState(g.compose.Get());
     cl->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
+    if (flare)
+      flare_after(cl);
   }
   std::swap(tb.Transition.StateBefore, tb.Transition.StateAfter);
   cl->ResourceBarrier(1, &tb);
