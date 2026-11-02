@@ -71,6 +71,7 @@ uint64_t s_disc_bytes = 0;
 // models in the 16-bit vertex form (machines are; only an order, a guess that costs nothing if wrong). Rest: all else.
 // DiscFirst: a new shader from the disc walk, not from a file the game reads.
 enum Tier { First, Same, PostSmall, DiscFirst, Rest, Tiers };
+std::set<std::vector<uint8_t>> s_walk_shaders;  // fog left at none
 bool s_from_disc = false;  // the file being read comes from the disc walk
 uint64_t s_disc_read = 0;
 struct Form {
@@ -306,7 +307,7 @@ void plan(const PipelineConfig& base, uint8_t fog, int post, bool small) {
                     : first || c.dstAlpha == 255 ? Same
                                                  : Rest;
   s_tiers[tier].push_back(Form{c, true, false});
-  s_tiers[Rest].push_back(Form{c, false, true});
+  if (!s_from_disc) s_tiers[Rest].push_back(Form{c, false, true});
 }
 
 void forms(const Mesh& m) {
@@ -361,6 +362,14 @@ void forms(const Mesh& m) {
               p.colorUpdate = true;
               std::vector<uint8_t> key(sizeof(p));
               std::memcpy(key.data(), &p, sizeof(p));
+              if (s_from_disc) {
+                // The walk makes each shader once: another form of a known shader costs a draw about 1.5 ms when it comes,
+                // and holding every form of the whole disc would take gigabytes (327,744 of them, counted)
+                std::vector<uint8_t> shader(sizeof(p.shaderConfig) + 1);
+                std::memcpy(shader.data(), &p.shaderConfig, sizeof(p.shaderConfig));
+                shader.back() = dst == UINT32_MAX;
+                if (!s_walk_shaders.insert(std::move(shader)).second) continue;
+              }
               if (s_seen.insert(std::move(key)).second) {
                 s_bases.push_back(Base{p, post, (m.model & 1) != 0});
                 for (const uint8_t fog : s_fogs) plan(p, fog, post, (m.model & 1) != 0);
@@ -539,7 +548,6 @@ void run() {
             s_from_disc = false;
             ++s_disc_read;
           }
-          told = false;
           continue;
         }
         if (walk_told && s_tiers[DiscFirst].empty() && waiting == 0) {
