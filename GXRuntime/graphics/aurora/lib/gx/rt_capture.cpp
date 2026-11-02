@@ -42,6 +42,7 @@ bool g_capturing = false;
 bool g_noHud = false;
 bool g_live = false;
 bool g_hook = false;
+static float s_starFrom = 4.f;  // AURORA_RT_ENGINE_STAR_FROM: the star's size (world units) from which is_engine_star takes it; StarGrown by default
 static bool s_seenPerspective = false;
 bool g_noGameShadow = false;
 static bool s_motionOn = false;  // AURORA_RT_DENOISE=1: motion data from the draws (rt_motion.hpp)
@@ -232,6 +233,8 @@ void start() noexcept {
   if (g_live && std::getenv("AURORA_RT_LIGHTING") != nullptr) {
     const char* v = std::getenv("AURORA_RT_NO_ENGINE_STAR");
     g_noEngineStar = v != nullptr && v[0] == '1';
+    if (const char* f = std::getenv("AURORA_RT_ENGINE_STAR_FROM"); f != nullptr && std::atof(f) > 0)
+      s_starFrom = static_cast<float>(std::atof(f));
   }
   if (std::getenv("AURORA_RT_MOTION_ONLY") != nullptr)  // the cost of the motion data alone
     s_motionOn = true;
@@ -1571,6 +1574,9 @@ std::atomic<u64> g_starsSkipped{0};
 // depth) whose texture's alpha is a star (star_alpha), and that the game has grown with distance to keep it readable: at least
 // StarGrown across in the world (twice the largest engine glow, which keeps its own size) and a set share of its distance. Near the
 // camera the star keeps its own size and stays, as do glows, flames, smoke and sparks (round, cloudy or lines). Picture only.
+// The game holds the star near one size on screen at every distance (across about a quarter of its distance: 1.5 at 6 units, 7.7 at 25,
+// 18 at 64), so StarGrown alone says how far away a machine must be to lose it: about 4 times StarGrown. 4 (the first rule) took the stars of
+// machines just ahead, the original's lens flare; AURORA_RT_ENGINE_STAR_FROM=<size> moves the line out, so only far machines lose it.
 constexpr float StarGrown = 4.f, StarShareOfDistance = 0.05f;
 bool is_engine_star(const GXPrimitive prim, const GXVtxFmt fmt, const u16 vtxCount, const u8* data) noexcept {
   const auto& st = g_gxState;
@@ -1583,7 +1589,7 @@ bool is_engine_star(const GXPrimitive prim, const GXVtxFmt fmt, const u16 vtxCou
   DrawShape sh{};
   if (!draw_shape(fmt, vtxCount, data, sh) || sh.facing < 0.95f || sh.mid[2] >= 0.f)
     return false;
-  if (sh.extent < StarGrown || sh.extent < -sh.mid[2] * StarShareOfDistance)
+  if (sh.extent < s_starFrom || sh.extent < -sh.mid[2] * StarShareOfDistance)
     return false;
   if (!star_alpha(st.textures[map].texObj))
     return false;

@@ -19,7 +19,7 @@ extern bool g_noHud;
 bool skip_draw() noexcept;
 extern bool g_noGameShadow;  // with own light: the game's machine shadow not drawn (AURORA_RT_GAME_SHADOW=1 keeps it)
 bool is_game_shadow() noexcept;
-// AURORA_RT_NO_ENGINE_STAR=1, with own light (AURORA_RT=1, AURORA_RT_LIGHTING): the game's star sprite on far machines' engines not drawn
+// AURORA_RT_NO_ENGINE_STAR=1, with own light (AURORA_RT=1, AURORA_RT_LIGHTING): the game's star sprite on far machines' engines not drawn; AURORA_RT_ENGINE_STAR_FROM=<size>: from what size (4 by default)
 extern bool g_noEngineStar;
 extern std::atomic<u64> g_starsSkipped;  // stars is_engine_star took, for the report
 bool is_engine_star(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* data) noexcept;
