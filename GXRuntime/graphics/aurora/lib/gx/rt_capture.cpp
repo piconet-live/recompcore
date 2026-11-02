@@ -228,6 +228,11 @@ void start() noexcept {
     const char* v = std::getenv("AURORA_RT_GAME_SHADOW");
     g_noGameShadow = v == nullptr || v[0] != '1';
   }
+  // with our own light: the star the game puts on far machines' engines, to keep them readable, looks out of place. Off by default
+  if (g_live && std::getenv("AURORA_RT_LIGHTING") != nullptr) {
+    const char* v = std::getenv("AURORA_RT_NO_ENGINE_STAR");
+    g_noEngineStar = v != nullptr && v[0] == '1';
+  }
   if (std::getenv("AURORA_RT_MOTION_ONLY") != nullptr)  // the cost of the motion data alone
     s_motionOn = true;
   if (const char* v = std::getenv("AURORA_RT_VERTEX_COLOUR"); v != nullptr && v[0] == '0')
@@ -1301,8 +1306,130 @@ bool is_game_shadow() noexcept {
   const auto& st = g_gxState;
   return st.blendMode == GX_BM_BLEND && st.blendFacSrc == GX_BL_INVDSTALPHA && st.blendFacDst == GX_BL_DSTALPHA && !st.depthUpdate;
 }
-// AURORA_RT_DRAWLOG=first,last: on those copies, each draw that writes no depth or samples a picture copy: its state, whether the rule took it, where it is
-void note_draw(const u16 vtxCount) noexcept {
+// A draw's corners in view space, read from its own bytes before it is drawn: where its middle is, how big it is, and how squarely
+// its first triangle lies in the view plane (1: square to the view's axis, as a sprite the game turns to the screen)
+struct DrawShape {
+  float mid[3], extent, facing;
+};
+static bool draw_shape(const GXVtxFmt fmt, const u16 vtxCount, const u8* data, DrawShape& out) noexcept {
+  const auto& st = g_gxState;
+  const auto& vf = st.vtxFmts[fmt];
+  u32 stride = 0, posOff = 0, mtxOff = UINT32_MAX;
+  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+    const auto attr = static_cast<GXAttr>(i);
+    const auto type = st.vtxDesc[i];
+    if (type == GX_NONE)
+      continue;
+    if (i == GX_VA_POS)
+      posOff = stride;
+    if (i == GX_VA_PNMTXIDX)
+      mtxOff = stride;
+    if (type == GX_DIRECT)
+      stride += i <= GX_VA_TEX7MTXIDX ? 1 : comp_type_size(attr, vf.attrs[i].type) * comp_cnt_count(attr, vf.attrs[i].cnt);
+    else
+      stride += (type == GX_INDEX8 ? 1 : 2) * (i == GX_VA_NRM && vf.attrs[i].cnt == GX_NRM_NBT3 ? 3 : 1);
+  }
+  if (st.vtxDesc[GX_VA_POS] == GX_NONE || vtxCount < 3)
+    return false;
+  const auto& a = vf.attrs[GX_VA_POS];
+  const u32 sz = comp_type_size(GX_VA_POS, a.type), n = std::min<u32>(comp_cnt_count(GX_VA_POS, a.cnt), 3);
+  float mn[3] = {1e30f, 1e30f, 1e30f}, mx[3] = {-1e30f, -1e30f, -1e30f}, sum[3]{}, tri[3][3]{};
+  for (u32 v = 0; v < vtxCount; ++v) {
+    const u8* vb = data + v * stride;
+    const u8* s = vb + posOff;
+    bool le = false;
+    if (st.vtxDesc[GX_VA_POS] != GX_DIRECT) {
+      const u32 index = st.vtxDesc[GX_VA_POS] == GX_INDEX8 ? s[0] : rd_be(s, 2);
+      const auto& arr = st.arrays[GX_VA_POS];
+      if (arr.data == nullptr || index * arr.stride >= arr.size)
+        return false;
+      s = static_cast<const u8*>(arr.data) + index * arr.stride, le = arr.le;
+    }
+    float p[3]{};
+    for (u32 c = 0; c < n; ++c)
+      p[c] = rd_comp(s + c * sz, a.type, a.frac, le);
+    const u32 mi = mtxOff != UINT32_MAX ? vb[mtxOff] / 3u : st.currentPnMtx / 3u;
+    const auto& m = st.pnMtx[std::min<u32>(mi, MaxPnMtx - 1)].pos;
+    const float q[3] = {dot4(m.m0, p[0], p[1], p[2], 1.f), dot4(m.m1, p[0], p[1], p[2], 1.f), dot4(m.m2, p[0], p[1], p[2], 1.f)};
+    for (int c = 0; c < 3; ++c) {
+      mn[c] = std::min(mn[c], q[c]), mx[c] = std::max(mx[c], q[c]), sum[c] += q[c];
+      if (v < 3)
+        tri[v][c] = q[c];
+    }
+  }
+  for (int c = 0; c < 3; ++c)
+    out.mid[c] = sum[c] / vtxCount;
+  out.extent = std::max({mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]});
+  const float e1[3] = {tri[1][0] - tri[0][0], tri[1][1] - tri[0][1], tri[1][2] - tri[0][2]}, e2[3] = {tri[2][0] - tri[0][0], tri[2][1] - tri[0][1], tri[2][2] - tri[0][2]};
+  const float nn[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+  const float ln = std::sqrt(nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]);
+  out.facing = ln > 0 ? std::fabs(nn[2]) / ln : 0.f;
+  return true;
+}
+// A texture whose alpha is a star: thin bright arms along its middle row and column, dark between them. Read on the ring at a quarter
+// to nearly half its size: the arms' mean against the diagonals' mean at the same radius. A round glow is the same both ways; smoke
+// and flame have no arms. Worked out once a texture, from its own pixels.
+static bool star_alpha(const GXTexObj_& in) noexcept {
+  static std::map<std::tuple<const void*, u32, u32, u32>, bool> known;  // what each texture's pixels said, not a list of textures
+  GXTexObj_ obj = in;
+  if (!recomp::resolve_texture_data(obj) || obj.data == nullptr)
+    return false;
+  const u32 w = obj.width(), h = obj.height(), f = obj.format();
+  const auto key = std::make_tuple(obj.data, w, h, f);
+  if (const auto it = known.find(key); it != known.end())
+    return it->second;
+  bool star = false;
+  // square, small, and not a palette texture (whose colours need a table load to read)
+  if (w == h && w >= 16 && w <= 128 && f != GX_TF_C4 && f != GX_TF_C8 && f != GX_TF_C14X2) {
+    const size_t bytes = GXGetTexBufferSize(static_cast<u16>(w), static_cast<u16>(h), f, GX_FALSE, 0);
+    const auto conv = gfx::convert_texture(f, w, h, 1, {static_cast<const u8*>(obj.data), bytes});
+    if (conv.data.size() >= size_t(w) * h * 4) {
+      const u8* px = conv.data.data();
+      const auto alpha = [&](float x, float y) {
+        const int xi = std::clamp(static_cast<int>(x), 0, static_cast<int>(w) - 1), yi = std::clamp(static_cast<int>(y), 0, static_cast<int>(h) - 1);
+        return px[(size_t(yi) * w + xi) * 4 + 3] / 255.f;
+      };
+      const float c = (w - 1) * 0.5f;
+      float arms = 0, diag = 0;
+      int k = 0;
+      for (float r = w * 0.25f; r <= w * 0.45f; r += 1.f, ++k) {
+        // the two pixels either side of the middle line, as the middle of an even texture falls between them
+        arms += (alpha(c + r, c - 0.5f) + alpha(c + r, c + 0.5f) + alpha(c - r, c - 0.5f) + alpha(c - r, c + 0.5f) + alpha(c - 0.5f, c + r) +
+                 alpha(c + 0.5f, c + r) + alpha(c - 0.5f, c - r) + alpha(c + 0.5f, c - r)) / 8.f;
+        const float d = r * 0.7071f;
+        diag += (alpha(c + d, c + d) + alpha(c - d, c + d) + alpha(c + d, c - d) + alpha(c - d, c - d)) / 4.f;
+      }
+      arms /= std::max(k, 1), diag /= std::max(k, 1);
+      star = arms > 0.15f && arms > diag * 4.f;
+    }
+  }
+  known.emplace(key, star);
+  return star;
+}
+bool g_noEngineStar = false;
+// The game's star on a far machine's engine, from the draw alone: an additive sprite (one quad turned square to the view, writing no
+// depth) whose texture's alpha is a star (star_alpha), and that the game has grown with distance to keep it readable: at least
+// StarGrown across in the world (twice the largest engine glow, which keeps its own size) and a set share of its distance. Near the
+// camera the star keeps its own size and stays, as do glows, flames, smoke and sparks (round, cloudy or lines). Picture only.
+constexpr float StarGrown = 4.f, StarShareOfDistance = 0.05f;
+bool is_engine_star(const GXPrimitive prim, const GXVtxFmt fmt, const u16 vtxCount, const u8* data) noexcept {
+  const auto& st = g_gxState;
+  if (vtxCount != 4 || (prim != GX_QUADS && prim != GX_TRIANGLESTRIP && prim != GX_TRIANGLEFAN) || st.projType != GX_PERSPECTIVE ||
+      st.blendMode != GX_BM_BLEND || st.blendFacDst != GX_BL_ONE || st.depthUpdate || !st.colorUpdate || st.numTevStages == 0)
+    return false;
+  const u32 map = st.tevStages[0].texMapId;
+  if (map >= MaxTextures)
+    return false;
+  DrawShape sh{};
+  if (!draw_shape(fmt, vtxCount, data, sh) || sh.facing < 0.95f || sh.mid[2] >= 0.f)
+    return false;
+  if (sh.extent < StarGrown || sh.extent < -sh.mid[2] * StarShareOfDistance)
+    return false;
+  return star_alpha(st.textures[map].texObj);
+}
+// AURORA_RT_DRAWLOG=first,last: on those copies, each draw that writes no depth or samples a picture copy: its state, whether the rule took it, where it is.
+// AURORA_RT_STARLOG=first,last: on those copies, each additive or depth-less sprite of up to 8 corners: its shape and texture, and whether is_engine_star took it
+void note_draw(const u16 vtxCount, const GXPrimitive prim, const GXVtxFmt fmt, const u8* data) noexcept {
   static u64 first = 0, last = 0;
   static const bool on = [] {
     const char* v = std::getenv("AURORA_RT_DRAWLOG");
@@ -1310,6 +1437,28 @@ void note_draw(const u16 vtxCount) noexcept {
       first = std::strtoull(v, nullptr, 10), last = std::strtoull(std::strchr(v, ',') + 1, nullptr, 10);
     return v != nullptr;
   }();
+  static u64 sfirst = 0, slast = 0;
+  static const bool starOn = [] {
+    const char* v = std::getenv("AURORA_RT_STARLOG");
+    if (v != nullptr && std::strchr(v, ',') != nullptr)
+      sfirst = std::strtoull(v, nullptr, 10), slast = std::strtoull(std::strchr(v, ',') + 1, nullptr, 10);
+    return v != nullptr;
+  }();
+  if (starOn && s_copyNow >= sfirst && s_copyNow <= slast) {
+    const auto& st = g_gxState;
+    const bool additive = st.blendMode == GX_BM_BLEND && st.blendFacDst == GX_BL_ONE;
+    DrawShape sh{};
+    if (st.projType == GX_PERSPECTIVE && (additive || !st.depthUpdate) && vtxCount <= 8 && draw_shape(fmt, vtxCount, data, sh)) {
+      const auto& p = st.proj;
+      const float cx = dot4(p.m0, sh.mid[0], sh.mid[1], sh.mid[2], 1.f), cy = dot4(p.m1, sh.mid[0], sh.mid[1], sh.mid[2], 1.f), cw = dot4(p.m3, sh.mid[0], sh.mid[1], sh.mid[2], 1.f);
+      const GXTexObj_* t = st.numTevStages > 0 && st.tevStages[0].texMapId < MaxTextures ? &st.textures[st.tevStages[0].texMapId].texObj : nullptr;
+      std::fprintf(stderr, "[rt] star copy %llu: blend %d %d %d z %d%d verts %u prim %d mid %.1f %.1f %.1f ext %.2f face %.3f e/z %.4f screen %.3f %.3f tex %ux%u f%u %p star %d rule %d\n",
+                   static_cast<unsigned long long>(s_copyNow), int(st.blendMode), int(st.blendFacSrc), int(st.blendFacDst), int(st.depthUpdate), int(st.depthCompare), vtxCount, int(prim),
+                   sh.mid[0], sh.mid[1], sh.mid[2], sh.extent, sh.facing, sh.extent / std::max(std::fabs(sh.mid[2]), 1e-3f), cw != 0 ? cx / cw * 0.5f + 0.5f : -1.f,
+                   cw != 0 ? 0.5f - cy / cw * 0.5f : -1.f, t ? t->width() : 0, t ? t->height() : 0, t ? t->format() : 0, t ? t->data : nullptr, t ? int(star_alpha(*t)) : 0,
+                   int(is_engine_star(prim, fmt, vtxCount, data)));
+    }
+  }
   if (!on || s_copyNow < first || s_copyNow > last)
     return;
   const auto& st = g_gxState;

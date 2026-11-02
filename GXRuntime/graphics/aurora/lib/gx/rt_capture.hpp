@@ -17,7 +17,10 @@ extern bool g_noHud;
 bool skip_draw() noexcept;
 extern bool g_noGameShadow;  // with own light: the game's machine shadow not drawn (AURORA_RT_GAME_SHADOW=1 keeps it)
 bool is_game_shadow() noexcept;
-void note_draw(u16 vtxCount) noexcept;
+// AURORA_RT_NO_ENGINE_STAR=1, with own light (AURORA_RT=1, AURORA_RT_LIGHTING): the game's star sprite on far machines' engines not drawn
+extern bool g_noEngineStar;
+bool is_engine_star(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* data) noexcept;
+void note_draw(u16 vtxCount, GXPrimitive prim, GXVtxFmt fmt, const u8* data) noexcept;
 void start() noexcept;  // reads the switches, once
 
 // A stage is a reflection layer when it adds or multiplies a texture looked up by the normal (a sphere map), with a
