@@ -65,6 +65,10 @@ static const uint MaskLayer = 128;
 // still drawn, draws mid-fade, other levels): primary rays alone see them, as they see the game's picture. All other rays meet the merged world, never
 // passed for being drawn (its flags stay 0), each mesh by the material first learned of it or the file's own.
 static const uint MaskStaticDraws = 64;
+// Additive draws and those that write no colour or darken (class 2, 3) are a structure of their own in the see-through mask, marked non-opaque (rt_rules.hpp
+// assemble_frame). Every ray but the camera's forces all to opaque and meets them as before; the camera's rays cull them, so a stack of flame cards costs them
+// no look (CameraRay). They never stopped a camera ray: the raster has them as the game drew them.
+#define CameraRay RAY_FLAG_CULL_NON_OPAQUE
 static const uint NoDraw = 0xFFFFFFFFu;
 struct WorldMesh { float4 colour; uint cls; uint draw; uint first; uint flags; };
 StructuredBuffer<WorldMesh> World : register(t11);
@@ -591,7 +595,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     float surfT = 100000;  // AURORA_RT_LAYER_PASS: where the pixel's surface is, for the layers in front of it
     const float3 lightBefore = light;
     for (int i = 0; i < PrimaryLooks; ++i) {
-      RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
+      RayQuery<CameraRay> q;
       const bool gapLook = gapAt >= 0;
       const float gapT = gapAt, gapR = PairGapLeast + gapAt * PairGapShare;
       gapAt = -1;
@@ -764,7 +768,7 @@ void light_pass(uint3 id : SV_DispatchThreadID) {
   float prevZ = 0, smear = 1;
   float gapAt = -1;  // AURORA_RT_PAIR_GAP, as main's
   for (int i = 0; i < PrimaryLooks; ++i) {
-    RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
+    RayQuery<CameraRay> q;
     const bool gapLook = gapAt >= 0;
     const float gapT = gapAt, gapR = PairGapLeast + gapAt * PairGapShare;
     gapAt = -1;

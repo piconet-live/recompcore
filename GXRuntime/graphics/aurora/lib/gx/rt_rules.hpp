@@ -176,6 +176,7 @@ struct Frame {
   std::vector<Vertex> verts;        // solid surfaces first, then what light passes through (see-through, glows), then the sky
   std::uint32_t seeFirstVertex = 0, layerFirstVertex = 0, skyFirstVertex = 0;
   std::uint32_t primaryFirstVertex = 0;  // AURORA_RT_SCENE_STEADY: static placements' draws for primary rays alone, after the sky
+  std::uint32_t passFirstVertex = 0;     // additive draws and draws that write no colour or darken (class 2, 3): last, a structure camera rays pass at once
   std::vector<GpuDraw> draws;
   std::vector<StageRec> stages;
   std::vector<LightPick> picks, merged;
@@ -316,7 +317,7 @@ inline bool faces_picture(const DrawRec& d, const Vertex* verts) {
 // The main view is the perspective projection with the most triangles. Sky: the largest see-through shells around the view,
 // by size against the largest in the frame, with no table of courses.
 inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex* verts, const Tuning& t, Frame& out) {
-  out.verts.clear(), out.prevPos.clear(), out.spans.clear(), out.draws.clear(), out.stages.clear(), out.main = nullptr, out.machineDraws = out.reflective = 0, out.seeFirstVertex = out.layerFirstVertex = out.skyFirstVertex = out.primaryFirstVertex = 0;
+  out.verts.clear(), out.prevPos.clear(), out.spans.clear(), out.draws.clear(), out.stages.clear(), out.main = nullptr, out.machineDraws = out.reflective = 0, out.seeFirstVertex = out.layerFirstVertex = out.skyFirstVertex = out.primaryFirstVertex = out.passFirstVertex = 0;
   const auto key = [](const DrawRec& d) { return std::array<int, 2>{static_cast<int>(d.proj[0] * 1000), static_cast<int>(d.proj[5] * 1000)}; };
   std::array<int, 2> best{};
   {
@@ -453,8 +454,13 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
 // in the first two), sky, then what primary rays alone see. drop: a byte a draw, 1 where the static track already holds it, 2 where a static placement's
 // draw is for primary rays alone (AURORA_RT_SCENE_STEADY; a layer or the sky stays in its own) (may be null). A card turned to the picture (highlight
 // bit 4, AURORA_RT_HUD_SKIP) is for primary rays alone too.
+// Last, the draws every camera ray passes: additive (engine fire, flames, glow cards) and those that write no colour or darken (class 2, 3). Camera rays
+// stepped past them one look each, and a stack of flame cards used all of a ray's looks: the road under a machine's flames got no light of its own and the
+// raster showed through as a patch. Their structure is marked non-opaque (rt_live.cpp) and camera rays cull non-opaque structures (rt.hlsl), so they pass
+// all of them at no look at all; every other ray forces all to opaque and meets them as before (the see-through mask). A static placement's such draw kept
+// for primary rays alone has nobody left to meet it and is left out.
 inline void assemble_frame(const DrawRec* draws, std::uint32_t count, const Vertex* verts, const std::uint8_t* drop, Frame& out, bool layersApart = false) {
-  for (int pass = 0; pass < 5; ++pass) {
+  for (int pass = 0; pass < 6; ++pass) {
     if (pass == 1)
       out.seeFirstVertex = static_cast<std::uint32_t>(out.verts.size());
     if (pass == 2)
@@ -463,8 +469,13 @@ inline void assemble_frame(const DrawRec* draws, std::uint32_t count, const Vert
       out.skyFirstVertex = static_cast<std::uint32_t>(out.verts.size());
     if (pass == 4)
       out.primaryFirstVertex = static_cast<std::uint32_t>(out.verts.size());
+    if (pass == 5)
+      out.passFirstVertex = static_cast<std::uint32_t>(out.verts.size());
     for (std::uint32_t i = 0; i < count; ++i) {
-      int group = out.is_sky(i) ? 3 : layersApart && (out.draws[i].highlight & 8) != 0 ? 2 : out.draws[i].cls == 0 ? 0 : 1;
+      const bool passed = out.draws[i].cls >= 2;
+      int group = out.is_sky(i) ? 3 : layersApart && (out.draws[i].highlight & 8) != 0 ? 2 : passed ? 5 : out.draws[i].cls == 0 ? 0 : 1;
+      if (drop != nullptr && drop[i] == 2 && group == 5)
+        continue;
       if ((drop != nullptr && drop[i] == 2 && group < 2) || ((out.draws[i].highlight & 16) != 0 && group < 3))
         group = 4;
       if (out.extent[i] <= 0.f || group != pass || (drop != nullptr && drop[i] == 1))

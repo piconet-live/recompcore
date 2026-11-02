@@ -105,12 +105,12 @@ struct Slot {
     u64 size = 0;
     void* map = nullptr;
   } verts, draws, stages, lights, glows, worldMeshes;
-  ComPtr<ID3D12Resource> blas[5], tlas, scratch, instances, constants, attrUpload;
+  ComPtr<ID3D12Resource> blas[6], tlas, scratch, instances, constants, attrUpload;
   u64 attrUploadSize = 0;
   void* attrUploadMap = nullptr;
   void* constantsMap = nullptr;
   Buf prevPos;
-  u64 blasSize[5]{}, tlasSize = 0, scratchSize = 0;
+  u64 blasSize[6]{}, tlasSize = 0, scratchSize = 0;
   std::vector<ComPtr<ID3D12Resource>> keep;
   // what this slot's timings belong to, for the time log
   u64 copy = 0;
@@ -847,11 +847,14 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   if (g.failed)
     return;
   // solid, see-through and glows, blended layers (AURORA_RT_LAYER_PASS; else none), sky: a structure each, so a shadow ray can leave out what light passes through.
-  // Then static placements' draws for primary rays alone (AURORA_RT_SCENE_STEADY; else none), by mask 64 (rt.hlsl MaskStaticDraws)
-  const u32 firsts[5] = {0, fr.seeFirstVertex, fr.layerFirstVertex, fr.skyFirstVertex, fr.primaryFirstVertex};
-  const u32 counts[5] = {fr.seeFirstVertex, fr.layerFirstVertex - fr.seeFirstVertex, fr.skyFirstVertex - fr.layerFirstVertex, fr.primaryFirstVertex - fr.skyFirstVertex,
-                         static_cast<u32>(fr.verts.size()) - fr.primaryFirstVertex};
-  static constexpr u32 masks[5] = {1, 4, 128, 2, 64};
+  // Then static placements' draws for primary rays alone (AURORA_RT_SCENE_STEADY; else none), by mask 64 (rt.hlsl MaskStaticDraws). Last the draws camera
+  // rays pass (additive, no colour, darkening: rt_rules.hpp assemble_frame): seen through as before by every other ray (the see-through mask), but marked
+  // non-opaque, which camera rays cull (rt.hlsl), so they cost those no look
+  const u32 firsts[6] = {0, fr.seeFirstVertex, fr.layerFirstVertex, fr.skyFirstVertex, fr.primaryFirstVertex, fr.passFirstVertex};
+  const u32 counts[6] = {fr.seeFirstVertex, fr.layerFirstVertex - fr.seeFirstVertex, fr.skyFirstVertex - fr.layerFirstVertex, fr.primaryFirstVertex - fr.skyFirstVertex,
+                         fr.passFirstVertex - fr.primaryFirstVertex, static_cast<u32>(fr.verts.size()) - fr.passFirstVertex};
+  static constexpr u32 masks[6] = {1, 4, 128, 2, 64, 4};
+  constexpr u32 Passed = 5;
   ensure(s.scratch, s.scratchSize, 256u << 20, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   u64 scratchAt = 0;
   {
@@ -860,21 +863,23 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
     bs[0].UAV.pResource = nullptr;
     cl->ResourceBarrier(1, bs);
   }
-  for (u32 i = 0; i < 5; ++i)
+  for (u32 i = 0; i < 6; ++i)
     if (counts[i])
       build_blas(s, i, s.verts.gpu->GetGPUVirtualAddress() + u64(firsts[i]) * sizeof(Vertex), counts[i], scratchAt);
   D3D12_RESOURCE_BARRIER uav{};
   uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
   cl->ResourceBarrier(1, &uav);
   static thread_local std::vector<D3D12_RAYTRACING_INSTANCE_DESC> inst;
-  inst.assign(5, D3D12_RAYTRACING_INSTANCE_DESC{});
+  inst.assign(6, D3D12_RAYTRACING_INSTANCE_DESC{});
   u32 instances = 0;
-  for (u32 i = 0; i < 5; ++i) {
+  for (u32 i = 0; i < 6; ++i) {
     if (!counts[i])
       continue;
     auto& d = inst[instances++];
     d.Transform[0][0] = d.Transform[1][1] = d.Transform[2][2] = 1;
     d.InstanceMask = masks[i];
+    if (i == Passed)
+      d.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_NON_OPAQUE;
     d.InstanceID = firsts[i] / 3;  // a hit's triangle: this plus its primitive index
     d.AccelerationStructure = s.blas[i]->GetGPUVirtualAddress();
   }
