@@ -335,11 +335,22 @@ float sun_term(float3 pos, float3 N, float dist) {
   Light sun = Lights[P.lightCount];
   float ndl = saturate(dot(N, sun.pos));
   if (ndl <= 0 || dot(sun.colour, 1.xxx) <= 0) return 0;
-  RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
-  RayDesc ray; ray.Origin = pos + N * (0.03 + dist * 0.0005); ray.Direction = sun.pos; ray.TMin = 0.02; ray.TMax = 100000;
-  q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskSolid, ray);
-  q.Proceed();
-  return q.CommittedStatus() != COMMITTED_TRIANGLE_HIT ? ndl : 0;
+  // Machines and many other bodies blend by texture alpha, so they aren't in the solid set: what light passes is told by its own alpha at the hit. Tuned: half, and four hits at most.
+  float tmin = 0.02;
+  for (int i = 0; i < 4; ++i) {
+    RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
+    RayDesc ray; ray.Origin = pos + N * (0.03 + dist * 0.0005); ray.Direction = sun.pos; ray.TMin = tmin; ray.TMax = 100000;
+    q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskSeen, ray);
+    q.Proceed();
+    if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) return ndl;
+    float t = q.CommittedRayT();
+    Hit h = fetch(q.CommittedInstanceID() + q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
+    Draw d = Draws[h.draw];
+    tmin = t + 0.02;
+    if (d.cls == 0) return 0;
+    if (d.cls == 1 && shade(h, 2.0).a >= 0.5) return 0;
+  }
+  return ndl;
 }
 // sun x N.L x shadow + sky x how much of the surroundings it sees + what it sees, as bounce. A factor on the picture: 1 is today's level. Floor and gains tuned.
 float3 lit_factor(float open, float3 bounce, float3 skySeen, float sunTerm) {
