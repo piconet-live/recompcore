@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <atomic>
+#include <thread>
 #include <unordered_set>
 
 #include "Common/CommonTypes.h"
@@ -20,6 +22,10 @@ public:
 
 private:
   void ModelFiles(const DiscIO::Volume& volume, const DiscIO::Partition& partition, u64 offset);
+  void StartWholeDisc(const DiscIO::Volume& volume, const DiscIO::Partition& partition);
+
+  std::thread m_whole_disc;
+  std::atomic_bool m_whole_disc_stop{false};
 
   std::unordered_set<u64> m_model_files_seen;
   DiscIO::Partition m_previous_partition;

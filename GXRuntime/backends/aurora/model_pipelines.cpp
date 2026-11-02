@@ -10,7 +10,14 @@
 // compile what comes out. A course file (COLI_COURSE) gives the fog type at its header's +0x84.
 //
 // What the file cannot say is tried in every form the renderer has: cull mode, depth update, destination alpha, scene
-// alpha, the post stages. A form no draw ever wants costs a little compile time and nothing else.
+// alpha. A form no draw ever wants costs a little compile time and nothing else.
+// The post stages (a tint the game sets around a draw: fn_80074A8C and its kin, a machine's flash among them) are not in any
+// file, and nothing in a file says whose model it is, so every model gets those forms, after every plain form (s_later).
+//
+// Files are told apart by their contents, not their names: LZ, a U8 archive (a machine's models come in one), a model file.
+// Only the course file goes by its name, the name the game itself opens: it has no mark of its own.
+// Order of work: files the game is reading now, then the post forms, then the rest of the disc (aurora_present_model_file's
+// later: only when ray tracing is on or a test asks), each only while the compile queue is short.
 // Nothing here reads or writes the guest: the bytes are the disc's, copied on the disc thread. Effects and the HUD are not models,
 // so they stay as they were: their pipelines compile at their first draw.
 #include "gxruntime/aurora_present.h"
@@ -34,6 +41,12 @@
 #include <thread>
 #include <vector>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 #include "model_pipelines.h"
 
 namespace {
@@ -46,14 +59,15 @@ struct File {
 };
 std::mutex s_lock;
 std::condition_variable s_wake;
-std::deque<File> s_files;
+std::deque<File> s_files, s_disc_files;
+uint64_t s_disc_bytes = 0;
+std::vector<PipelineConfig> s_later;  // the post forms, not yet asked for
 bool s_quit = false, s_aurora_up = false;
 std::thread s_thread;
 std::vector<PipelineConfig> s_bases;  // fog left at none
 std::set<std::vector<uint8_t>> s_seen;
 std::vector<bool> s_base_takes_fog;
 std::set<uint8_t> s_fogs{0};
-bool s_machine_file = false;  // a machine's: the renderer's post stages (a machine's flash) are tried too
 uint64_t s_meshes = 0, s_meshes_left_out = 0, s_configs = 0;
 FILE* s_dump = nullptr;
 
@@ -278,7 +292,7 @@ void forms(const Mesh& m) {
   const auto blend_dst = (flags & 0x40) ? static_cast<GXBlendFactor>(m.blend >> 4 & 0xF) : GX_BL_INVSRCALPHA;
   {
     const bool plain = false;
-    for (int post = 0; post < (s_machine_file ? 4 : 1); ++post) {
+    for (int post = 0; post < 4; ++post) {
       ShaderConfig c = shader;
       stages(m, c, plain, post);
       // the texture coordinates in use; what stands beyond them is not in a real key either
@@ -312,6 +326,10 @@ void forms(const Mesh& m) {
               std::vector<uint8_t> key(sizeof(p));
               std::memcpy(key.data(), &p, sizeof(p));
               if (s_seen.insert(std::move(key)).second) {
+                if (post != 0) {
+                  s_later.push_back(p);
+                  continue;
+                }
                 s_bases.push_back(p);
                 s_base_takes_fog.push_back(takes_fog);
                 for (const uint8_t fog : s_fogs) {
@@ -363,15 +381,43 @@ void read_models(const std::vector<uint8_t>& d) {
   }
 }
 
+bool packed(const std::vector<uint8_t>& d) {
+  // LZ: the packed size, the whole size, then the stream to the file's end (an archive may pad what it holds)
+  if (d.size() < 16) return false;
+  const uint64_t stream = uint64_t(le32(d.data())) + 8;
+  return stream <= d.size() && d.size() - stream < 32 && le32(d.data() + 4) >= stream / 16;
+}
+
+void read_contents(const std::vector<uint8_t>& d, int depth) {
+  if (depth > 4 || d.size() < 16) return;
+  if (packed(d)) {
+    read_contents(unpack(d), depth + 1);
+    return;
+  }
+  if (be32(d.data()) == 0x55AA382D) {  // U8: nodes of 12 bytes from the root's; the root's size is how many
+    const uint64_t root = be32(d.data() + 4);
+    if (root + 12 > d.size()) return;
+    const uint64_t nodes = be32(d.data() + root + 8);
+    if (nodes == 0 || root + nodes * 12 > d.size()) return;
+    for (uint64_t i = 1; i < nodes; ++i) {
+      const uint8_t* n = d.data() + root + i * 12;
+      if (n[0] != 0) continue;  // a directory
+      const uint64_t at = be32(n + 4), size = be32(n + 8);
+      if (at + size > d.size()) continue;
+      read_contents(std::vector<uint8_t>(d.begin() + at, d.begin() + at + size), depth + 1);
+    }
+    return;
+  }
+  read_models(d);
+}
+
 void read_file(const File& f) {
-  const bool packed = f.path.size() > 3 && f.path.compare(f.path.size() - 3, 3, ".lz") == 0;
-  const std::vector<uint8_t> whole = packed ? unpack(f.bytes) : std::vector<uint8_t>{};
-  const std::vector<uint8_t>& d = packed ? whole : f.bytes;
   if (f.path.find("COLI_COURSE") != std::string::npos) {
-    if (d.size() < 0x88) return;
-    const uint32_t at = be32(d.data() + 0x84);
-    if (at >= d.size()) return;
-    const uint8_t fog = d[at];
+    const std::vector<uint8_t> whole = packed(f.bytes) ? unpack(f.bytes) : f.bytes;
+    if (whole.size() < 0x88) return;
+    const uint32_t at = be32(whole.data() + 0x84);
+    if (at >= whole.size()) return;
+    const uint8_t fog = whole[at];
     if (s_fogs.insert(fog).second) {
       std::fprintf(stderr, "[pipelines] fog type %u from %s\n", fog, f.path.c_str());
       for (size_t i = 0; i < s_bases.size(); ++i) {
@@ -380,83 +426,108 @@ void read_file(const File& f) {
     }
     return;
   }
-  s_machine_file = f.path.find("vehicle") != std::string::npos;
-  read_models(d);
+  const uint64_t meshes = s_meshes, configs = s_configs;
+  const size_t later = s_later.size();
+  read_contents(f.bytes, 0);
+  if (s_meshes != meshes)
+    std::fprintf(stderr, "[pipelines] file %s: %llu meshes, %llu new forms, %zu new post forms\n", f.path.c_str(),
+                 (unsigned long long)(s_meshes - meshes), (unsigned long long)(s_configs - configs), s_later.size() - later);
 }
 
-void all_on_disc(const char* dir) {
-  std::error_code ec;
-  std::vector<std::filesystem::path> paths;
-  for (const auto& e : std::filesystem::recursive_directory_iterator(dir, ec)) {
-    const std::string name = e.path().filename().string();
-    if (name.find(".gma") != std::string::npos || (name.find("COLI_COURSE") == 0 && name.find(".lz") != std::string::npos))
-      paths.push_back(e.path());
-  }
-  std::fprintf(stderr, "[pipelines] test: every model on the disc, %zu files\n", paths.size());
-  std::sort(paths.begin(), paths.end());
-  std::lock_guard g{s_lock};
-  for (const auto& path : paths) {
-    File f;
-    f.path = path.string();
-    std::ifstream in(path, std::ios::binary);
-    f.bytes.assign(std::istreambuf_iterator<char>(in), {});
-    s_files.push_back(std::move(f));
+void ask_later(size_t count) {
+  while (count-- != 0 && !s_later.empty()) {
+    const PipelineConfig p = s_later.back();
+    s_later.pop_back();
+    s_bases.push_back(p);
+    s_base_takes_fog.push_back(true);
+    for (const uint8_t fog : s_fogs) precompile_with_fog(p, fog);
   }
 }
 
 void run() {
+#ifdef _WIN32
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
   {
     std::unique_lock g{s_lock};
     s_wake.wait(g, [] { return s_aurora_up || s_quit; });
   }
   if (const char* dump = std::getenv("AURORA_TEST_MODEL_DUMP")) s_dump = std::fopen(dump, "wb");
-  const char* all = std::getenv("AURORA_TEST_ALL_MODELS");
-  if (all) all_on_disc(all);
   const auto t0 = Clock::now();
+  constexpr size_t Short = 32;  // the compile queue counts as short: later work never stands in front of a file being read
   bool told = true;
   for (;;) {
     File f;
+    bool have = false;
     {
       std::unique_lock g{s_lock};
-      if (s_files.empty() && !told) {
-        // the first time the compile threads are done with what came in so far: the log says how long it took
-        g.unlock();
-        while (aurora::gfx::pipelines_waiting() != 0) {
-          std::unique_lock g2{s_lock};
-          if (s_wake.wait_for(g2, std::chrono::milliseconds(20), [] { return s_quit || !s_files.empty(); })) break;
+      if (s_quit) break;
+      if (!s_files.empty()) {
+        f = std::move(s_files.front());
+        s_files.pop_front();
+        have = true;
+      } else {
+        const bool more = !s_later.empty() || !s_disc_files.empty();
+        const size_t waiting = aurora::gfx::pipelines_waiting();
+        if (waiting >= Short || (waiting != 0 && !more)) {
+          s_wake.wait_for(g, std::chrono::milliseconds(20), [] { return s_quit || !s_files.empty(); });
+          continue;
         }
-        g.lock();
-        if (s_files.empty()) {
-          told = true;
-          std::fprintf(stderr, "[pipelines] models: %llu meshes (%llu left out), %llu forms, %zu pipelines compiled, nothing waiting, %.0f ms after the first file\n",
-                       (unsigned long long)s_meshes, (unsigned long long)s_meshes_left_out, (unsigned long long)s_configs,
-                       aurora::gfx::pipelines_compiled(),
-                       std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
-          if (s_dump) std::fflush(s_dump);
+        if (!s_later.empty()) {
+          g.unlock();
+          ask_later(Short);
+          told = false;
+          continue;
+        }
+        if (!s_disc_files.empty()) {
+          f = std::move(s_disc_files.front());
+          s_disc_files.pop_front();
+          s_disc_bytes -= f.bytes.size();
+          have = true;
+          g.unlock();
+          s_wake.notify_all();  // (the disc walk waits for room)
+          g.lock();
+        } else {
+          if (!told) {
+            told = true;
+            std::fprintf(stderr, "[pipelines] models: %llu meshes (%llu left out), %llu forms, %zu pipelines compiled, nothing waiting, %.0f ms after the first file\n",
+                         (unsigned long long)s_meshes, (unsigned long long)s_meshes_left_out, (unsigned long long)s_configs,
+                         aurora::gfx::pipelines_compiled(),
+                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+            if (s_dump) std::fflush(s_dump);
+          }
+          s_wake.wait(g, [] { return s_quit || !s_files.empty() || !s_disc_files.empty(); });
+          continue;
         }
       }
-      s_wake.wait(g, [] { return s_quit || !s_files.empty(); });
-      if (s_quit) break;
-      f = std::move(s_files.front());
-      s_files.pop_front();
+    }
+    if (have) {
+      read_file(f);
       told = false;
     }
-    read_file(f);
   }
   if (s_dump) std::fclose(s_dump);
   s_dump = nullptr;
 }
 }  // namespace
 
-extern "C" void aurora_present_model_file(const char* path, const uint8_t* bytes, uint64_t size) {
+extern "C" void aurora_present_model_file(const char* path, const uint8_t* bytes, uint64_t size, int later) {
   static const bool off = std::getenv("AURORA_TEST_NO_MODELS") != nullptr;  // a test: today's behaviour, to compare
   if (off) return;
   File f;
   f.path = path;
   f.bytes.assign(bytes, bytes + size);
   {
-    std::lock_guard g{s_lock};
-    s_files.push_back(std::move(f));
+    std::unique_lock g{s_lock};
+    if (later) {
+      // The disc walk's thread waits here, so a whole disc never stands in memory
+      s_wake.wait(g, [] { return s_quit || s_disc_bytes < 64u * 1024 * 1024; });
+      if (s_quit) return;
+      s_disc_bytes += f.bytes.size();
+      s_disc_files.push_back(std::move(f));
+    } else {
+      s_files.push_back(std::move(f));
+    }
     if (!s_thread.joinable()) s_thread = std::thread(run);
   }
   s_wake.notify_all();
@@ -466,7 +537,6 @@ void model_pipelines_aurora_up() {
   {
     std::lock_guard g{s_lock};
     s_aurora_up = true;
-    if (!s_thread.joinable() && std::getenv("AURORA_TEST_ALL_MODELS")) s_thread = std::thread(run);
   }
   s_wake.notify_all();
 }

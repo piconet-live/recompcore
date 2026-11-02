@@ -121,7 +121,7 @@ struct Library
   void (*overlay_forget)(u64) = nullptr;
   void (*overlay_frame)(const void*) = nullptr;
   int (*picture_rect)(s32*) = nullptr;
-  void (*model_file)(const char*, const u8*, u64) = nullptr;
+  void (*model_file)(const char*, const u8*, u64, int) = nullptr;
 };
 
 Settings s_settings;
@@ -317,10 +317,20 @@ bool WantsModelFiles()
   return s_on.load(std::memory_order_relaxed) && s_lib.model_file != nullptr;
 }
 
-void ModelFile(const std::string& path, const u8* bytes, u64 size)
+bool WantsWholeDisc()
+{
+  static const bool wanted = [] {
+    const char* rt = std::getenv("AURORA_RT");
+    const char* asked = std::getenv("AURORA_WHOLE_DISC");
+    return (rt != nullptr && (rt[0] == '1' || rt[0] == '2')) || (asked != nullptr && asked[0] == '1');
+  }();
+  return wanted && WantsModelFiles();
+}
+
+void ModelFile(const std::string& path, const u8* bytes, u64 size, bool later)
 {
   if (WantsModelFiles())
-    s_lib.model_file(path.c_str(), bytes, size);
+    s_lib.model_file(path.c_str(), bytes, size, later ? 1 : 0);
 }
 
 void Configure(const Settings& settings)
