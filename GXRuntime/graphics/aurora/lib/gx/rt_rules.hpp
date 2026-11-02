@@ -147,7 +147,7 @@ inline void draw_colour(const DrawRec& d, const Vertex* verts, const float (*tex
 struct GpuDraw {
   std::uint32_t stages, firstStage, cls;  // cls: 0 solid, 1 translucent, 2 additive, 3 ignored
   float strength;                         // reflection strength; machines boosted, scenery capped
-  std::uint32_t highlight;                // bit 0: has a stage looked up by the normal, the game's own shine; bit 1: glows, gives light; bit 2: outside the depth, drawn over the world, takes no light
+  std::uint32_t highlight;                // bit 0: has a stage looked up by the normal, the game's own shine; bit 1: glows, gives light; bit 2: outside the depth, drawn over the world, takes no light; bit 3: a blended layer writing no depth
   std::uint32_t fogType;
   float fog[3];
   float fogColour[3];
@@ -172,7 +172,7 @@ struct Frame {
   std::vector<float> prevPos;       // each of verts in the last frame's view space, with motion data on (rt_motion.hpp)
   std::vector<std::pair<std::uint32_t, std::uint32_t>> spans;  // the draw order's first vertex and count behind verts
   std::vector<Vertex> verts;        // solid surfaces first, then what light passes through (see-through, glows), then the sky
-  std::uint32_t seeFirstVertex = 0, skyFirstVertex = 0;
+  std::uint32_t seeFirstVertex = 0, layerFirstVertex = 0, skyFirstVertex = 0;
   std::vector<GpuDraw> draws;
   std::vector<StageRec> stages;
   std::vector<LightPick> picks, merged;
@@ -288,7 +288,7 @@ inline void build_glows(const DrawRec* draws, std::uint32_t count, const Vertex*
 // The main view is the perspective projection with the most triangles. Sky: the largest see-through shells around the view,
 // by size against the largest in the frame, with no table of courses.
 inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex* verts, const Tuning& t, Frame& out) {
-  out.verts.clear(), out.prevPos.clear(), out.spans.clear(), out.draws.clear(), out.stages.clear(), out.main = nullptr, out.machineDraws = out.reflective = 0, out.seeFirstVertex = out.skyFirstVertex = 0;
+  out.verts.clear(), out.prevPos.clear(), out.spans.clear(), out.draws.clear(), out.stages.clear(), out.main = nullptr, out.machineDraws = out.reflective = 0, out.seeFirstVertex = out.layerFirstVertex = out.skyFirstVertex = 0;
   const auto key = [](const DrawRec& d) { return std::array<int, 2>{static_cast<int>(d.proj[0] * 1000), static_cast<int>(d.proj[5] * 1000)}; };
   std::array<int, 2> best{};
   {
@@ -386,6 +386,9 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
       }
     }
     g.cls = !d.colorUpdate || darkens ? 3 : additive ? 2 : translucent ? 1 : 0;
+    // a layer: blended over what is there by its alpha, writing no depth (dust, sand sheets, smoke cards). Rays may pass it (rt.hlsl AURORA_RT_LAYER_PASS)
+    if (d.blendMode == 1 && !additive && !darkens && !opaqueBlend && !d.depthUpdate && g.cls < 2)
+      g.highlight |= 8;
     const bool inView = d.projType == 0 && key(d) == best && d.vertices > 0;
     if (strength > 0 && inView) {
       ++out.reflective;
@@ -414,15 +417,18 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
   const auto sky = [&](std::uint32_t i) { return out.is_sky(i); };
   build_glows(draws, count, verts, t, extent, sky, out);
 }
-// The triangles the rays get: solid, what light passes through, sky. drop: a byte a draw, 1 where the static track already holds it (may be null).
-inline void assemble_frame(const DrawRec* draws, std::uint32_t count, const Vertex* verts, const std::uint8_t* drop, Frame& out) {
-  for (int pass = 0; pass < 3; ++pass) {
+// The triangles the rays get: solid, what light passes through, blended layers writing no depth (only with layersApart, AURORA_RT_LAYER_PASS; else they stay
+// in the first two), sky. drop: a byte a draw, 1 where the static track already holds it (may be null).
+inline void assemble_frame(const DrawRec* draws, std::uint32_t count, const Vertex* verts, const std::uint8_t* drop, Frame& out, bool layersApart = false) {
+  for (int pass = 0; pass < 4; ++pass) {
     if (pass == 1)
       out.seeFirstVertex = static_cast<std::uint32_t>(out.verts.size());
     if (pass == 2)
+      out.layerFirstVertex = static_cast<std::uint32_t>(out.verts.size());
+    if (pass == 3)
       out.skyFirstVertex = static_cast<std::uint32_t>(out.verts.size());
     for (std::uint32_t i = 0; i < count; ++i) {
-      const int group = out.is_sky(i) ? 2 : out.draws[i].cls == 0 ? 0 : 1;
+      const int group = out.is_sky(i) ? 3 : layersApart && (out.draws[i].highlight & 8) != 0 ? 2 : out.draws[i].cls == 0 ? 0 : 1;
       if (out.extent[i] <= 0.f || group != pass || (drop != nullptr && drop[i] != 0))
         continue;
       out.verts.insert(out.verts.end(), verts + draws[i].firstVertex, verts + draws[i].firstVertex + draws[i].vertices);

@@ -1001,6 +1001,14 @@ void motion_wait() {
   s_motionWorkWake.wait(lock, [] { return s_motionWorkDone; });
 }
 
+// AURORA_RT_LAYER_PASS=1: blended layers that write no depth get a structure of their own (rt.hlsl MaskLayer), so rays pass them without looking at each
+static bool layers_apart() {
+  static const bool on = [] {
+    const char* v = std::getenv("AURORA_RT_LAYER_PASS");
+    return v != nullptr && std::atof(v) != 0;
+  }();
+  return on;
+}
 void run_rules(live::Job& j) {
   const auto t0 = std::chrono::steady_clock::now();
   Tuning tuning;
@@ -1096,9 +1104,9 @@ void run_rules(live::Job& j) {
       scene::match_static(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, s_texAvg, MostTexAvg, j.frame.main->proj[0], j.frame.main->proj[5], j.frame, j.world);
     }
     gfx::stagelog::Scope t{"assemble", j.copy};
-    assemble_frame(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, j.world.drop.data(), j.frame);
+    assemble_frame(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, j.world.drop.data(), j.frame, layers_apart());
   } else {
-    assemble_frame(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, nullptr, j.frame);
+    assemble_frame(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, nullptr, j.frame, layers_apart());
     if (scene::on() && !staticScene && j.frame.main != nullptr)
       scene::match(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, s_texAvg, MostTexAvg, j.frame.main->proj[0], j.frame.main->proj[5], j.world);
   }

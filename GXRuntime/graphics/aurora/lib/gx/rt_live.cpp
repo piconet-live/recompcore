@@ -69,7 +69,7 @@ struct Params {
   // AURORA_RT_LIGHTING=1: the surface's light from rays (rt.hlsl lighting()). rays 0: off
   u32 lightRays;
   float skyGain, lightReach, bounce, visFloor;
-  u32 stableShine;  // bit 0: AURORA_RT_SHINE_STABLE=1; bit 1: t13 holds the picture from before the last blends; bit 2: AURORA_RT_PAIR_GAP=1. The root signature has no room for more words
+  u32 stableShine;  // bit 0: AURORA_RT_SHINE_STABLE=1; bit 1: t13 holds the picture from before the last blends; bit 2: AURORA_RT_PAIR_GAP=1; bit 3: AURORA_RT_LAYER_PASS=1. The root signature has no room for more words
 };
 
 constexpr u32 Frames = 3, SlotDescriptors = 13, MaxTextures = 8192, PostLevels = 6;
@@ -105,12 +105,12 @@ struct Slot {
     u64 size = 0;
     void* map = nullptr;
   } verts, draws, stages, lights, glows, worldMeshes;
-  ComPtr<ID3D12Resource> blas[3], tlas, scratch, instances, constants, attrUpload;
+  ComPtr<ID3D12Resource> blas[4], tlas, scratch, instances, constants, attrUpload;
   u64 attrUploadSize = 0;
   void* attrUploadMap = nullptr;
   void* constantsMap = nullptr;
   Buf prevPos;
-  u64 blasSize[3]{}, tlasSize = 0, scratchSize = 0;
+  u64 blasSize[4]{}, tlasSize = 0, scratchSize = 0;
   std::vector<ComPtr<ID3D12Resource>> keep;
   // what this slot's timings belong to, for the time log
   u64 copy = 0;
@@ -792,10 +792,10 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   world_stage(s, job);
   if (g.failed)
     return;
-  // solid, see-through and glows, sky: a structure each, so a shadow ray can leave out what light passes through
-  const u32 firsts[3] = {0, fr.seeFirstVertex, fr.skyFirstVertex};
-  const u32 counts[3] = {fr.seeFirstVertex, fr.skyFirstVertex - fr.seeFirstVertex, static_cast<u32>(fr.verts.size()) - fr.skyFirstVertex};
-  static constexpr u32 masks[3] = {1, 4, 2};
+  // solid, see-through and glows, blended layers (AURORA_RT_LAYER_PASS; else none), sky: a structure each, so a shadow ray can leave out what light passes through
+  const u32 firsts[4] = {0, fr.seeFirstVertex, fr.layerFirstVertex, fr.skyFirstVertex};
+  const u32 counts[4] = {fr.seeFirstVertex, fr.layerFirstVertex - fr.seeFirstVertex, fr.skyFirstVertex - fr.layerFirstVertex, static_cast<u32>(fr.verts.size()) - fr.skyFirstVertex};
+  static constexpr u32 masks[4] = {1, 4, 128, 2};
   ensure(s.scratch, s.scratchSize, 256u << 20, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   u64 scratchAt = 0;
   {
@@ -804,16 +804,16 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
     bs[0].UAV.pResource = nullptr;
     cl->ResourceBarrier(1, bs);
   }
-  for (u32 i = 0; i < 3; ++i)
+  for (u32 i = 0; i < 4; ++i)
     if (counts[i])
       build_blas(s, i, s.verts.gpu->GetGPUVirtualAddress() + u64(firsts[i]) * sizeof(Vertex), counts[i], scratchAt);
   D3D12_RESOURCE_BARRIER uav{};
   uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
   cl->ResourceBarrier(1, &uav);
   static thread_local std::vector<D3D12_RAYTRACING_INSTANCE_DESC> inst;
-  inst.assign(3, D3D12_RAYTRACING_INSTANCE_DESC{});
+  inst.assign(4, D3D12_RAYTRACING_INSTANCE_DESC{});
   u32 instances = 0;
-  for (u32 i = 0; i < 3; ++i) {
+  for (u32 i = 0; i < 4; ++i) {
     if (!counts[i])
       continue;
     auto& d = inst[instances++];
@@ -825,7 +825,7 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   inst.resize(instances);
   world_instances(s, job, inst);
   instances = static_cast<u32>(inst.size());
-  const u64 instanceBytes = std::max<size_t>(instances, 3) * sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
+  const u64 instanceBytes = std::max<size_t>(instances, 4) * sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
   if (!s.instances || s.instances->GetDesc().Width < instanceBytes) {
     if (s.instances)
       s.keep.push_back(s.instances);
@@ -915,7 +915,9 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   static const u32 stableShine = post_setting("AURORA_RT_SHINE_STABLE", 0.f) != 0.f ? 1 : 0;
   // AURORA_RT_PAIR_GAP=1 (rt.hlsl pair_gap_on): a primary ray past a drawn placement's triangle with no draw of it looks for that draw just around it
   static const u32 pairGap = post_setting("AURORA_RT_PAIR_GAP", 0.f) != 0.f ? 4 : 0;
-  p.stableShine = stableShine | (g.beforeThis ? 2u : 0u) | pairGap;
+  // AURORA_RT_LAYER_PASS=1 (rt.hlsl layer_pass_on): primary rays pass a blended draw that tests depth but writes none, as they pass additive draws
+  static const u32 layerPass = post_setting("AURORA_RT_LAYER_PASS", 0.f) != 0.f ? 8 : 0;
+  p.stableShine = stableShine | (g.beforeThis ? 2u : 0u) | pairGap | layerPass;
   p.skyFirst = fr.skyFirstVertex;
   p.glowCount = glowCount;
   p.glowGain = job.glow;

@@ -45,7 +45,7 @@ struct Params {
   float wet;
   uint lightRays;    // the surface's light from rays, this many a pixel; 0 off
   float skyGain, lightReach, bounce, visFloor;
-  uint stableShine;  // bit 0 stable shine, bit 1 Before holds a picture, bit 2 AURORA_RT_PAIR_GAP
+  uint stableShine;  // bit 0 stable shine, bit 1 Before holds a picture, bit 2 AURORA_RT_PAIR_GAP, bit 3 AURORA_RT_LAYER_PASS
 };
 struct Light { float3 pos; float3 colour; float reach; };
 struct GlowLight { float3 pos; float area; float3 colour; float radius; };
@@ -58,6 +58,8 @@ static const uint MaskRaySolid = MaskSolid | MaskWorld, MaskRaySeen = MaskSeen |
 // AURORA_RT_SCENE_STATIC=1: a placement the game drew has these too, so primary rays see it, at the level and matrix the game drew it by; its id has WorldDrawn. Element 0's draw: where the static draws begin.
 static const uint MaskWorldDrawn = 32, MaskWorldDrawnSee = 64, WorldDrawn = 0x400000, WorldMask = 0x3FFFFF;
 static const uint MaskPrimary = MaskSeen | MaskWorldDrawn | MaskWorldDrawnSee;
+// AURORA_RT_LAYER_PASS=1: blended layers that write no depth, a structure of their own that no other mask takes in (rt_rules.hpp assemble_frame)
+static const uint MaskLayer = 128;
 static const uint NoDraw = 0xFFFFFFFFu;
 struct WorldMesh { float4 colour; uint cls; uint draw; uint first; uint flags; };
 StructuredBuffer<WorldMesh> World : register(t11);
@@ -364,6 +366,28 @@ static const float LitRayMost = 2.0;
 // With this, the next look is for draws alone, in a window around that hit as wide as the two transforms part: a share of the distance. Nothing found: as before.
 static const float PairGapLeast = 0.02, PairGapShare = 0.002;
 bool pair_gap_on() { return (P.stableShine & 4) != 0; }
+// AURORA_RT_LAYER_PASS=1 (bit 3 of stableShine): a blended draw that tests depth but writes none (dust and sand sheets, smoke: highlight bit 3) took a primary
+// ray where its texel's alpha reached 0.5 (whole cards where its class says solid), and the pixel then took no own light at all, the ground behind it included: Sand Ocean's blowing-sand sheets
+// showed as the raster's lighter patches, the shape of their alpha, on lit dunes. With this a primary ray passes such a layer as it passes additive draws: the
+// light falls on the surface behind. The layer covers that surface by its texel's alpha (texture and vertex): the change rays make there is kept to the part it
+// leaves showing, and the layer itself takes only a soft share of the open sky's light, no sun and no shadow. A card's square edge, where its alpha is 0, fades
+// to the change on the surface behind; no edge of it can show.
+bool layer_pass_on() { return (P.stableShine & 8) != 0; }
+// Tuned by eye: how much of the open sky's light a layer in the air takes
+static const float LayerSkyShare = 0.5;
+// A dust column is many cards deep: passing them one look at a time ran out of looks, and where the count crossed the limit the cards' edges showed. So with
+// this on the layers are a structure of their own (MaskLayer) that camera, light and shadow rays leave out; only layer_through looks at them.
+// How much the layers along a ray let through, from tMin to tMax: each covers by its texel's alpha (texture and vertex), in any order. level: the texture's
+// level, softer for light than for the camera
+float layer_through(float3 org, float3 dir, float tMin, float tMax, float level) {
+  RayQuery<RAY_FLAG_FORCE_NON_OPAQUE> q;
+  RayDesc ray; ray.Origin = org; ray.Direction = dir; ray.TMin = tMin; ray.TMax = tMax;
+  q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskLayer, ray);
+  float through = 1;
+  while (q.Proceed())
+    through *= 1 - saturate(shade(fetch(q.CandidateInstanceID() + q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics()), level).a);
+  return through;
+}
 // What the rays bring a surface: how open it is, what it sees as bounce, what it sees of the sky. xi: the first ray's place in the hemisphere, the rest follow by a fixed sequence.
 // A hit counts as closed by distance, all of it near and nothing at lightReach, so a far wall leaves the open track as it is. Glows and additive draws are seen through, adding their light. Reach tuned.
 void light_rays(float3 pos, float3 N, float dist, float2 xi, out float open, out float3 bounce, out float3 skySeen) {
@@ -379,6 +403,7 @@ void light_rays(float3 pos, float3 N, float dist, float2 xi, out float open, out
     for (int i = 0; i < 4 && !ended; ++i) {
       RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
       RayDesc ray; ray.Origin = org; ray.Direction = dir; ray.TMin = tmin; ray.TMax = 100000;
+      // AURORA_RT_LAYER_PASS: layers in the air (dust, smoke cards) are out of MaskRaySeen; they don't close a surface's sky
       q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskRaySeen, ray);
       q.Proceed();
       if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) { raySky += through * sky_along(dir, 3.0); break; }
@@ -424,12 +449,14 @@ float sun_term(float3 pos, float3 N, float dist) {
   if (ndl <= 0 || dot(sun.colour, 1.xxx) <= 0) return 0;
   // Machines and many other bodies blend by texture alpha, so they aren't in the solid set: what light passes is told by its own alpha at the hit. Tuned: half, and four hits at most.
   float tmin = 0.02;
+  const float3 org = pos + N * (0.03 + dist * 0.0005);
   for (int i = 0; i < 4; ++i) {
     RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
-    RayDesc ray; ray.Origin = pos + N * (0.03 + dist * 0.0005); ray.Direction = sun.pos; ray.TMin = tmin; ray.TMax = 100000;
+    RayDesc ray; ray.Origin = org; ray.Direction = sun.pos; ray.TMin = tmin; ray.TMax = 100000;
+    // AURORA_RT_LAYER_PASS: a layer is never the hit; all of them along the ray let the sun through by their alpha, a soft partial shadow, no card's square
     q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskRaySeen, ray);
     q.Proceed();
-    if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) return ndl;
+    if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) return layer_pass_on() ? ndl * layer_through(org, sun.pos, 0.02, 100000, 2.0) : ndl;
     float t = q.CommittedRayT();
     if (q.CommittedInstanceID() >= WorldId) {
       WorldMesh m = world_mesh(q.CommittedInstanceID(), q.CommittedGeometryIndex());
@@ -449,7 +476,7 @@ float sun_term(float3 pos, float3 N, float dist) {
     if (d.cls == 0) return 0;
     if (d.cls == 1 && shade(h, 2.0).a >= 0.5) return 0;
   }
-  return ndl;
+  return layer_pass_on() ? ndl * layer_through(org, sun.pos, 0.02, 100000, 2.0) : ndl;
 }
 // sun x N.L x shadow + sky x how much of the surroundings it sees + what it sees, as bounce. A factor on the picture: 1 is today's level. Floor and gains tuned.
 float3 lit_factor(float open, float3 bounce, float3 skySeen, float sunTerm) {
@@ -536,6 +563,8 @@ void main(uint3 id : SV_DispatchThreadID) {
       }
     }
     float gapAt = -1;  // AURORA_RT_PAIR_GAP: >= 0 when this look is the window for draws around a drawn placement's hit there
+    float surfT = 100000;  // AURORA_RT_LAYER_PASS: where the pixel's surface is, for the layers in front of it
+    const float3 lightBefore = light;
     for (int i = 0; i < 8; ++i) {
       RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
       const bool gapLook = gapAt >= 0;
@@ -564,6 +593,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         if (surf.a < 0.5) { tmin = t + 0.02; continue; }
       }
       hitDepth = t;
+      surfT = t;
       float3 N = h.nrm;
       if (dot(N, v) > 0) N = -N;
       if (P.mode == 3) { dbg += N * 0.5 + 0.5; break; }
@@ -668,6 +698,13 @@ void main(uint3 id : SV_DispatchThreadID) {
         term *= bare;
       }
       break;
+    }
+    const float shows = layer_pass_on() ? layer_through(0.xxx, v, 0.01, surfT, 0) : 1;
+    if (shows < 1) {
+      // the part the layers cover: the open sky's light, a share of it, on the layers' own colour as the raster has it
+      const float3 sky = P.lightRays > 0 ? lit_factor(1, 0.xxx, 0.xxx, 0) : 1.xxx;
+      light = lightBefore + (light - lightBefore) * shows + (1 - shows) * LayerSkyShare * (sky - 1);
+      term *= shows;
     }
     sum += term;
   }
