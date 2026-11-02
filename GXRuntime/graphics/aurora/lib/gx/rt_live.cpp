@@ -85,8 +85,10 @@ struct DenoiseParams {
   float cam[3][4];
   float alphaLeast, phiNormal, phiDepth, phiLight;
   u32 step, reset, denoised, show;
+  float litScale;  // full pixels to a light pixel: 2 with AURORA_RT_HALF=1
+  u32 half;
 };
-constexpr u32 DenoiseSteps = 8, DenoiseViews = 12, DenoiseIterations = 4;
+constexpr u32 DenoiseSteps = 8, DenoiseViews = 13, DenoiseIterations = 4;
 constexpr u32 ConstantStride = 256;
 constexpr u32 ViewHdr = PostFirst, ViewDown = ViewHdr + 2, ViewUp = ViewDown + 2 * PostLevels, ViewExpo = ViewUp + 2 * (PostLevels - 1);
 
@@ -123,7 +125,7 @@ struct State {
   ComPtr<ID3D12RootSignature> root;
   ComPtr<ID3D12PipelineState> trace, compose, lightPass, temporal, atrous;
   // Light across frames (AURORA_RT_DENOISE=1): textures for this frame and the last; a texture with its descriptors written per step
-  ComPtr<ID3D12Resource> guide[2], motion, noisyOpen, noisySky, histOpen[2], histSky[2], moments[2], tmpOpen[2], tmpSky[2];
+  ComPtr<ID3D12Resource> refl, guide[2], motion, noisyOpen, noisySky, histOpen[2], histSky[2], moments[2], tmpOpen[2], tmpSky[2];
   u32 flip = 0;
   float prevProj[16]{}, prevViewport[4]{};
   u64 lastLitCopy = 0;
@@ -455,6 +457,13 @@ bool denoise_on() {
   }();
   return on;
 }
+bool half_on() {
+  static const bool on = [] {
+    const char* v = std::getenv("AURORA_RT_HALF");
+    return v != nullptr && v[0] == '1';
+  }();
+  return on;
+}
 bool post_on() {
   static const bool on = [] {
     const char* v = std::getenv("AURORA_LOOK_POST");
@@ -551,6 +560,9 @@ void make_targets(u32 w, u32 h, wgpu::TextureFormat format) {
         fail("no texture for light across frames");
     };
     constexpr DXGI_FORMAT F16 = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    if (half_on())
+      d.Width = (w + 1) / 2, d.Height = (h + 1) / 2;
+    make(g.refl, F16);
     make(g.motion, F16), make(g.noisyOpen, F16), make(g.noisySky, F16);
     for (u32 i = 0; i < 2; ++i) {
       make(g.guide[i], DXGI_FORMAT_R32G32B32A32_FLOAT);
@@ -909,17 +921,19 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   ID3D12Resource* litOpen = nullptr;
   ID3D12Resource* litSky = nullptr;
   const u32 now = g.flip, old = g.flip ^ 1;
+  const u32 lightW = half_on() ? (g.w + 1) / 2 : g.w, lightH = half_on() ? (g.h + 1) / 2 : g.h;
+  dp.litScale = half_on() ? 2.f : 1.f, dp.half = half_on() ? 1 : 0;
   if (lit && p.lightRays > 0) {
     dp.denoised = 1;
-    bind({g.guide[now].Get(), g.motion.Get(), g.noisyOpen.Get(), g.noisySky.Get()});
+    bind({g.guide[now].Get(), g.motion.Get(), g.noisyOpen.Get(), g.noisySky.Get(), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, g.refl.Get()});
     cl->SetPipelineState(g.lightPass.Get());
-    cl->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
+    cl->Dispatch((lightW + 7) / 8, (lightH + 7) / 8, 1);
     barrier();
     cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot + 2);
     bind({g.guide[now].Get(), g.motion.Get(), g.noisyOpen.Get(), g.noisySky.Get(), g.guide[old].Get(), g.histOpen[old].Get(), g.histSky[old].Get(), g.moments[old].Get(),
           g.tmpOpen[0].Get(), g.tmpSky[0].Get(), g.moments[now].Get()});
     cl->SetPipelineState(g.temporal.Get());
-    cl->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
+    cl->Dispatch((lightW + 7) / 8, (lightH + 7) / 8, 1);
     barrier();
     // the first step's result is the next frame's history; then back and forth
     ID3D12Resource* fromO = g.tmpOpen[0].Get();
@@ -930,7 +944,7 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
       ID3D12Resource* toS = i == 0 ? g.histSky[now].Get() : g.tmpSky[i & 1].Get();
       dp.step = 1u << i;
       bind({g.guide[now].Get(), nullptr, fromO, fromS, nullptr, nullptr, nullptr, nullptr, toO, toS});
-      cl->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
+      cl->Dispatch((lightW + 7) / 8, (lightH + 7) / 8, 1);
       barrier();
       fromO = toO, fromS = toS;
     }
@@ -947,7 +961,7 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   dp.show = lit ? show : 0;
   // AURORA_RT_SHOW=4: the raw rays in the place of the smoothed
   if (show == 4 && lit) litOpen = g.noisyOpen.Get(), litSky = g.noisySky.Get();
-  bind({lit ? g.guide[now].Get() : nullptr, lit ? g.motion.Get() : nullptr, litOpen, litSky, nullptr, nullptr, nullptr, lit ? g.moments[now].Get() : nullptr});
+  bind({lit ? g.guide[now].Get() : nullptr, lit ? g.motion.Get() : nullptr, litOpen, litSky, nullptr, nullptr, nullptr, lit ? g.moments[now].Get() : nullptr, nullptr, nullptr, nullptr, lit ? g.refl.Get() : nullptr});
   cl->SetPipelineState(g.trace.Get());
   cl->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
   barrier();
