@@ -22,6 +22,7 @@ add_library(aurora_gx STATIC
         lib/gx/attr_fmt.cpp
         lib/gx/command_processor.cpp
         lib/gx/rt_capture.cpp
+        lib/gx/rt_scene.cpp
         lib/gx/regs.cpp
         lib/gx/recomp.cpp
         lib/gx/dl.cpp

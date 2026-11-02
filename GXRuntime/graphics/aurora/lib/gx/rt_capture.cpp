@@ -439,23 +439,15 @@ void translate(const Packet& st, DrawRec& d, Vertex* outVerts) noexcept {
       chan = 1;
       break;
     }
-  if (s_motionOn) {
+  if (s_motionOn || scene::on()) {
     // the draw's own bytes and where its arrays are: the same list of the same model next frame has the same key
-    std::uint64_t h = 0xcbf29ce484222325ull ^ (static_cast<std::uint64_t>(prim) << 32 | vtxCount);
+    std::uint64_t h = 0;
+    const size_t used = std::min<size_t>(st.rawBytes, size_t(stride) * vtxCount);
+    d.sceneKey = fields[GX_VA_POS].type == GX_DIRECT ? scene::list_key(prim, vtxCount, vertices, used, &h) : (scene::list_key(prim, vtxCount, vertices, used, &h), 0);
     const auto mix = [&h](std::uint64_t w) {
       h = (h ^ w) * 0x9E3779B97F4A7C15ull;
       h ^= h >> 29;
     };
-    const size_t used = std::min<size_t>(st.rawBytes, size_t(stride) * vtxCount);
-    size_t at = 0;
-    for (; at + 8 <= used; at += 8) {
-      std::uint64_t w;
-      std::memcpy(&w, vertices + at, 8);
-      mix(w);
-    }
-    std::uint64_t w = 0;
-    std::memcpy(&w, vertices + at, used - at);
-    mix(w);
     mix(reinterpret_cast<std::uintptr_t>(st.arrays[GX_VA_POS].data));
     d.motionKey = h | 1;
     d.motionSingle = st.mtxCount == 1 ? 1 : 0;
@@ -919,6 +911,8 @@ void run_rules(live::Job& j) {
       }
     });
   build_frame(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, tuning, j.frame);
+  if (scene::on() && j.frame.main != nullptr)
+    scene::match(j.draws.get() + j.baseDraw, j.drawCount, j.verts.get() + j.baseVert, s_texAvg, MostTexAvg, j.frame.main->proj[0], j.frame.main->proj[5], j.world);
   if (motion.joinable()) {
     motion.join();
     j.frame.prevPos.clear();

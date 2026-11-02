@@ -94,7 +94,7 @@ struct Slot {
     ComPtr<ID3D12Resource> upload, gpu;
     u64 size = 0;
     void* map = nullptr;
-  } verts, draws, stages, lights, glows;
+  } verts, draws, stages, lights, glows, worldMeshes;
   ComPtr<ID3D12Resource> blas[3], tlas, scratch, instances, constants;
   void* constantsMap = nullptr;
   Buf prevPos;
@@ -146,6 +146,12 @@ struct State {
   gfx::EncoderTaskId task = gfx::InvalidEncoderTask;
   gfx::DrawTypeId draw = gfx::InvalidDrawType;
 
+  // The whole track (AURORA_RT_SCENE=1): one structure for each model, made once
+  std::shared_ptr<scene::Scene> worldScene;
+  ComPtr<ID3D12Resource> worldBlas;
+  std::vector<u64> worldAt;
+  u64 worldBytes = 0;
+  double worldKnown = 0, worldDrawn = 0, worldInstances = 0, worldDraws = 0, worldMatched = 0, worldMoved = 0, worldMs = 0;
   std::unique_ptr<Job> pending;
   bool drawThis = false;
   wgpu::CommandBuffer first;
@@ -288,7 +294,7 @@ void init_device() {
       !traceCs || !composeCs || !hdrCs || !downCs || !upCs || !expoCs || !toneCs)
     return fail("the shader does not compile");
 
-  D3D12_DESCRIPTOR_RANGE1 r1[2]{};
+  D3D12_DESCRIPTOR_RANGE1 r1[3]{};
   r1[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
   r1[0].NumDescriptors = 8;
   r1[0].Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
@@ -296,6 +302,11 @@ void init_device() {
   r1[1].NumDescriptors = 2;
   r1[1].OffsetInDescriptorsFromTableStart = 8;
   r1[1].Flags = r1[0].Flags;
+  r1[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;  // t11: the whole track's meshes (rt_scene_live.inl)
+  r1[2].NumDescriptors = 1;
+  r1[2].BaseShaderRegister = 11;
+  r1[2].OffsetInDescriptorsFromTableStart = 10;
+  r1[2].Flags = r1[0].Flags;
   D3D12_DESCRIPTOR_RANGE1 rd[2]{};
   rd[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
   rd[0].NumDescriptors = 1;
@@ -322,7 +333,7 @@ void init_device() {
   rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   rp[0].Constants.Num32BitValues = sizeof(Params) / 4;
   rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  rp[1].DescriptorTable.NumDescriptorRanges = 2;
+  rp[1].DescriptorTable.NumDescriptorRanges = 3;
   rp[1].DescriptorTable.pDescriptorRanges = r1;
   rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
   rp[2].DescriptorTable.NumDescriptorRanges = 1;
@@ -642,6 +653,8 @@ void build_blas(Slot& s, u32 which, D3D12_GPU_VIRTUAL_ADDRESS addr, u32 count, u
   s.cl->BuildRaytracingAccelerationStructure(&bd, 0, nullptr);
 }
 
+#include "rt_scene_live.inl"
+
 // The rays' part: this frame's structures and the trace itself
 void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   for (const auto& t : job.textures)
@@ -687,6 +700,7 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
     fr.glows.push_back({});
   glowCount = job.glow > 0 ? static_cast<u32>(fr.glows.size()) : 0;
   stage(s, s.glows, fr.glows.data(), fr.glows.size() * sizeof(GlowLight));
+  world_stage(s, job);
   if (g.failed)
     return;
   // solid, see-through and glows, sky: a structure each, so a shadow ray can leave out what light passes through
@@ -707,7 +721,8 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   D3D12_RESOURCE_BARRIER uav{};
   uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
   cl->ResourceBarrier(1, &uav);
-  D3D12_RAYTRACING_INSTANCE_DESC inst[3]{};
+  static thread_local std::vector<D3D12_RAYTRACING_INSTANCE_DESC> inst;
+  inst.assign(3, D3D12_RAYTRACING_INSTANCE_DESC{});
   u32 instances = 0;
   for (u32 i = 0; i < 3; ++i) {
     if (!counts[i])
@@ -718,11 +733,18 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
     d.InstanceID = firsts[i] / 3;  // a hit's triangle: this plus its primitive index
     d.AccelerationStructure = s.blas[i]->GetGPUVirtualAddress();
   }
-  if (!s.instances)
-    s.instances = make_buffer(D3D12_HEAP_TYPE_UPLOAD, sizeof inst, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  inst.resize(instances);
+  world_instances(s, job, inst);
+  instances = static_cast<u32>(inst.size());
+  const u64 instanceBytes = std::max<size_t>(instances, 3) * sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
+  if (!s.instances || s.instances->GetDesc().Width < instanceBytes) {
+    if (s.instances)
+      s.keep.push_back(s.instances);
+    s.instances = make_buffer(D3D12_HEAP_TYPE_UPLOAD, instanceBytes + instanceBytes / 4, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  }
   void* im = nullptr;
   RT_HR(s.instances->Map(0, nullptr, &im));
-  std::memcpy(im, inst, sizeof inst);
+  std::memcpy(im, inst.data(), instanceBytes > inst.size() * sizeof(D3D12_RAYTRACING_INSTANCE_DESC) ? inst.size() * sizeof(D3D12_RAYTRACING_INSTANCE_DESC) : instanceBytes);
   s.instances->Unmap(0, nullptr);
   D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS tin{};
   tin.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
@@ -750,6 +772,7 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   srv_buffer(s.lights.gpu.Get(), static_cast<u32>(fr.lights.size()), sizeof(EngineLight), base + 4);
   srv_buffer(s.stages.gpu.Get(), static_cast<u32>(fr.stages.size()), sizeof(StageRec), base + 5);
   srv_buffer(s.glows.gpu.Get(), static_cast<u32>(fr.glows.size()), sizeof(GlowLight), base + 7);
+  srv_buffer(s.worldMeshes.gpu.Get(), static_cast<u32>(std::max<size_t>(job.world.colours.size(), 1)), sizeof(scene::GpuMesh), base + 10);
   Params p{};
   p.size[0] = static_cast<float>(g.w), p.size[1] = static_cast<float>(g.h);
   p.rectWH[0] = 640.f, p.rectWH[1] = 528.f;  // the EFB as the snapshot holds it, all of it
@@ -1064,6 +1087,7 @@ void run_rays(Job& job) {
   g.tris += fr.verts.size() / 3;
   g.lightsSeen += fr.lights.size();
   g.lightsMost = std::max<u64>(g.lightsMost, fr.lights.size());
+  world_count(job);
   static const u32 every = [] {
     const char* v = std::getenv("AURORA_RT_REPORT");
     return v != nullptr ? static_cast<u32>(std::atoi(v)) : 300u;
@@ -1074,6 +1098,7 @@ void run_rays(Job& job) {
     std::fprintf(stderr, "[rt] per frame, %u frames at %ux%u: GPU build %.2f ms and rays+cleanup %.2f ms (all %.2f, worst %.2f); CPU in the stream %.2f ms, translation beside it %.2f ms, rules %.2f ms, worker %.2f ms; %.0f triangles, lights %.1f (most %llu), picks %.1f, merged %.1f, glows %.1f from %.0f pieces of %.1f draws, one draw held most %.1f\n",
                  g.count, g.w, g.h, (g.msGpu - g.msTrace - g.msLight - g.msDenoise) / n, g.msTrace / n, g.msGpu / n, g.msGpuMost, g.msBuild / n, g.msTranslate / n, g.msRules / n, g.msComposeWait / n, double(g.tris) / n, double(g.lightsSeen) / n,
                  static_cast<unsigned long long>(g.lightsMost), g.picks / n, g.merged / n, g.glowsSeen / n, g.glowPieces / n, g.glowDraws / n, g.glowTop / n);
+    world_report(n);
     g.msLight = g.msDenoise = g.motionAgree = g.motionOwn = 0;
     g.count = 0, g.msGpuMost = 0, g.msGpu = g.msTrace = g.msBuild = g.msRules = g.msTranslate = g.msComposeWait = 0, g.tris = 0, g.lightsSeen = 0, g.lightsMost = 0, g.picks = g.merged = g.glowsSeen = g.glowPieces = g.glowDraws = g.glowTop = 0;
   }

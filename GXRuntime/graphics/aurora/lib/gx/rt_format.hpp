@@ -36,6 +36,7 @@ struct DrawRec {
   std::uint64_t motionKey;
   float motionMtx[12];
   std::uint32_t motionSingle;
+  std::uint64_t sceneKey;  // the draw's own bytes alone, the same as the model file's list (rt_scene.hpp); 0 unknown
   std::uint32_t samplesCopy;  // a stage reads a texture the frame copied from the picture
   StageRec stage[16];
 };

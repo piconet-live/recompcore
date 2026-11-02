@@ -29,6 +29,7 @@
 
 #include "gfx/pipeline_cache.hpp"
 #include "gx/pipeline.hpp"
+#include "gx/rt_scene.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -73,6 +74,7 @@ uint64_t s_disc_bytes = 0;
 enum Tier { First, Same, PostSmall, DiscFirst, Rest, Tiers };
 std::set<std::vector<uint8_t>> s_walk_shaders;  // fog left at none
 bool s_from_disc = false;  // the file being read comes from the disc walk
+const char* s_reading = "";  // the path of the file being read
 uint64_t s_disc_read = 0;
 struct Form {
   PipelineConfig config;
@@ -446,12 +448,14 @@ void read_contents(const std::vector<uint8_t>& d, int depth) {
     }
     return;
   }
+  if (!s_from_disc) aurora::gx::rt::scene::add_file(s_reading, d);
   read_models(d);
 }
 
 void read_file(const File& f) {
   if (f.path.find("COLI_COURSE") != std::string::npos) {
     const std::vector<uint8_t> whole = packed(f.bytes) ? unpack(f.bytes) : f.bytes;
+    if (!s_from_disc) aurora::gx::rt::scene::add_course(whole);
     if (whole.size() < 0x88) return;
     const uint32_t at = be32(whole.data() + 0x84);
     if (at >= whole.size()) return;
@@ -464,6 +468,7 @@ void read_file(const File& f) {
   }
   const uint64_t meshes = s_meshes;
   const size_t first = s_tiers[First].size();
+  s_reading = f.path.c_str();
   read_contents(f.bytes, 0);
   if (s_meshes != meshes)
     std::fprintf(stderr, "[pipelines] file %s: %llu meshes, %zu new shaders\n", f.path.c_str(),
@@ -589,6 +594,9 @@ void run() {
 extern "C" void aurora_present_model_file(const char* path, const uint8_t* bytes, uint64_t size, int later) {
   static const bool off = std::getenv("AURORA_TEST_NO_MODELS") != nullptr;  // a test: today's behaviour, to compare
   if (off) return;
+  // The runner walks the disc whenever rays are on; only a test that asks for it now takes it
+  static const bool walk = std::getenv("AURORA_WHOLE_DISC") != nullptr && std::getenv("AURORA_WHOLE_DISC")[0] == '1';
+  if (later && !walk) return;
   File f;
   f.path = path;
   f.bytes.assign(bytes, bytes + size);

@@ -50,6 +50,12 @@ struct Light { float3 pos; float3 colour; float reach; };
 struct GlowLight { float3 pos; float area; float3 colour; float radius; };
 // The acceleration structure's instances: solid surfaces, the sky's shells, and what light passes through (see-through, glows)
 static const uint MaskSolid = 1, MaskSky = 2, MaskSee = 4, MaskSeen = MaskSolid | MaskSee;
+// The whole static track (AURORA_RT_SCENE=1): only rays leaving a surface see it, and only what the game didn't draw this frame is in it, so an object is never there twice.
+// A hit knows its mesh by the instance's id and the geometry's index; element 0 holds the frame's facts: colour.x 1 shows the scene (a test), cls a draw whose fog far hits take.
+static const uint MaskWorld = 8, MaskWorldSee = 16, WorldId = 0x800000;
+static const uint MaskRaySolid = MaskSolid | MaskWorld, MaskRaySeen = MaskSeen | MaskWorld | MaskWorldSee;
+struct WorldMesh { float4 colour; uint cls; uint3 pad; };
+StructuredBuffer<WorldMesh> World : register(t11);
 ConstantBuffer<Params> P : register(b0);
 RaytracingAccelerationStructure Scene : register(t0);
 StructuredBuffer<Vertex> Verts : register(t1);
@@ -213,10 +219,21 @@ float3 trace_reflection(float3 org, float3 dir, float maxLodScale) {
   for (int bounce = 0; bounce < 8; ++bounce) {
     RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
     RayDesc ray; ray.Origin = org; ray.Direction = dir; ray.TMin = tmin; ray.TMax = 100000;
-    q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskSeen, ray);
+    q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskRaySeen, ray);
     q.Proceed();
     if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) { sum += through * (P.miss + sky_along(dir, 2.0)); break; }
     float t = q.CommittedRayT();
+    if (q.CommittedInstanceID() >= WorldId) {
+      WorldMesh m = World[(q.CommittedInstanceID() & (WorldId - 1)) + q.CommittedGeometryIndex()];
+      tmin = t + 0.02;
+      if (m.cls == 3) continue;
+      float3 wc = m.colour.rgb;
+      if (World[0].cls != 0xFFFFFFFFu) wc = fogged(Draws[World[0].cls], org + dir * t, wc);
+      if (m.cls == 2) { sum += through * wc * saturate(m.colour.a); continue; }
+      if (m.cls == 1) { float a = saturate(m.colour.a); sum += through * wc * a; through *= 1 - a; if (through < 0.03) break; continue; }
+      sum += through * wc;
+      break;
+    }
     Hit h = fetch(q.CommittedInstanceID() + q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
     Draw d = Draws[h.draw];
     tmin = t + 0.02;
@@ -256,7 +273,7 @@ float3 engine_light(float3 pos, float3 N) {
     if (P.lightShadow != 0 && fall * wrap > 0.02) {
       RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
       RayDesc ray; ray.Origin = pos + N * 0.03; ray.Direction = L; ray.TMin = 0.02; ray.TMax = max(dist - 0.6, 0.03);
-      q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskSolid, ray);
+      q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskRaySolid, ray);
       q.Proceed();
       if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) vis = 0.25;
     }
@@ -283,7 +300,7 @@ float3 glow_light(float3 pos, float3 N) {
   if (top < 0.005 || topMax < 0.2) return sum;
   RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
   RayDesc ray; ray.Origin = pos + N * 0.03; ray.Direction = normalize(topDir); ray.TMin = 0.02; ray.TMax = topMax;
-  q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskSolid, ray);
+  q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskRaySolid, ray);
   q.Proceed();
   return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? sum - topLight * 0.85 : sum;
 }
@@ -306,17 +323,24 @@ void light_rays(float3 pos, float3 N, float dist, float2 xi, out float open, out
     for (int i = 0; i < 4 && !ended; ++i) {
       RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
       RayDesc ray; ray.Origin = org; ray.Direction = dir; ray.TMin = tmin; ray.TMax = 100000;
-      q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskSeen, ray);
+      q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskRaySeen, ray);
       q.Proceed();
       if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) { raySky += through * sky_along(dir, 3.0); break; }
       float t = q.CommittedRayT();
-      Hit h = fetch(q.CommittedInstanceID() + q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
-      Draw d = Draws[h.draw];
       tmin = t + 0.02;
-      if (d.cls == 3) continue;
-      float4 c = shade(h, 3.0);
-      if (d.cls == 2) { rayBounce += through * c.rgb * saturate(c.a); continue; }
-      if (d.cls == 1) { float al = saturate(c.a); rayBounce += through * c.rgb * al; through *= 1 - al; continue; }
+      float4 c = 0;
+      uint cls;
+      if (q.CommittedInstanceID() >= WorldId) {
+        WorldMesh m = World[(q.CommittedInstanceID() & (WorldId - 1)) + q.CommittedGeometryIndex()];
+        cls = m.cls, c = m.colour;
+      } else {
+        Hit h = fetch(q.CommittedInstanceID() + q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
+        cls = Draws[h.draw].cls;
+        if (cls != 3) c = shade(h, 3.0);
+      }
+      if (cls == 3) continue;
+      if (cls == 2) { rayBounce += through * c.rgb * saturate(c.a); continue; }
+      if (cls == 1) { float al = saturate(c.a); rayBounce += through * c.rgb * al; through *= 1 - al; continue; }
       // a bright surface lights from any distance, whatever else is near closes only within reach; so lava lights what faces it from far away
       float near = t / P.lightReach, closed = saturate(1 - near * near);
       float most = max(c.r, max(c.g, c.b)), strong = smoothstep(LitStrongLow, LitStrongHigh, most);
@@ -340,10 +364,16 @@ float sun_term(float3 pos, float3 N, float dist) {
   for (int i = 0; i < 4; ++i) {
     RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
     RayDesc ray; ray.Origin = pos + N * (0.03 + dist * 0.0005); ray.Direction = sun.pos; ray.TMin = tmin; ray.TMax = 100000;
-    q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskSeen, ray);
+    q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskRaySeen, ray);
     q.Proceed();
     if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) return ndl;
     float t = q.CommittedRayT();
+    if (q.CommittedInstanceID() >= WorldId) {
+      WorldMesh m = World[(q.CommittedInstanceID() & (WorldId - 1)) + q.CommittedGeometryIndex()];
+      tmin = t + 0.02;
+      if (m.cls == 0 || (m.cls == 1 && m.colour.a >= 0.5)) return 0;
+      continue;
+    }
     Hit h = fetch(q.CommittedInstanceID() + q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
     Draw d = Draws[h.draw];
     tmin = t + 0.02;
@@ -383,6 +413,18 @@ void main(uint3 id : SV_DispatchThreadID) {
     float3 v = normalize(float3((ndc + P.pOffset) / P.pScale, -1));
     float tmin = 0.01;
     float3 term = 0;
+    if (World[0].colour.x > 0) {
+      RayQuery<RAY_FLAG_FORCE_OPAQUE> sq;
+      RayDesc sr; sr.Origin = 0; sr.Direction = v; sr.TMin = 0.01; sr.TMax = 100000;
+      sq.TraceRayInline(Scene, RAY_FLAG_NONE, MaskWorld | MaskWorldSee, sr);
+      sq.Proceed();
+      if (sq.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+        WorldMesh m = World[(sq.CommittedInstanceID() & (WorldId - 1)) + sq.CommittedGeometryIndex()];
+        float3 shown = m.colour.rgb * (0.6 + 0.4 * frac(sq.CommittedPrimitiveIndex() * 0.37));
+        Out[id.xy] = float4(lerp(0.xxx, shown - raster, 0.75), sq.CommittedRayT());
+        return;
+      }
+    }
     for (int i = 0; i < 8; ++i) {
       RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
       RayDesc ray; ray.Origin = 0; ray.Direction = v; ray.TMin = tmin; ray.TMax = 100000;

@@ -3,6 +3,7 @@
 // around the frame's submit.
 #include "rt_motion.hpp"
 #include "rt_rules.hpp"
+#include "rt_scene.hpp"
 
 #include <atomic>
 #include <future>
@@ -26,6 +27,7 @@ struct Job {
   std::future<void> rules;
   Frame frame;
   MotionResult motion;
+  scene::Frame world;  // the whole track's instances for this frame (AURORA_RT_SCENE=1)
   std::vector<LiveTexture> textures;
   float proj[16], viewport[4];
   float road, light, glow, calm, wet;
