@@ -8,11 +8,13 @@
 #include "gfx/recording.hpp"
 #include "gfx/render_worker.hpp"
 #include "gx/command_processor.hpp"
+#include "gx/rt_capture.hpp"
 #include "gx/fifo.hpp"
 #include "gx/gx.hpp"
 #include "gx/texture.hpp"
 #include "imgui.hpp"
 #include "webgpu/gpu.hpp"
+#include "webgpu/hdr.hpp"
 #include "webgpu/gpu_prof.hpp"
 #include <webgpu/webgpu_cpp.h>
 #endif
@@ -196,6 +198,7 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
 #ifdef AURORA_ENABLE_GX
   gfx::initialize();
   gx::fifo::init();
+  gx::rt::start();
   imgui::create_context();
 #endif
   const auto size = window::get_window_size();
@@ -351,7 +354,12 @@ void end_frame() noexcept {
         filterView = webgpu::present_hook().finalTarget(webgpu::g_graphicsConfig.surfaceConfiguration.width,
                                                         webgpu::g_graphicsConfig.surfaceConfiguration.height);
       }
-      const wgpu::TextureView& drawView = filterView ? filterView : currentView;
+      // AURORA_LOOK_HDR=1: everything to here as for an 8-bit surface, in float; the last step to the surface in scRGB
+      const wgpu::TextureView outputView =
+          webgpu::hdr::on() ? webgpu::hdr::target(webgpu::g_graphicsConfig.surfaceConfiguration.width,
+                                                  webgpu::g_graphicsConfig.surfaceConfiguration.height)
+                            : currentView;
+      const wgpu::TextureView& drawView = filterView ? filterView : outputView;
       {
         const std::array attachments{
             wgpu::RenderPassColorAttachment{
@@ -406,7 +414,10 @@ void end_frame() noexcept {
         pass.End();
       }
       if (filterView) {
-        webgpu::present_hook().finalPass(encoder, filterView, currentView);
+        webgpu::present_hook().finalPass(encoder, filterView, outputView);
+      }
+      if (webgpu::hdr::on()) {
+        webgpu::hdr::final_pass(encoder, currentView);
       }
     } else {
       Log.info("Skipping present; window not presentable");
@@ -416,7 +427,11 @@ void end_frame() noexcept {
     const auto buffer = encoder.Finish(&cmdBufDescriptor);
     {
       ZoneScopedN("Queue Submit");
+      if (gfx::g_beforeFrameSubmit != nullptr)
+        gfx::g_beforeFrameSubmit();
       g_queue.Submit(1, &buffer);
+      if (gfx::g_afterFrameSubmit != nullptr)
+        gfx::g_afterFrameSubmit();
       g_timingSubmitNs.store(timing_now_ns(), std::memory_order_release);
       g_queue.OnSubmittedWorkDone(wgpu::CallbackMode::AllowSpontaneous,
                                   [](wgpu::QueueWorkDoneStatus, wgpu::StringView) {

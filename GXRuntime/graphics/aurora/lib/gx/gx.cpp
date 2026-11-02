@@ -1,6 +1,8 @@
 #include "gx.hpp"
+#include "rt_capture.hpp"
 
 #include "pipeline.hpp"
+#include "shader_info.hpp"
 #include "texture.hpp"
 #include "../dolphin/vi/vi_internal.hpp"
 #include "../webgpu/gpu.hpp"
@@ -548,9 +550,37 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
     config.shaderConfig.indStages[i] = g_gxState.indStages[i];
   }
   config.shaderConfig.numIndStages = g_gxState.numIndStages;
+  // State no input of a stage reads is left out of the key, or one material makes a new pipeline for whatever the draw
+  // before it left in the registers (a stage's K selection, its swaps, the channels), and only a draw could say which.
+  bool readsRaster = false;
+  for (u8 i = 0; i < g_gxState.numTevStages; ++i) {
+    auto& stage = config.shaderConfig.tevStages[i];
+    const auto reads = [](const auto& pass, auto... args) {
+      return ((pass.a == args || pass.b == args || pass.c == args || pass.d == args) || ...);
+    };
+    if (!reads(stage.colorPass, GX_CC_KONST)) {
+      stage.kcSel = GX_TEV_KCSEL_1;
+    }
+    if (!reads(stage.alphaPass, GX_CA_KONST)) {
+      stage.kaSel = GX_TEV_KASEL_1;
+    }
+    if (!reads(stage.colorPass, GX_CC_RASC, GX_CC_RASA) && !reads(stage.alphaPass, GX_CA_RASA)) {
+      stage.channelId = GX_COLOR_NULL;
+      stage.tevSwapRas = GX_TEV_SWAP0;
+    } else {
+      readsRaster = true;
+    }
+    if (stage.texMapId == GX_TEXMAP_NULL && stage.indTexStage == GX_INDTEXSTAGE0 && stage.indTexMtxId == GX_ITM_OFF) {
+      stage.texCoordId = GX_TEXCOORD0;
+      stage.tevSwapTex = GX_TEV_SWAP0;
+    }
+  }
+  const auto sampledChannels = build_shader_info(config.shaderConfig).sampledColorChannels;
   for (u8 i = 0; i < MaxColorChannels; ++i) {
     const auto& cc = g_gxState.colorChannelConfig[i];
-    if (cc.lightingEnabled) {
+    if (!readsRaster || !sampledChannels.test(i % 2)) {
+      config.shaderConfig.colorChannels[i] = {};
+    } else if (cc.lightingEnabled) {
       config.shaderConfig.colorChannels[i] = cc;
     } else {
       // Only matSrc matters when lighting disabled
@@ -562,6 +592,7 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
   for (u8 i = 0; i < g_gxState.numTexGens; ++i) {
     config.shaderConfig.tcgs[i] = g_gxState.tcgs[i];
   }
+  if (rt::g_neutral) UNLIKELY { rt::neutralise(config.shaderConfig); }
   if (g_gxState.alphaCompare) {
     config.shaderConfig.alphaCompare = g_gxState.alphaCompare;
   }

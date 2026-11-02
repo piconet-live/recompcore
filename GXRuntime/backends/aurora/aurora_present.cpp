@@ -2,10 +2,12 @@
 // aurora_present (gxruntime/aurora_present.h): Aurora on a thread of its own, fed the retail command stream by an
 // emulator that keeps running the game's GPU, its pictures read back for the emulator to show.
 
+#include "gx/rt_capture.hpp"
 #include "gxruntime/aurora_present.h"
 
 #include "aurora_backend_private.h"
 #include "aurora_overlay.h"
+#include "model_pipelines.h"
 #include "gxruntime/aurora_backend.h"
 #include "gxruntime/gx_recomp.h"
 
@@ -512,6 +514,7 @@ void run() {
     AuroraSetViewportPolicy(AURORA_VIEWPORT_NATIVE);  // the game's own viewport, unscaled
   }
   aurora_overlay_start(s->ram);
+  model_pipelines_aurora_up();
   // AURORA_TEST_FATAL=<copy> (a test): a fatal error at this copy, the way any of Aurora's goes
   const char* test_fatal_text = std::getenv("AURORA_TEST_FATAL");
   const std::uint64_t test_fatal = test_fatal_text != nullptr ? std::strtoull(test_fatal_text, nullptr, 10) : 0;
@@ -617,6 +620,7 @@ void run() {
     }
     s_test_frame = &f.bytes;
     s_test_frame_copy = f.copy;
+    aurora::gx::rt::begin_copy(f.copy);
     // A picture between that cannot be on time is left out: the true one never waits for it. (Decoded all the same: a
     // frame missed would leave Aurora's state wrong.)
     const bool between = f.between > 0;
@@ -767,6 +771,12 @@ int aurora_present_start(const AuroraPresentConfig* config) {
     s->most_behind = config->most_behind;
   s->window = config->window;
   s->scale = std::clamp<std::uint32_t>(config->scale, 1u, 8u);
+  // AURORA_TEST_SIZE=<w>x<h> (tests): the picture's size, whatever the window's
+  if (const char* v = std::getenv("AURORA_TEST_SIZE")) {
+    unsigned w = 0, h = 0;
+    if (std::sscanf(v, "%ux%u", &w, &h) == 2 && w > 0 && h > 0)
+      s->width = w, s->height = h;
+  }
   if (const char* v = std::getenv("AURORA_MOST_BEHIND"); v != nullptr && std::atoi(v) > 0)  // (tests)
     s->most_behind = static_cast<std::uint32_t>(std::atoi(v));
   s->building.reserve(512u * 1024u);
@@ -809,7 +819,18 @@ void aurora_present_frame(uint64_t copy) {
     // In the host window there is no picture of the emulator's to go back to: a stop would freeze the window with the
     // race going on (course 36 under load, 1214 frames in), so only the byte bound stops it there.
     const std::size_t most = (s->up && s->window == nullptr) ? s->most_behind : 1800u;
-    const std::size_t most_bytes = s->window != nullptr ? State::most_bytes_behind_window : State::most_bytes_behind;
+    // AURORA_MOST_MB_BEHIND=<MB> (tests only: further behind, the guest's RAM may hold a later frame's lists); AURORA_QUEUE_LOG=<file>: a line a frame, copy, bytes, frames and bytes waiting
+    static const std::size_t mostMb = [] {
+      const char* v = std::getenv("AURORA_MOST_MB_BEHIND");
+      return v != nullptr ? static_cast<std::size_t>(std::atoll(v)) : std::size_t{0};
+    }();
+    static FILE* queueLog = [] {
+      const char* v = std::getenv("AURORA_QUEUE_LOG");
+      return v != nullptr ? std::fopen(v, "wb") : nullptr;
+    }();
+    if (queueLog != nullptr)
+      std::fprintf(queueLog, "%llu,%zu,%zu,%zu\n", static_cast<unsigned long long>(copy), f.bytes.size(), s->queue.size(), s->bytes_waiting);
+    const std::size_t most_bytes = mostMb != 0 ? mostMb << 20 : s->window != nullptr ? State::most_bytes_behind_window : State::most_bytes_behind;
     if (s->queue.size() >= most || s->bytes_waiting + f.bytes.size() > most_bytes) {
       stop_for_run(s->queue.size() >= most ? "too many frames behind" : "too many bytes behind");
       s->queue.clear();
@@ -859,6 +880,7 @@ void aurora_present_stats(AuroraPresentStats* out) {
 }
 
 void aurora_present_stop(void) {
+  model_pipelines_stop();
   if (s == nullptr)
     return;
   {

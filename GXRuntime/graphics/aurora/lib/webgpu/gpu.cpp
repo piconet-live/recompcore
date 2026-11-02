@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "gpu.hpp"
 
 #include <algorithm>
@@ -24,6 +25,7 @@
 #include "../internal.hpp"
 #include "../window.hpp"
 #include "gpu_prof.hpp"
+#include "hdr.hpp"
 
 #ifdef WEBGPU_DAWN
 #include "../dawn/TracyPlatform.hpp"
@@ -96,7 +98,17 @@ AuroraLogLevel wgpu_log_level(wgpu::LoggingType type) {
   }
 }
 
+// AURORA_DAWN_LOG=<file>: what Dawn says, kept where a test can read it
+void dawn_note(std::string_view text) {
+  if (const char* path = std::getenv("AURORA_DAWN_LOG"))
+    if (FILE* f = std::fopen(path, "ab")) {
+      std::fwrite(text.data(), 1, text.size(), f);
+      std::fputc('\n', f);
+      std::fclose(f);
+    }
+}
 void wgpu_log(wgpu::LoggingType type, wgpu::StringView message) {
+  dawn_note(std::string_view(message.data, message.length));
   Log.report(wgpu_log_level(type), "WebGPU message: {}", message);
 }
 
@@ -266,13 +278,27 @@ wgpu::PresentMode select_present_mode(const wgpu::SurfaceCapabilities& capabilit
   return wgpu::PresentMode::Fifo;
 }
 
+bool raw_picture() noexcept {
+  static const bool on = [] {
+    const char* v = std::getenv("AURORA_LOOK_RAW");
+    return v != nullptr && v[0] == '1';
+  }();
+  return on;
+}
+wgpu::TextureFormat present_format() noexcept {
+  return hdr::on() ? wgpu::TextureFormat::RGBA16Float : g_graphicsConfig.surfaceConfiguration.format;
+}
+wgpu::TextureFormat scene_format() noexcept {
+  return raw_picture() ? wgpu::TextureFormat::RGBA16Float : g_graphicsConfig.surfaceConfiguration.format;
+}
+
 TextureWithSampler create_render_texture(uint32_t width, uint32_t height, bool multisampled) {
   const wgpu::Extent3D size{
       .width = width,
       .height = height,
       .depthOrArrayLayers = 1,
   };
-  const auto format = g_graphicsConfig.surfaceConfiguration.format;
+  const auto format = scene_format();
   uint32_t sampleCount = 1;
   if (multisampled) {
     sampleCount = g_graphicsConfig.msaaSamples;
@@ -544,7 +570,7 @@ fn fs_premultiplied_alpha(in: VertexOutput) -> @location(0) vec4<f32> {
   const auto make_copy_pipeline = [&](const char* label, const char* fragmentEntryPoint,
                                       const wgpu::BlendState* blend) {
     const std::array colorTargets{wgpu::ColorTargetState{
-        .format = g_graphicsConfig.surfaceConfiguration.format,
+        .format = present_format(),
         .blend = blend,
         .writeMask = wgpu::ColorWriteMask::All,
     }};
@@ -604,7 +630,7 @@ void create_resample_pipeline() {
   };
   auto module = g_device.CreateShaderModule(&moduleDescriptor);
   const std::array colorTargets{wgpu::ColorTargetState{
-      .format = g_graphicsConfig.surfaceConfiguration.format,
+      .format = scene_format(),
       .writeMask = wgpu::ColorWriteMask::All,
   }};
   const wgpu::FragmentState fragmentState{
@@ -966,6 +992,13 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
       if (feature == wgpu::FeatureName::Depth32FloatStencil8 && timewarp_pin_wanted()) {
         requiredFeatures.push_back(feature);
       }
+      // the ray-traced picture's two textures, shared with D3D12 (AURORA_RT=1 or AURORA_LOOK_POST=1)
+      if (feature == wgpu::FeatureName::SharedTextureMemoryD3D12Resource) {
+        const char* rt = std::getenv("AURORA_RT");
+        const char* look = std::getenv("AURORA_LOOK_POST");
+        if ((rt != nullptr && rt[0] == '1') || (look != nullptr && look[0] == '1') || raw_picture())
+          requiredFeatures.push_back(feature);
+      }
       if (feature == wgpu::FeatureName::CoreFeaturesAndLimits || feature == wgpu::FeatureName::TextureCompressionBC ||
           feature == wgpu::FeatureName::TextureCompressionASTC ||
           feature == wgpu::FeatureName::TextureComponentSwizzle || feature == wgpu::FeatureName::DualSourceBlending) {
@@ -1047,6 +1080,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     });
     deviceDescriptor.SetUncapturedErrorCallback(
         [](const wgpu::Device& device, wgpu::ErrorType type, wgpu::StringView message) {
+          dawn_note(std::string_view(message.data, message.length));
           if (g_initialized) {
             FATAL("WebGPU error {}: {}", underlying(type), message);
           } else {
@@ -1056,6 +1090,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     deviceDescriptor.SetDeviceLostCallback(
         wgpu::CallbackMode::AllowSpontaneous,
         [](const wgpu::Device& device, wgpu::DeviceLostReason reason, wgpu::StringView message) {
+          dawn_note(std::string_view(message.data, message.length));
           // (Destroyed: the device went on purpose, at a shutdown or as the process ends: no error. Patch 19)
           if (g_initialized && reason != wgpu::DeviceLostReason::Destroyed) {
             FATAL("Device lost: {}", message);
@@ -1118,6 +1153,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
       .msaaSamples = g_config.msaa,
       .textureAnisotropy = g_config.maxTextureAnisotropy,
   };
+  hdr::choose(g_surfaceCapabilities);
   create_copy_pipeline();
   create_resample_pipeline();
   gpu_prof::initialize();
@@ -1130,6 +1166,7 @@ void shutdown() {
   g_initialized = false;
   gfx::gpu_synchronize();
   gpu_prof::shutdown();
+  hdr::shutdown();
   g_CopyBindGroupLayout = {};
   g_CopyPipeline = {};
   g_CopyPremultipliedAlphaPipeline = {};
@@ -1177,6 +1214,10 @@ static void resize_swapchain_internal(uint32_t width, uint32_t height, uint32_t 
   g_graphicsConfig.surfaceConfiguration.height = nativeHeight;
   auto surfaceConfiguration = g_graphicsConfig.surfaceConfiguration;
   surfaceConfiguration.device = g_device;
+  // Windows treats a float swapchain as scRGB without being told (seen through a window capture); Dawn's colour management chain isn't needed
+  if (hdr::on()) {
+    surfaceConfiguration.format = wgpu::TextureFormat::RGBA16Float;
+  }
   {
     window::SurfaceLock surfaceLock;
     g_surface.Configure(&surfaceConfiguration);

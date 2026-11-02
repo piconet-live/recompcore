@@ -5,6 +5,7 @@
 #include "../webgpu/gpu.hpp"
 #include "gx.hpp"
 #include "gx_fmt.hpp"
+#include "rt_capture.hpp"
 #include "shader_info.hpp"
 
 #include <cstdlib>
@@ -407,6 +408,8 @@ std::string tev_op(GXTevOp op, std::string_view bias, std::string_view scale, st
 std::string tev_color_op(GXTevOp op, std::string_view bias, std::string_view scale, bool clamp, std::string_view a,
                          std::string_view b, std::string_view c, std::string_view d) {
   std::string expr = tev_op(op, bias, scale, a, b, c, d, "vec3(0)"sv);
+  if (webgpu::raw_picture())
+    return fmt::format("max({}, vec3f(-4.0))", expr);
   return clamp ? fmt::format("clamp({}, vec3f(0.0), vec3f(1.0))", expr)
                : fmt::format("clamp({}, vec3f(-4.0), vec3f(4.0))", expr);
 }
@@ -414,6 +417,8 @@ std::string tev_color_op(GXTevOp op, std::string_view bias, std::string_view sca
 std::string tev_alpha_op(GXTevOp op, std::string_view bias, std::string_view scale, bool clamp, std::string_view a,
                          std::string_view b, std::string_view c, std::string_view d) {
   std::string expr = tev_op(op, bias, scale, a, b, c, d, "0.0"sv);
+  if (webgpu::raw_picture())
+    return fmt::format("max({}, -4.0)", expr);
   return clamp ? fmt::format("clamp({}, 0.0, 1.0)", expr) : fmt::format("clamp({}, -4.0, 4.0)", expr);
 }
 
@@ -795,7 +800,7 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
   }
 
   if (cc.matSrc == GX_SRC_VTX) {
-    matSrc = vtx_attr(config, static_cast<GXAttr>(GX_VA_CLR0 + i));
+    matSrc = rt::g_noVertexColour && !alpha ? std::string("vec4f(1.0)") : std::string(vtx_attr(config, static_cast<GXAttr>(GX_VA_CLR0 + i)));
   } else if (cc.matSrc == GX_SRC_REG) {
     matSrc = fmt::format("ubuf.cc{0}{1}_mat", i, alpha ? "a"sv : ""sv);
   }
@@ -846,10 +851,11 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
           var diff = {3};
           lighting = lighting + (attn * diff * light.color);
       }}
-      {7}{8} = ({4} * clamp(lighting, vec4f(0.0), vec4f(1.0))){8};
+      {7}{8} = ({4} * {10}){8};
     }})""",
                      i, GX::MaxLights, lightAttnFn, lightDiffFn, matSrc, ambSrc, posVar, outVar, swizzle,
-                     alpha ? "a"sv : ""sv);
+                     alpha ? "a"sv : ""sv,
+                     webgpu::raw_picture() ? "max(lighting, vec4f(0.0))"sv : "clamp(lighting, vec4f(0.0), vec4f(1.0))"sv);
 }
 
 absl::flat_hash_set<gfx::ShaderRef> s_seenShaders;
@@ -2060,7 +2066,16 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTar
       normalAttachment = i;
     }
   }
-  const auto shaderSource = build_shader_source(config, dstAlphaMode, normalAttachment);
+  auto shaderSource = build_shader_source(config, dstAlphaMode, normalAttachment);
+  // A test of a truly empty cache: every shader differs from any run before, so neither Dawn's cache nor the driver's own
+  // (which no switch empties) has seen it. The branch never runs: no vertex has this index.
+  static const char* const salt = std::getenv("AURORA_TEST_SHADER_SALT");
+  if (salt != nullptr) {
+    const std::string line = fmt::format("if (vidx == {}u) {{ out.pos.x = 0.0; }}\n    return out;", 4000000000ull + std::strtoull(salt, nullptr, 10) % 100000000ull);
+    if (const auto at = shaderSource.find("return out;"); at != std::string::npos) {
+      shaderSource.replace(at, 11, line);
+    }
+  }
   const auto hash = xxh3_hash(dstAlphaMode, xxh3_hash(normalAttachment, xxh3_hash(config)));
   wgpu::ShaderSourceWGSL wgslDescriptor{};
   wgslDescriptor.code = shaderSource.c_str();

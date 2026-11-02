@@ -236,8 +236,10 @@ uint32_t end_display_list() {
 
 bool in_display_list() { return detail::sInDisplayList; }
 
+thread_local int HoldDrain::depth = 0;
+
 void drain() {
-  if (detail::sBufferSize == 0) {
+  if (detail::sBufferSize == 0 || HoldDrain::depth != 0) {
     return;
   }
 

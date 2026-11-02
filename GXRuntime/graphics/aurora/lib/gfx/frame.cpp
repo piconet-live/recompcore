@@ -276,7 +276,7 @@ wgpu::Device device() noexcept { return g_device; }
 
 wgpu::Queue queue() noexcept { return g_queue; }
 
-wgpu::TextureFormat color_format() noexcept { return webgpu::g_graphicsConfig.surfaceConfiguration.format; }
+wgpu::TextureFormat color_format() noexcept { return webgpu::scene_format(); }
 
 wgpu::TextureFormat depth_format() noexcept { return webgpu::g_graphicsConfig.depthFormat; }
 
