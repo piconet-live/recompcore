@@ -38,6 +38,8 @@ struct DrawRec {
   std::uint32_t motionSingle;
   std::uint64_t sceneKey;  // the draw's own bytes alone, the same as the model file's list (rt_scene.hpp); 0 unknown
   std::uint32_t samplesCopy;  // a stage reads a texture the frame copied from the picture
+  std::uint64_t stateKey;     // what the draw's translation reads besides its bytes, as far as its own stages read it: stream's state_key
+  float nrmMtx[9];            // its one normal matrix, when it has one
   std::uint32_t fading;       // its alpha is one material alpha below full, by the draw's own channel state: a whole list fading, however its bytes read
   StageRec stage[16];
 };

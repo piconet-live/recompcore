@@ -64,6 +64,7 @@ struct ListInfo {
   std::atomic<ListState> state{ListState::New};
   std::uint8_t seen = 0;
   float extent = 0.f;
+  std::uint64_t stateKey = 0;  // the draw's state when first seen (state_key in rt_capture): the stream knows at once when it no longer holds
 };
 struct ListGroup {
   std::uint64_t key = 0;
@@ -72,7 +73,7 @@ struct ListGroup {
 // Why lists stay as draws, for the report
 struct KeepCount {
   std::uint32_t copy = 0, additive = 0, sky = 0, glow = 0, overWorld = 0, coords = 0, classDiffers = 0, sizeDiffers = 0, material = 0, moved = 0, ofMesh = 0, moving = 0;
-  std::uint64_t auditFails = 0;
+  std::uint64_t auditFails = 0, auditNormal = 0, auditColour = 0, auditCoords = 0, stateMoved = 0;
 };
 struct KeyHit {
   std::uint32_t model;  // in placementsOf
@@ -112,17 +113,17 @@ struct Scene {
   std::mutex pendingLock;
   std::vector<std::pair<std::uint32_t, std::uint32_t>> pending;  // attributes the GPU doesn't have yet: first, count
   KeepCount kept;
-};
   // AURORA_RT_SCENE_MERGE=1: every static placement's largest level in one structure for what light and reflections see, solid and see-through apart, a geometry for each placed mesh. Built once, in the world's space.
   struct MergedGeo {
     std::uint32_t mesh, geometry, placed;
   };
   std::vector<MergedGeo> merged[2];
+};
 
 bool on() noexcept;
 bool static_on() noexcept;  // AURORA_RT_SCENE_STATIC=1, with the scene
-// From the reader, on its thread, for files the game is reading (never the disc walk's). Bytes unpacked.
 bool merge_on() noexcept;   // AURORA_RT_SCENE_MERGE=1, with the static track
+// From the reader, on its thread, for files the game is reading (never the disc walk's). Bytes unpacked.
 void add_course(const std::vector<std::uint8_t>& whole);
 void add_file(const char* path, const std::vector<std::uint8_t>& whole);
 // The scene as it stands, or null. Any thread.
@@ -170,7 +171,7 @@ void match(const DrawRec* draws, std::uint32_t count, const Vertex* verts, const
            float proj0, float proj5, Frame& out);
 // From the stream, before a draw is translated. Static placement, proved list, and this draw needs no translation: true. m: its one matrix.
 void stream_reset(Frame& f);
-bool stream_skip(Frame& f, Scene& sc, std::uint32_t prim, std::uint32_t count, const std::uint8_t* bytes, std::size_t used, const float m[12], const float proj[16], std::uint32_t triVerts, std::uint32_t tick);
+bool stream_skip(Frame& f, Scene& sc, std::uint32_t prim, std::uint32_t count, const std::uint8_t* bytes, std::size_t used, const float m[12], const float proj[16], std::uint32_t triVerts, std::uint32_t tick, std::uint64_t stateKey);
 // The rules thread, AURORA_RT_SCENE_STATIC=1: as match, and learns the draws it sees; fr gets the static draws after its own, fr's assemble_frame takes out.drop.
 void match_static(const DrawRec* draws, std::uint32_t count, const Vertex* verts, const float (*texMeans)[4], std::uint32_t texCount, float proj0, float proj5, aurora::gx::rt::Frame& fr, Frame& out);
 // The same hash on the same bytes as the file's lists: FNV's start, then 64-bit words

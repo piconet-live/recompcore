@@ -154,7 +154,9 @@ bool world_fetch(WorldMesh m, uint prim, float2 bary, float3x4 o2w, out Hit h) {
   h.pos = mul(o2w, float4(a.pos * w.x + b.pos * w.y + c.pos * w.z, 1));
   float3 n = a.nrm == NoDraw ? 0.xxx : nrm_of(a.nrm) * w.x + nrm_of(b.nrm) * w.y + nrm_of(c.nrm) * w.z;
   if (dot(n, n) < 1e-6) n = cross(b.pos - a.pos, c.pos - a.pos);
-  h.nrm = normalize(mul((float3x3)o2w, n));
+  // by the placement's cofactors, so a scaled placement's normals stay normal; a rigid one's are its rotation
+  float3 c0 = o2w._m00_m10_m20, c1 = o2w._m01_m11_m21, c2 = o2w._m02_m12_m22;
+  h.nrm = normalize(cross(c1, c2) * n.x + cross(c2, c0) * n.y + cross(c0, c1) * n.z);
   h.ras = ras_of(a.ras) * w.x + ras_of(b.ras) * w.y + ras_of(c.ras) * w.z;
   for (int i = 0; i < 2; ++i) {
     h.uv[i] = a.uv[i] * w.x + b.uv[i] * w.y + c.uv[i] * w.z;
@@ -263,9 +265,9 @@ float3 trace_reflection(float3 org, float3 dir, float maxLodScale) {
       WorldMesh m = world_mesh(q.CommittedInstanceID(), q.CommittedGeometryIndex());
       tmin = t + 0.02;
       have = world_fetch(m, q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), q.CommittedObjectToWorld3x4(), h);
+      if (have) h.pos = org + dir * t;  // for fog alone; a merged structure's own transform isn't the instance's
       // the game drew this placement but not by this triangle, or by a draw still in the rays
       if (!have && ((q.CommittedInstanceID() & WorldDrawn) != 0 || m.flags != 0)) continue;
-      if (have) h.pos = org + dir * t;  // for fog alone; a merged structure's own transform isn't the instance's
     }
     if (q.CommittedInstanceID() >= WorldId && !have) {
       WorldMesh m = world_mesh(q.CommittedInstanceID(), q.CommittedGeometryIndex());
