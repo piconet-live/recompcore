@@ -728,13 +728,14 @@ bool redraw_held(const std::function<void(uint8_t* uniforms, size_t bytes)>& pat
       }
       patch(g_patched.data(), g_patched.size());
     }
-    // the blocks written in runs: blocks less than Gap apart go in one write
-    constexpr uint32_t Gap = 1024;
+    // the blocks written as one span, first to last: a write per run of nearby blocks cost more (0.12 -> 0.46 ms a picture with runs
+    // closer than 1 KiB, c37 30 racers: about 1.5 us a write, and the blocks lie all through the buffer)
+    constexpr uint64_t Gap = UINT32_MAX;
     stagelog::Scope t{"rd_uniforms", blocks->size()};
     for (size_t k = 0; k < blocks->size();) {
       const uint32_t from = (*blocks)[k];
       uint32_t to = from + 64;
-      for (++k; k < blocks->size() && (*blocks)[k] <= to + Gap; ++k) {
+      for (++k; k < blocks->size() && (*blocks)[k] <= uint64_t{to} + Gap; ++k) {
         to = (*blocks)[k] + 64;
       }
       to = std::min<uint32_t>(to, static_cast<uint32_t>(g_patched.size()) & ~3u);
