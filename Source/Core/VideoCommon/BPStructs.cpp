@@ -3,6 +3,9 @@
 
 #include "VideoCommon/BPStructs.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 #include <algorithm>
 #include <cstring>
 #include <string>
@@ -187,6 +190,18 @@ static void BPWritten(PixelShaderManager& pixel_shader_manager, XFStateManager& 
       if (VideoCommon::FrameRedraw::Recording())
         VideoCommon::FrameRedraw::OnDrawDone();
       INCSTAT(g_stats.this_frame.num_draw_done);
+      // A test's lost draw-done (AURORA_TEST_LOSE_DRAW_DONE=N:M): from the Nth, M of them never reach the game.
+      {
+        static const char* const lose = std::getenv("AURORA_TEST_LOSE_DRAW_DONE");
+        static u64 seen = 0;
+        unsigned long long from = 0, count = 0;
+        ++seen;
+        if (lose && std::sscanf(lose, "%llu:%llu", &from, &count) == 2 && seen >= from && seen < from + count)
+        {
+          std::fprintf(stderr, "fzgx test: draw-done %llu lost\n", static_cast<unsigned long long>(seen));
+          return;
+        }
+      }
       g_texture_cache->FlushEFBCopies();
       g_texture_cache->FlushStaleBinds();
       g_framebuffer_manager->InvalidatePeekCache(false);

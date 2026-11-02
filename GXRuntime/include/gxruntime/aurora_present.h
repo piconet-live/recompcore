@@ -116,6 +116,8 @@ AURORA_PRESENT_API int aurora_present_start(const AuroraPresentConfig* config);
 // The GPU thread: `size` bytes of the command stream, in order. Copied; never blocks.
 AURORA_PRESENT_API void aurora_present_write(const uint8_t* bytes, uint32_t size);
 // The GPU thread: the stream so far ends frame `copy` (its XFB copy, numbered from 1). Never blocks.
+// The copy about to be marked is a picture between two steps, shown `fraction` of a field after the true one before it.
+AURORA_PRESENT_API void aurora_present_frame_between(uint64_t copy, float fraction);
 AURORA_PRESENT_API void aurora_present_frame(uint64_t copy);
 // Any one thread: the newest picture finished since the last take (1), none (0), or -1 once Aurora has stopped for
 // the run (show the emulator's own pictures from then on). Cheap: no wait, one lock.

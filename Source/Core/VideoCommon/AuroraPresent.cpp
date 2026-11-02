@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -116,6 +117,7 @@ struct Library
   int (*start)(const LibConfig*) = nullptr;
   void (*write)(const u8*, u32) = nullptr;
   void (*frame)(u64) = nullptr;
+  void (*frame_between)(u64, float) = nullptr;
   int (*take)(LibPicture*) = nullptr;
   void (*stats)(LibStats*) = nullptr;
   void (*stop)() = nullptr;
@@ -160,6 +162,16 @@ FILE* s_shown_log = nullptr;
 std::chrono::steady_clock::time_point s_t0;
 std::string s_report;  // made at the stop
 
+// NoteBetween's, oldest first; the fraction of the copy being cut (0: a true picture)
+struct Between
+{
+  u64 position;
+  float fraction;
+};
+std::mutex s_between_lock;
+std::deque<Between> s_between;
+float s_cut_fraction = 0;
+
 #ifdef _WIN32
 HMODULE s_module = nullptr;
 template <typename T>
@@ -198,6 +210,7 @@ bool Load(const std::string& path)
     s_lib = {};
     return false;
   }
+  Bind(&s_lib.frame_between, "aurora_present_frame_between");
   return true;
 #else
   s_load_problem = "Aurora is only loaded on Windows so far";
@@ -340,6 +353,15 @@ void Configure(const Settings& settings)
   s_on = true;
 }
 
+void NoteBetween(u64 position, float fraction)
+{
+  if (!s_started)
+    return;
+  std::lock_guard guard(s_between_lock);
+  if (s_between.size() < 64)
+    s_between.push_back({position, fraction});
+}
+
 std::string Report()
 {
   return s_report.empty() ? MakeReport() : s_report;
@@ -381,6 +403,15 @@ void OnXFBCopy()
   ++s_copies;
   s_cut_copy = s_copies;
   s_cut = true;
+  {
+    std::lock_guard guard(s_between_lock);
+    s_cut_fraction = 0;
+    if (!s_between.empty() && FrameRedraw::ReadPosition() > s_between.front().position)
+    {
+      s_cut_fraction = s_between.front().fraction;
+      s_between.pop_front();
+    }
+  }
   g_pending = true;
   if (!s_settings.shot_prefix.empty())
     FrameRedraw::TakeStills(s_copies, false);
@@ -476,6 +507,8 @@ void OnCommandEnd(const u8* data, u32 size)
   const size_t frame = s_pending.size() - tail;
   if (frame)
     s_lib.write(s_pending.data(), static_cast<u32>(frame));
+  if (s_cut_fraction > 0 && s_lib.frame_between)
+    s_lib.frame_between(s_cut_copy, s_cut_fraction);
   s_lib.frame(s_cut_copy);
   // the picture's shape, as the emulator's own video would show it (the host sets it from the game's screen option)
   if (s_video_off_window)

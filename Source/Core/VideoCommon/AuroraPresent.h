@@ -63,6 +63,9 @@ void OverlayFrame(const ImDrawData* data, u32 width, u32 height);
 // The ImGui id of a copy of the game's to the guest's RAM at this physical address: a head of the top 6, say. A frame
 // that uses one before the game has made it draws nothing there.
 u64 OverlayCopyTexture(u32 physical);
+// The emulated CPU's thread: the next XFB copy after the stream position `position` (FrameRedraw::WrittenPosition) is a
+// picture between two steps, `fraction` of a field after the true picture before it (the run ahead: fzgx/runahead.h).
+void NoteBetween(u64 position, float fraction);
 // The summary for the host's log (empty when it was never on).
 std::string Report();
 bool On();
