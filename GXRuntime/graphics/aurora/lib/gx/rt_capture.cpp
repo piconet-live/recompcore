@@ -1407,6 +1407,7 @@ static bool star_alpha(const GXTexObj_& in) noexcept {
   return star;
 }
 bool g_noEngineStar = false;
+std::atomic<u64> g_starsSkipped{0};
 // The game's star on a far machine's engine, from the draw alone: an additive sprite (one quad turned square to the view, writing no
 // depth) whose texture's alpha is a star (star_alpha), and that the game has grown with distance to keep it readable: at least
 // StarGrown across in the world (twice the largest engine glow, which keeps its own size) and a set share of its distance. Near the
@@ -1425,7 +1426,10 @@ bool is_engine_star(const GXPrimitive prim, const GXVtxFmt fmt, const u16 vtxCou
     return false;
   if (sh.extent < StarGrown || sh.extent < -sh.mid[2] * StarShareOfDistance)
     return false;
-  return star_alpha(st.textures[map].texObj);
+  if (!star_alpha(st.textures[map].texObj))
+    return false;
+  g_starsSkipped.fetch_add(1, std::memory_order_relaxed);
+  return true;
 }
 // AURORA_RT_DRAWLOG=first,last: on those copies, each draw that writes no depth or samples a picture copy: its state, whether the rule took it, where it is.
 // AURORA_RT_STARLOG=first,last: on those copies, each additive or depth-less sprite of up to 8 corners: its shape and texture, and whether is_engine_star took it

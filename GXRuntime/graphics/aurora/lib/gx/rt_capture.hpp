@@ -4,6 +4,8 @@
 
 #include "gx.hpp"
 
+#include <atomic>
+
 namespace aurora::gx::rt {
 extern bool g_neutral;    // AURORA_RT=1: the game's fake reflection stages pass through; rays stand in for them
 extern bool g_gameLightOff;  // AURORA_RT_GAME_LIGHT=0: no game lights in the picture (never anything the game reads)
@@ -19,6 +21,7 @@ extern bool g_noGameShadow;  // with own light: the game's machine shadow not dr
 bool is_game_shadow() noexcept;
 // AURORA_RT_NO_ENGINE_STAR=1, with own light (AURORA_RT=1, AURORA_RT_LIGHTING): the game's star sprite on far machines' engines not drawn
 extern bool g_noEngineStar;
+extern std::atomic<u64> g_starsSkipped;  // stars is_engine_star took, for the report
 bool is_engine_star(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* data) noexcept;
 void note_draw(u16 vtxCount, GXPrimitive prim, GXVtxFmt fmt, const u8* data) noexcept;
 void start() noexcept;  // reads the switches, once

@@ -7,6 +7,7 @@
 #endif
 #include "../gfx/stagelog.hpp"
 #include "rt_live.hpp"
+#include "rt_capture.hpp"
 
 #include "rt_format.hpp"
 #include "rt_rules.hpp"
@@ -1321,6 +1322,8 @@ void run_rays(Job& job) {
                  g.count, g.w, g.h, (g.msGpu - g.msTrace - g.msLight - g.msDenoise) / n, g.msTrace / n, g.msGpu / n, g.msGpuMost, g.msBuild / n, g.msTranslate / n, g.msRules / n, g.msComposeWait / n, double(g.tris) / n, double(g.lightsSeen) / n,
                  static_cast<unsigned long long>(g.lightsMost), g.picks / n, g.merged / n, g.glowsSeen / n, g.glowPieces / n, g.glowDraws / n, g.glowTop / n);
     world_report(n);
+    if (g_noEngineStar)
+      std::fprintf(stderr, "[rt] engine stars not drawn: %llu so far\n", static_cast<unsigned long long>(g_starsSkipped.load(std::memory_order_relaxed)));
     g.msLight = g.msDenoise = g.motionAgree = g.motionOwn = 0;
     g.count = 0, g.msGpuMost = 0, g.msGpu = g.msTrace = g.msBuild = g.msRules = g.msTranslate = g.msComposeWait = 0, g.tris = 0, g.lightsSeen = 0, g.lightsMost = 0, g.picks = g.merged = g.glowsSeen = g.glowPieces = g.glowDraws = g.glowTop = 0;
   }
