@@ -12,7 +12,7 @@ struct Draw {
   uint stages, firstStage;
   uint cls;       // 0 solid, 1 translucent, 2 additive, 3 ignored
   float strength; // the draw's own reflection strength
-  uint highlight; // bit 0 the game's own shine, 1 glows, 2 outside the depth (takes no light), 3 a blended layer writing no depth, 4 a card turned to the picture (primary rays alone)
+  uint highlight; // bit 0 the game's own shine, 1 glows, 2 outside the depth (takes no light), 3 a blended layer writing no depth, 4 a card turned to the picture (primary rays alone); 8-12 LIGHT_OWN: 1 + the machine light whose body it is
   uint fogType;
   float3 fog;
   float3 fogColour;
@@ -329,6 +329,15 @@ float3 trace_reflection(float3 org, float3 dir, float maxLodScale) {
   return sum;
 }
 float lum(float3 c) { return dot(c, float3(0.3, 0.59, 0.11)); }
+// LIGHT_OWN (AURORA_RT_LIGHT_OWN=1, off by default): a machine light comes from the machine's flames, in or at its nozzles, so the machine's
+// own body lay between it and most of what it lights. The shadow ray met that body ahead of and beside the machine, every frame, and the test
+// itself starts only where the light gives 0.02: past that line the light was whole, inside it a quarter. So a round dark disc with an edge,
+// about 10 units across, sat on the road around every machine while it raced, larger with a boost's bigger flames (rt_rules.hpp own_light).
+// With this the ray takes the nearest hit, and a hit on the light's own body (bits 8-12 of its draw: rt_rules.hpp own_light) is no shadow:
+// nothing nearer stood in between. Any other hit fades the light in over the next 0.02 instead of a step.
+#ifndef LIGHT_OWN
+#define LIGHT_OWN 0
+#endif
 // Engine lights: plain omni, distance falloff, no direction. Multiplies what the pixel already shows, so it needs no material.
 float3 engine_light(float3 pos, float3 N) {
   float3 sum = 0;
@@ -343,7 +352,17 @@ float3 engine_light(float3 pos, float3 N) {
     float fall = 1 / (1 + dd / (r * r * 0.25));
     fall *= saturate(1 - dist / (3 * r));
     float vis = 1;
-    if (P.lightShadow != 0 && fall * wrap > 0.02) {
+    if (LIGHT_OWN && P.lightShadow != 0 && fall * wrap > 0.02) {
+      RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
+      RayDesc ray; ray.Origin = pos + N * 0.03; ray.Direction = L; ray.TMin = 0.02; ray.TMax = max(dist - 0.6, 0.03);
+      q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskRaySolid, ray);
+      q.Proceed();
+      if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+        const bool own = q.CommittedInstanceID() < WorldId &&
+                         ((Draws[Verts[(q.CommittedInstanceID() + q.CommittedPrimitiveIndex()) * 3].draw].highlight >> 8) & 31) == i + 1;
+        if (!own) vis = lerp(1.0, 0.25, saturate((fall * wrap - 0.02) / 0.02));
+      }
+    } else if (P.lightShadow != 0 && fall * wrap > 0.02) {
       RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
       RayDesc ray; ray.Origin = pos + N * 0.03; ray.Direction = L; ray.TMin = 0.02; ray.TMax = max(dist - 0.6, 0.03);
       q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskRaySolid, ray);

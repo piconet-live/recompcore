@@ -77,6 +77,29 @@ inline bool beside_engine_light(const DrawRec& d, const Vertex* verts, const std
   return false;
 }
 
+// AURORA_RT_LIGHT_OWN: the machine light a draw is beside (beside_engine_light's rule, the nearest within its reach), as 1 + its number in
+// lights; 0: none. A machine's flames make its light; the light sits in or at its nozzles, so the machine's own body lies between it and
+// most of what it lights: its shadow ray met the body ahead of and beside the machine, every frame. That draw is the light's own body.
+inline std::uint32_t own_light(const DrawRec& d, const Vertex* verts, const std::vector<EngineLight>& lights, float machineLight, float reach = 5.f) {
+  if (d.vertices == 0)
+    return 0;
+  float c[3]{};
+  for (std::uint32_t v = 0; v < d.vertices; ++v)
+    for (int a = 0; a < 3; ++a)
+      c[a] += verts[d.firstVertex + v].pos[a] / d.vertices;
+  std::uint32_t best = 0;
+  float bestD = reach;
+  for (std::uint32_t i = 0; i < lights.size() && i < 31; ++i) {
+    const EngineLight& l = lights[i];
+    if (l.reach * l.reach < machineLight)
+      continue;
+    const float dd = std::hypot(c[0] - l.pos[0], c[1] - l.pos[1], c[2] - l.pos[2]);
+    if (dd < bestD)
+      bestD = dd, best = i + 1;
+  }
+  return best;
+}
+
 // A big glowing surface as light: a piece of it, its power as colour by area
 struct GlowLight {
   float pos[3], area, colour[3], radius;
@@ -149,6 +172,7 @@ struct GpuDraw {
   float strength;                         // reflection strength; machines boosted, scenery capped
   std::uint32_t highlight;                // bit 0: has a stage looked up by the normal, the game's own shine; bit 1: glows, gives light; bit 2: outside the depth, drawn over the world, takes no light; bit 3: a blended layer writing no depth;
                                           // bit 4: a card turned to the picture (faces_picture, AURORA_RT_HUD_SKIP): the camera's rays alone meet it, it takes no light and casts no shadow
+                                          // bits 8-12 (AURORA_RT_LIGHT_OWN): 1 + the number in lights of the machine light this body draw is beside (own_light), 0 none
   std::uint32_t fogType;
   float fog[3];
   float fogColour[3];
@@ -169,6 +193,7 @@ struct Tuning {
   std::uint64_t extraVerts[4]{};
   float largestFloor = 0.f;
   bool overlayApart = false;  // AURORA_RT_HUD_SKIP=1: cards turned to the picture are the game's overlay in the world (faces_picture), not surfaces
+  bool lightOwn = false;      // AURORA_RT_LIGHT_OWN=1: a body draw beside a machine light carries that light's number (GpuDraw highlight bits 8-12)
 };
 struct Frame {
   std::vector<float> prevPos;       // each of verts in the last frame's view space, with motion data on (rt_motion.hpp)
@@ -423,6 +448,8 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
     // takes no light through it, and it takes none itself (bit 2); no other ray meets it: no shadow, no reflection, no light from it
     if (t.overlayApart && inView && g.cls < 2 && faces_picture(d, verts))
       g.highlight |= 16 | 4;
+    if (t.lightOwn && inView && g.cls < 2 && (g.highlight & 16) == 0)
+      g.highlight |= own_light(d, verts, out.lights, t.machineLight) << 8;
     if (strength > 0 && inView) {
       ++out.reflective;
       if (beside_engine_light(d, verts, out.machineLights)) {

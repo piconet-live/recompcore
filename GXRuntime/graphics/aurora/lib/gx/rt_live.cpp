@@ -460,7 +460,9 @@ const std::vector<std::wstring>& shader_defines() {
                                          // phase 2: glows and their shadow ray that cannot move a pixel a quarter step left out; main's camera ray capped first
                                          {"AURORA_RT_GLOW_FAST", L"GLOW_FAST", 0.f}, {"AURORA_RT_DEPTH_CAP", L"DEPTH_CAP", 0.f},
                                          // phase 2: the glow light once per light pixel, read up in main (needs AURORA_RT_HALF and the denoiser); 2: the engine lights too
-                                         {"AURORA_RT_GLOW_HALF", L"GLOW_HALF", 0.f}};
+                                         {"AURORA_RT_GLOW_HALF", L"GLOW_HALF", 0.f},
+                                         // a machine light's shadow ray passes the machine's own body, and a shadow fades in instead of starting at a step
+                                         {"AURORA_RT_LIGHT_OWN", L"LIGHT_OWN", 0.f}};
     for (const auto& n : numbers) {
       const char* v = std::getenv(n.env);
       const float f = v != nullptr && v[0] != '\0' ? static_cast<float>(std::atof(v)) : n.otherwise;

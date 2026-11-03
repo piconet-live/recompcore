@@ -1236,6 +1236,12 @@ void run_rules(live::Job& j) {
     return v != nullptr && std::atof(v) != 0;
   }();
   tuning.overlayApart = overlayApart;
+  // AURORA_RT_LIGHT_OWN=1 (off by default): each body draw beside a machine light is marked as that light's own (rt_rules.hpp, rt.hlsl LIGHT_OWN)
+  static const bool lightOwn = [] {
+    const char* v = std::getenv("AURORA_RT_LIGHT_OWN");
+    return v != nullptr && std::atof(v) != 0;
+  }();
+  tuning.lightOwn = lightOwn;
   if (j.glow > 0.f) {
     tuning.texMeans = s_texAvg;
     tuning.texCount = MostTexAvg;
