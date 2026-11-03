@@ -100,9 +100,17 @@ extern void (*g_betweenTask)(wgpu::CommandEncoder& cmd, EncoderTaskId type);  //
 extern bool g_overlap;
 extern bool g_drawingBetween;
 extern void (*g_afterDrain)();
+// AURORA_RT_GPU_SPLIT=1 (a measuring tool, with AURORA_RT_GPU_ROWS): a GPU timestamp mark on the queue (the ray tracing's), a gm_* stage row
+extern void (*g_gpuMark)(const char* what, uint64_t copy);
 // the frames ended (Aurora's thread counts them as it hands each end to the worker) and the one held for pictures between (the worker's)
 uint64_t frames_ended() noexcept;
 uint64_t frame_held() noexcept;
+// AURORA_REDRAW_SKIP_OFFSCREEN: a picture between leaves out the held frame's first offscreen passes (a test turns it over for one picture);
+// how many ops of the held frame that is
+bool redraw_skip_offscreen() noexcept;
+void set_redraw_skip_offscreen(bool on) noexcept;
+size_t redraw_skipped_ops() noexcept;
+std::array<int, 8> redraw_skip_why() noexcept;  // (a test's line) offscreen ops first, the scene pass's colour load/clear, depth load/clear/has, discard, passes
 
 struct EncoderTaskContext {
   wgpu::Device device;

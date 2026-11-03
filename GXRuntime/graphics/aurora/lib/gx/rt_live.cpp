@@ -296,9 +296,21 @@ bool hot_core_on() {
 // timestamp a queue writes when it gets to it (all before it done): gm_* rows (start the GPU's moment, length how long after it was handed
 // to the queue the queue got to it). The slots' own timestamps
 // give gpu_rays (a true frame's rays, start to end) and gpu_btw (a picture between's ray part).
+// AURORA_RT_GPU_ROWS=2: only the marks at each present's end (gm_true_end, gm_btw_end; ~1/3 of the marks' CPU cost): when each present's GPU
+// work was done, for how many refreshes get a new picture; AURORA_RT_GPU_SPLIT also needs it (1 or 2)
 bool gpu_rows_on() {
-  static const bool on = env_one("AURORA_RT_GPU_ROWS") && gfx::stagelog::on();
+  static const bool on = [] {
+    const char* v = std::getenv("AURORA_RT_GPU_ROWS");
+    return v != nullptr && (v[0] == '1' || v[0] == '2') && gfx::stagelog::on();
+  }();
   return on;
+}
+bool gpu_rows_ends_only() {
+  static const bool only = [] {
+    const char* v = std::getenv("AURORA_RT_GPU_ROWS");
+    return v != nullptr && v[0] == '2';
+  }();
+  return only;
 }
 struct GpuClock {
   u64 gpu0 = 0, ticks = 0;
@@ -358,8 +370,10 @@ void marks_harvest(u32 k, ID3D12CommandQueue* q, GpuClock& c) {
   }
 }
 // on Dawn's queue (compute: on the rays' own)
-void gpu_mark(const char* what, u64 copy, ID3D12CommandQueue* q = nullptr) {
+void gpu_mark(const char* what, u64 copy, ID3D12CommandQueue* q = nullptr, bool always = false) {
   if (!gpu_rows_on() || g.failed || !g.ready)
+    return;
+  if (gpu_rows_ends_only() && !always && std::strstr(what, "_end") == nullptr)
     return;
   const bool compute = q != nullptr && q != g.queue.Get();
   if (q == nullptr)
@@ -1862,6 +1876,9 @@ bool submit_job(std::unique_ptr<Job> job) {
     gfx::g_beforeFrameSubmit = before_frame_submit;
     gfx::g_afterFrameSubmit = after_frame_submit;
     gfx::g_betweenTask = between_task;
+    // AURORA_RT_GPU_SPLIT=1 (a measuring tool, with AURORA_RT_GPU_ROWS=1 or 2): a picture between's ops each marked on the queue
+    if (gpu_rows_on() && env_one("AURORA_RT_GPU_SPLIT"))
+      gfx::g_gpuMark = [](const char* what, uint64_t copy) { gpu_mark(what, copy, nullptr, true); };
   }
   // from inside the command stream: these calls must not drain it
   const gx::fifo::HoldDrain hold;
@@ -1911,11 +1928,24 @@ void before_frame_submit() {
     if (g.pendingBetween && !g.failed) {
       g.pendingBetween = false;
       gpu_mark("gm_btw_p1", g.betweenCount);
-      begin_access(g.inputMem, g.input);
-      webgpu::g_queue.Submit(1, &g.firstBetween);
+      {
+        gfx::stagelog::Scope t{"rd_rt_access"};
+        begin_access(g.inputMem, g.input);
+      }
+      {
+        gfx::stagelog::Scope t{"rd_rt_first"};  // Dawn records the picture's raster into D3D12 here
+        webgpu::g_queue.Submit(1, &g.firstBetween);
+      }
       g.firstBetween = {};
-      end_access(g.inputMem, g.input);
-      run_between();
+      {
+        gfx::stagelog::Scope t{"rd_rt_access"};
+        end_access(g.inputMem, g.input);
+      }
+      {
+        gfx::stagelog::Scope t{"rd_rt_between"};
+        run_between();
+      }
+      gfx::stagelog::Scope t{"rd_rt_access"};
       begin_access(g.outputMem, g.output);
       g.outputOpen = true;
     }

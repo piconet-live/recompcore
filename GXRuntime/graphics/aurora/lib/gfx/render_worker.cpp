@@ -10,6 +10,7 @@
 #include <tracy/Tracy.hpp>
 
 namespace aurora::gfx::render_worker {
+void (*g_onIdle)() = nullptr;
 namespace {
 constexpr size_t QueueCapacity = 256;
 constexpr auto IdlePumpInterval = std::chrono::milliseconds{1};
@@ -52,7 +53,9 @@ void worker_main(std::stop_token token) {
       item->work();
     }
     complete_sync(item->sync);
-    g_pendingItems.fetch_sub(1, std::memory_order_acq_rel);
+    if (g_pendingItems.fetch_sub(1, std::memory_order_acq_rel) == 1 && g_onIdle != nullptr) {
+      g_onIdle();
+    }
     if (item->type == ItemType::Shutdown) {
       break;
     }

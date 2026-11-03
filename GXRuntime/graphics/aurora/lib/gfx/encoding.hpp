@@ -16,6 +16,8 @@ void encode_op_again(wgpu::CommandEncoder& encoder, FramePacket& frame, const Fr
 extern bool g_redrawBundles;
 // A new frame is held: its bundles are recorded again at its first picture
 void forget_redraw_bundles() noexcept;
+// AURORA_REDRAW_SURVEY: the held frame's ops to stderr (after its bundles were built)
+void survey_held(const FramePacket& frame);
 }
 
 } // namespace aurora::gfx

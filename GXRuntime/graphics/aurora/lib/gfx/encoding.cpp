@@ -41,6 +41,7 @@ void (*g_beforePresent)() = nullptr;
 bool g_overlap = false;
 bool g_drawingBetween = false;
 void (*g_afterDrain)() = nullptr;
+void (*g_gpuMark)(const char* what, uint64_t copy) = nullptr;
 
 namespace {
 constexpr Module Log{"aurora::gfx"};
@@ -547,6 +548,86 @@ bool g_redrawBundles = [] {
   return v != nullptr && v[0] == '1';
 }();
 void forget_redraw_bundles() noexcept { g_passBundles.clear(); }
+
+// AURORA_REDRAW_SURVEY=<n> (a measuring tool, off by default): at the n-th picture between, the held frame's ops to stderr, one line each
+// ([redraw-survey]): what each costs a picture to encode and draw again (passes, sizes, draws, pipeline and texture changes, bundles)
+void survey_held(const FramePacket& frame) {
+  uint64_t all = 0, allSwitches = 0, allTex = 0, allBundled = 0, allRuns = 0;
+  unsigned at = 0;
+  for (const auto& op : frame.ops) {
+    const unsigned k = at++;
+    switch (op.type) {
+    case FrameOpType::RenderPass: {
+      if (op.renderPass == nullptr)
+        break;
+      const auto& p = *op.renderPass;
+      uint32_t draws = 0, custom = 0, viewports = 0, scissors = 0, stencil = 0, switches = 0, tex = 0, prepass = 0;
+      std::vector<PipelineRef> pipes;
+      PipelineRef last = 0;
+      BindGroupRef lastTex = 0;
+      for (const auto& c : p.commands) {
+        if (c.type == CommandType::Draw) {
+          if (bundle_draw(c)) {
+            const auto& d = gx_data(c);
+            ++draws;
+            if (d.pipeline != last)
+              ++switches, last = d.pipeline;
+            if (d.bindGroups.textureBindGroup != lastTex)
+              ++tex, lastTex = d.bindGroups.textureBindGroup;
+            if (std::find(pipes.begin(), pipes.end(), d.pipeline) == pipes.end())
+              pipes.push_back(d.pipeline);
+            CompiledPipeline cp;
+            if (get_pipeline(d.pipeline, cp) && cp.prepass)
+              ++prepass;
+          } else {
+            ++custom;
+          }
+        } else if (c.type == CommandType::CustomDraw) {
+          ++custom;
+        } else if (c.type == CommandType::SetViewport) {
+          ++viewports;
+        } else if (c.type == CommandType::SetScissor) {
+          ++scissors;
+        } else if (c.type == CommandType::SetStencilRef) {
+          ++stencil;
+        }
+      }
+      uint32_t bundled = 0, runs = 0;
+      if (op.index < g_passBundles.size())
+        for (const auto& r : g_passBundles[op.index].runs)
+          bundled += r.end - r.first, ++runs;
+      const auto& a = p.colorAttachments[SceneColorAttachmentIndex];
+      std::fprintf(stderr,
+                   "[redraw-survey] op %u pass %u '%s' %ux%u fmt %d msaa %u colors %u depth %d sealed %d discard %d commands %zu gx %u (prepass %u) "
+                   "custom %u vp %u sc %u stencil %u pipelines %zu switches %u tex-changes %u bundled %u in %u runs, resolve %s %ux%u fmt %d, "
+                   "palette %zu, load %d store %d clear %d depth-clear %d depth-load %d stencil %d offscreen %d snapshots c%d d%d n%d\n",
+                   k, op.index, p.label.c_str(), a.size.width, a.size.height, static_cast<int>(a.format),
+                   p.msaaSamples, p.colorAttachmentCount, p.hasDepth ? 1 : 0, p.sealed ? 1 : 0, p.discardable ? 1 : 0, p.commands.size(), draws,
+                   prepass, custom, viewports, scissors, stencil, pipes.size(), switches, tex, bundled, runs, p.resolveTarget ? "yes" : "no",
+                   p.resolveTarget ? p.resolveTarget->size.width : 0, p.resolveTarget ? p.resolveTarget->size.height : 0,
+                   static_cast<int>(p.resolveFormat), p.paletteConvs.size(), static_cast<int>(a.loadOp), static_cast<int>(a.storeOp), a.clear ? 1 : 0,
+                   p.clearDepth ? 1 : 0, static_cast<int>(p.depthLoadOp), p.hasStencil ? 1 : 0, redraw_pass_offscreen(op.index) ? 1 : 0,
+                   p.snapshotColorDst ? 1 : 0, p.snapshotDepthDst ? 1 : 0, p.snapshotNormalDst ? 1 : 0);
+      all += draws, allSwitches += switches, allTex += tex, allBundled += bundled, allRuns += runs;
+    } break;
+    case FrameOpType::TextureCopy:
+      if (op.textureCopy != nullptr)
+        std::fprintf(stderr, "[redraw-survey] op %u texture copy %ux%u\n", k,
+                     op.textureCopy->size.width, op.textureCopy->size.height);
+      break;
+    case FrameOpType::EncoderTask:
+      std::fprintf(stderr, "[redraw-survey] op %u encoder task %u\n", k,
+                   op.encoderTask != nullptr ? static_cast<unsigned>(op.encoderTask->type) : 0u);
+      break;
+    case FrameOpType::Readback:
+      std::fprintf(stderr, "[redraw-survey] op %u readback\n", k);
+      break;
+    }
+  }
+  std::fprintf(stderr, "[redraw-survey] all: %zu ops, gx draws %llu, pipeline switches %llu, texture changes %llu, bundled %llu in %llu runs\n",
+               frame.ops.size(), static_cast<unsigned long long>(all), static_cast<unsigned long long>(allSwitches),
+               static_cast<unsigned long long>(allTex), static_cast<unsigned long long>(allBundled), static_cast<unsigned long long>(allRuns));
+}
 
 void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op) {
   copy_staging_to_high_water(cmd, frame, op);
