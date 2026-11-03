@@ -71,6 +71,11 @@ void release_surface() noexcept;
 bool refresh_surface(bool recreate = true);
 void resize_swapchain(uint32_t width, uint32_t height, uint32_t nativeWidth, uint32_t nativeHeight, bool force = false);
 TextureWithSampler create_render_texture(uint32_t width, uint32_t height, bool multisampled);
+// AURORA_LOOK_RAW=1: the picture in 16-bit float with no stage clamps, instead of the surface's 8 bits; the surface itself stays as it is
+bool raw_picture() noexcept;
+wgpu::TextureFormat scene_format() noexcept;
+// What the present and everything over it draw into: the surface's format, or float under AURORA_LOOK_HDR=1 (hdr.hpp). g_graphicsConfig.surfaceConfiguration.format stays 8 bit for the textures the game copies into.
+wgpu::TextureFormat present_format() noexcept;
 bool enable_normal_buffer();
 const TextureWithSampler& present_source() noexcept;
 // The display (XFB) copy's texture as the present source, from the frame it was made on (render worker only).

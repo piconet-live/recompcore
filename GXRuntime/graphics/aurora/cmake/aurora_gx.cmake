@@ -2,6 +2,7 @@ add_library(aurora_gx STATIC
         lib/gfx/clear.cpp
         lib/gfx/encoding.cpp
         lib/gfx/frame.cpp
+        lib/gfx/stagelog.cpp
         lib/gfx/efb_readback.cpp
         lib/gfx/timewarp.cpp
         lib/gfx/pipeline_cache.cpp
@@ -21,6 +22,9 @@ add_library(aurora_gx STATIC
         lib/gfx/texture_replacement.cpp
         lib/gx/attr_fmt.cpp
         lib/gx/command_processor.cpp
+        lib/gx/rt_capture.cpp
+        lib/gx/redraw.cpp
+        lib/gx/rt_scene.cpp
         lib/gx/regs.cpp
         lib/gx/recomp.cpp
         lib/gx/dl.cpp
@@ -31,6 +35,7 @@ add_library(aurora_gx STATIC
         lib/gx/readback.cpp
         lib/gx/shader.cpp
         lib/gx/shader_info.cpp
+        lib/gx/soft_cards.cpp
         lib/dolphin/gx/GXBump.cpp
         lib/dolphin/gx/GXCull.cpp
         lib/dolphin/gx/GXCpu2Efb.cpp
@@ -57,6 +62,16 @@ add_library(aurora::gx ALIAS aurora_gx)
 set_target_properties(aurora_gx PROPERTIES FOLDER "aurora")
 
 target_link_libraries(aurora_gx PUBLIC aurora::core dawn::webgpu_dawn xxHash::xxhash)
+if (WIN32 AND DAWN_ENABLE_D3D12)
+    # Ray tracing's live pass: the shader, as bytes for the DXC of Dawn's own package
+    target_sources(aurora_gx PRIVATE lib/gx/rt_live.cpp)
+    target_compile_definitions(aurora_gx PRIVATE AURORA_RT_LIVE=1)
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/lib/gx/rt.hlsl" _rt_hlsl HEX)
+    string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," _rt_hlsl "${_rt_hlsl}")
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/rt_gen/rt_shader.inc" "${_rt_hlsl}")
+    target_include_directories(aurora_gx PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/rt_gen")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/lib/gx/rt.hlsl")
+endif ()
 target_link_libraries(aurora_gx PRIVATE absl::btree absl::flat_hash_map sqlite3 Tracy::TracyClient PNG::PNG)
 target_compile_definitions(aurora_gx PRIVATE WEBGPU_DAWN)
 

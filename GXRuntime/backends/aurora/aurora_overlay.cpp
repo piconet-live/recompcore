@@ -180,7 +180,7 @@ void make_pipeline() {
                 .dstFactor = wgpu::BlendFactor::One},
   };
   const wgpu::ColorTargetState target{
-      .format = webgpu::g_graphicsConfig.surfaceConfiguration.format, .blend = &blend, .writeMask = wgpu::ColorWriteMask::All};
+      .format = webgpu::present_format(), .blend = &blend, .writeMask = wgpu::ColorWriteMask::All};
   const wgpu::FragmentState fragment{.module = module, .entryPoint = "fs", .targetCount = 1, .targets = &target};
   const wgpu::RenderPipelineDescriptor pipeline{
       .label = "overlay",
@@ -437,7 +437,7 @@ fn to_srgb(c: vec3f) -> vec3f { return select(1.055 * pow(c, vec3f(1.0 / 2.4)) -
   s_filter_layout = webgpu::g_device.CreateBindGroupLayout(&layout_desc);
   const wgpu::PipelineLayoutDescriptor pipeline_layout{.bindGroupLayoutCount = 1, .bindGroupLayouts = &s_filter_layout};
   const auto layout = webgpu::g_device.CreatePipelineLayout(&pipeline_layout);
-  const wgpu::ColorTargetState target{.format = webgpu::g_graphicsConfig.surfaceConfiguration.format,
+  const wgpu::ColorTargetState target{.format = webgpu::present_format(),
                                       .writeMask = wgpu::ColorWriteMask::All};
   const wgpu::FragmentState fragment{.module = module, .entryPoint = "fs", .targetCount = 1, .targets = &target};
   const wgpu::RenderPipelineDescriptor pipeline{
@@ -461,7 +461,7 @@ wgpu::TextureView filter_target(uint32_t width, uint32_t height) {
         .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
         .dimension = wgpu::TextureDimension::e2D,
         .size = {width, height, 1},
-        .format = webgpu::g_graphicsConfig.surfaceConfiguration.format,
+        .format = webgpu::present_format(),
         .mipLevelCount = 1,
         .sampleCount = 1,
     };

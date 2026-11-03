@@ -59,7 +59,9 @@ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mi
                                     ArrayRef<uint8_t> data, bool tlut, const char* label) noexcept;
 TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
                                      const char* label) noexcept;
-TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept;
+// format: left out, the surface's
+TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label,
+                                 wgpu::TextureFormat format = wgpu::TextureFormat::Undefined) noexcept;
 TextureHandle new_conv_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept;
 void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept;
 }; // namespace aurora::gfx
@@ -129,6 +131,10 @@ struct GXTlutObj_ {
   void set_no_cache(bool value) noexcept { flags = value ? flags | 0x80 : flags & ~0x80; }
 };
 static_assert(sizeof(GXTlutObj_) <= sizeof(GXTlutObj), "GXTlutObj too small!");
+namespace aurora::gfx {
+// The anisotropy the raster's sampler gives this texture (TextureBind::get_descriptor), 1 where it has no mips: for the rays to read it at the raster's level
+u16 raster_anisotropy(const GXTexObj_& obj) noexcept;
+} // namespace aurora::gfx
 
 namespace aurora::gfx {
 struct TextureBind {

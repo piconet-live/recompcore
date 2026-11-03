@@ -41,7 +41,7 @@ namespace VideoCommon::AuroraPresent
 {
 namespace
 {
-// gxruntime/aurora_present.h, as the library exports it (ABI 4)
+// gxruntime/aurora_present.h, as the library exports it (ABI 5)
 struct LibConfig
 {
   u32 abi;
@@ -71,8 +71,9 @@ struct LibStats
   u64 overflow_drops;
   u32 fatal;
   u32 scale;
+  u64 pictures_between;
 };
-constexpr u32 LIB_ABI = 4;
+constexpr u32 LIB_ABI = 5;
 void* s_video_off_window = nullptr;  // SetVideoOffWindow
 u64 s_presents_counted = 0;
 // The hand-off's time on the thread that decodes (the report's last figure): the bursts kept, the calls swapped for
@@ -118,6 +119,8 @@ struct Library
   void (*write)(const u8*, u32) = nullptr;
   void (*frame)(u64) = nullptr;
   void (*frame_between)(u64, float) = nullptr;
+  void (*frame_at)(u64) = nullptr;
+  void (*redraw)(const void*) = nullptr;
   int (*take)(LibPicture*) = nullptr;
   void (*stats)(LibStats*) = nullptr;
   void (*stop)() = nullptr;
@@ -126,6 +129,7 @@ struct Library
   void (*overlay_frame)(const void*) = nullptr;
   int (*picture_in_window)(u32, u32, s32*) = nullptr;
   void (*picture_shape)(float) = nullptr;
+  void (*model_file)(const char*, const u8*, u64, int) = nullptr;
 };
 
 Settings s_settings;
@@ -171,6 +175,7 @@ struct Between
 std::mutex s_between_lock;
 std::deque<Between> s_between;
 float s_cut_fraction = 0;
+u64 s_cut_position = 0;
 
 #ifdef _WIN32
 HMODULE s_module = nullptr;
@@ -188,6 +193,17 @@ bool Load(const std::string& path)
   if (!s_module)
   {
     const std::wstring wide = UTF8ToWString(path);
+    // AURORA_DXC_FIRST=1: the shader compiler is loaded first and never freed, so it initialises before Dawn and
+    // detaches after it. Dawn would load it last, and at process exit a DXC object it still held was released after
+    // dxcompiler.dll had detached: DXC's own assert, a breakpoint at dxcompiler.dll+0x10750f. Dawn's load finds this one.
+    const char* const dxc_first = std::getenv("AURORA_DXC_FIRST");
+    if (dxc_first && dxc_first[0] == '1')
+    {
+      const size_t slash = wide.find_last_of(L"\\/");
+      const std::wstring dxc = (slash == std::wstring::npos ? std::wstring() : wide.substr(0, slash + 1)) + L"dxcompiler.dll";
+      const HMODULE loaded = LoadLibraryExW(dxc.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+      std::fprintf(stderr, "[aurora-present] dxcompiler.dll loaded first: %s\n", loaded ? "yes" : "no");
+    }
     // its own folder first for its DLLs (Dawn, SDL, the shader compiler beside it)
     s_module = LoadLibraryExW(wide.c_str(), nullptr,
                               LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
@@ -204,13 +220,16 @@ bool Load(const std::string& path)
       !Bind(&s_lib.overlay_forget, "aurora_present_overlay_forget") ||
       !Bind(&s_lib.overlay_frame, "aurora_present_overlay_frame") ||
       !Bind(&s_lib.picture_in_window, "aurora_present_picture_in_window") ||
-      !Bind(&s_lib.picture_shape, "aurora_present_picture_shape"))
+      !Bind(&s_lib.picture_shape, "aurora_present_picture_shape") ||
+      !Bind(&s_lib.model_file, "aurora_present_model_file"))
   {
     s_load_problem = fmt::format("{} lacks an aurora_present function", path);
     s_lib = {};
     return false;
   }
   Bind(&s_lib.frame_between, "aurora_present_frame_between");
+  Bind(&s_lib.frame_at, "aurora_present_frame_at");
+  Bind(&s_lib.redraw, "aurora_present_redraw");
   return true;
 #else
   s_load_problem = "Aurora is only loaded on Windows so far";
@@ -257,7 +276,7 @@ void Start()
                                (g_framebuffer_manager ? g_framebuffer_manager->GetEFBScale() : 1);
   if (!s_lib.start(&c))
   {
-    s_load_problem = "the library's interface is not this emulator's (ABI 4)";
+    s_load_problem = "the library's interface is not this emulator's (ABI 5)";
     s_on = false;
     return;
   }
@@ -327,6 +346,27 @@ void StopAll()
 
 bool g_pending = false;
 
+bool WantsModelFiles()
+{
+  return s_on.load(std::memory_order_relaxed) && s_lib.model_file != nullptr;
+}
+
+bool WantsWholeDisc()
+{
+  static const bool wanted = [] {
+    const char* rt = std::getenv("AURORA_RT");
+    const char* asked = std::getenv("AURORA_WHOLE_DISC");
+    return (rt != nullptr && (rt[0] == '1' || rt[0] == '2')) || (asked != nullptr && asked[0] == '1');
+  }();
+  return wanted && WantsModelFiles();
+}
+
+void ModelFile(const std::string& path, const u8* bytes, u64 size, bool later)
+{
+  if (WantsModelFiles())
+    s_lib.model_file(path.c_str(), bytes, size, later ? 1 : 0);
+}
+
 void Configure(const Settings& settings)
 {
   if (!settings.on)
@@ -351,6 +391,12 @@ void Configure(const Settings& settings)
     return;
   }
   s_on = true;
+}
+
+void Redraw(const RedrawRequest* request)
+{
+  if (s_started && s_lib.redraw)
+    s_lib.redraw(request);
 }
 
 void NoteBetween(u64 position, float fraction)
@@ -403,6 +449,7 @@ void OnXFBCopy()
   ++s_copies;
   s_cut_copy = s_copies;
   s_cut = true;
+  s_cut_position = FrameRedraw::ReadPosition();
   {
     std::lock_guard guard(s_between_lock);
     s_cut_fraction = 0;
@@ -507,6 +554,8 @@ void OnCommandEnd(const u8* data, u32 size)
   const size_t frame = s_pending.size() - tail;
   if (frame)
     s_lib.write(s_pending.data(), static_cast<u32>(frame));
+  if (s_lib.frame_at)
+    s_lib.frame_at(s_cut_position);
   if (s_cut_fraction > 0 && s_lib.frame_between)
     s_lib.frame_between(s_cut_copy, s_cut_fraction);
   s_lib.frame(s_cut_copy);
@@ -521,13 +570,14 @@ void OnCommandEnd(const u8* data, u32 size)
       s_lib.picture_shape(mode == AspectMode::ForceStandard ? 4.0f / 3.0f : mode == AspectMode::Stretch ? 0.0f : 16.0f / 9.0f);
     }
   }
-  // Dolphin presents nothing and draws no statistics then: its frame rate counts Aurora's presents
+  // Dolphin presents nothing and draws no statistics then: its frame rate counts Aurora's presents, the true frames'
+  // and the pictures drawn between them from their draws (the window strip's FPS)
   if (s_video_off_window)
   {
     LibStats st{};
     s_lib.stats(&st);
     auto& metrics = Core::System::GetInstance().GetPerfMetrics();
-    for (; s_presents_counted < st.frames_drawn; ++s_presents_counted)
+    for (; s_presents_counted < st.frames_drawn + st.pictures_between; ++s_presents_counted)
       metrics.CountFrame();
     metrics.UpdateCounters();
   }

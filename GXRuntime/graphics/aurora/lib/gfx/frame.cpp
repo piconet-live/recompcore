@@ -1,3 +1,5 @@
+#include "stagelog.hpp"
+#include "upload_read.hpp"
 #include "efb_readback.hpp"
 #include "frame.hpp"
 
@@ -10,6 +12,8 @@
 #include "tex_palette_conv.hpp"
 #include "texture_replacement.hpp"
 #include "../gx/gx.hpp"
+#include "../gx/redraw.hpp"
+#include "encoding.hpp"
 #ifdef AURORA_ENABLE_RMLUI
 #include "../rmlui/pipeline.hpp"
 #endif
@@ -20,6 +24,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <optional>
@@ -276,7 +281,7 @@ wgpu::Device device() noexcept { return g_device; }
 
 wgpu::Queue queue() noexcept { return g_queue; }
 
-wgpu::TextureFormat color_format() noexcept { return webgpu::g_graphicsConfig.surfaceConfiguration.format; }
+wgpu::TextureFormat color_format() noexcept { return webgpu::scene_format(); }
 
 wgpu::TextureFormat depth_format() noexcept { return webgpu::g_graphicsConfig.depthFormat; }
 
@@ -624,8 +629,11 @@ std::optional<size_t> acquire_mapped_staging_buffer() {
 bool begin_frame() {
   ZoneScoped;
   // pace_frame_start();
+  const auto waited = PresentClock::now();
   const size_t frameSlot = acquire_frame_slot();
   const auto stagingSlot = acquire_mapped_staging_buffer();
+  if (stagelog::on())
+    stagelog::note("begin_slot_wait", waited);
   if (!stagingSlot) {
     g_frameSlots.release(frameSlot);
     return false;
@@ -664,6 +672,105 @@ bool begin_frame() {
   return true;
 }
 
+namespace {
+// AURORA_REDRAW: the frame last ended, kept for the pictures between (the render worker's)
+FramePacket g_held;
+std::vector<uint8_t> g_heldUniforms, g_patched;
+bool g_patchedHeld = false;  // g_patched is the held frame's uniforms but for its patched blocks (AURORA_REDRAW_BUNDLES)
+EndFrameCallback g_heldCallback;
+std::vector<bool> g_heldOffscreen;
+
+void note_held_passes() {
+  // A pass into another size than the picture's, or ending in a copy smaller than half of it: an offscreen pass
+  uint32_t width = 0, height = 0;
+  for (const auto& pass : g_held.renderPasses) {
+    if (pass.colorAttachmentCount != 0) {
+      width = std::max(width, pass.colorAttachments[SceneColorAttachmentIndex].size.width);
+      height = std::max(height, pass.colorAttachments[SceneColorAttachmentIndex].size.height);
+    }
+  }
+  g_heldOffscreen.clear();
+  for (const auto& pass : g_held.renderPasses) {
+    bool off = false;
+    if (pass.colorAttachmentCount != 0) {
+      const auto& size = pass.colorAttachments[SceneColorAttachmentIndex].size;
+      off = size.width != width || size.height != height;
+    }
+    if (pass.resolveTarget && pass.resolveRect.width * pass.resolveRect.height * 2 < static_cast<int64_t>(width) * height) {
+      off = true;
+    }
+    g_heldOffscreen.push_back(off);
+  }
+}
+} // namespace
+
+bool redraw_pass_offscreen(uint32_t pass) noexcept { return pass < g_heldOffscreen.size() && g_heldOffscreen[pass]; }
+
+void redraw_write_vertices(uint32_t at, const uint8_t* data, size_t bytes) {
+  g_queue.WriteBuffer(g_resources.vertexBuffer, at, data, bytes);
+}
+
+bool redraw_held(const std::function<void(uint8_t* uniforms, size_t bytes)>& patch, const std::vector<uint32_t>* blocks) {
+  if (!g_heldCallback || g_held.ops.empty()) {
+    return false;
+  }
+  if (blocks != nullptr) {
+    {
+      stagelog::Scope t{"rd_patch"};
+      if (!g_patchedHeld) {
+        g_patched = g_heldUniforms;
+        g_patchedHeld = true;
+      }
+      for (const uint32_t at : *blocks) {
+        if (at + 64 <= g_patched.size()) {
+          std::memcpy(g_patched.data() + at, g_heldUniforms.data() + at, 64);
+        }
+      }
+      patch(g_patched.data(), g_patched.size());
+    }
+    // the blocks written as one span, first to last: a write per run of nearby blocks cost more (0.12 -> 0.46 ms a picture with runs
+    // closer than 1 KiB, c37 30 racers: about 1.5 us a write, and the blocks lie all through the buffer)
+    constexpr uint64_t Gap = UINT32_MAX;
+    stagelog::Scope t{"rd_uniforms", blocks->size()};
+    for (size_t k = 0; k < blocks->size();) {
+      const uint32_t from = (*blocks)[k];
+      uint32_t to = from + 64;
+      for (++k; k < blocks->size() && (*blocks)[k] <= uint64_t{to} + Gap; ++k) {
+        to = (*blocks)[k] + 64;
+      }
+      to = std::min<uint32_t>(to, static_cast<uint32_t>(g_patched.size()) & ~3u);
+      if (to > from) {
+        g_queue.WriteBuffer(g_resources.uniformBuffer, from, g_patched.data() + from, to - from);
+      }
+    }
+  }
+  constexpr wgpu::CommandEncoderDescriptor EncoderDescriptor{.label = "Picture between encoder"};
+  auto encoder = g_device.CreateCommandEncoder(&EncoderDescriptor);
+  webgpu::gpu_prof::frame_begin(encoder);
+  if (blocks == nullptr) {
+    {
+      stagelog::Scope t{"rd_patch"};
+      g_patched = g_heldUniforms;
+      patch(g_patched.data(), g_patched.size());
+    }
+    stagelog::Scope t{"rd_uniforms", g_patched.size()};
+    g_queue.WriteBuffer(g_resources.uniformBuffer, 0, g_patched.data(), AURORA_ALIGN(g_patched.size(), 4));
+  }
+  {
+    stagelog::Scope t{"rd_encode"};
+    for (const auto& op : g_held.ops) {
+      encode_op_again(encoder, g_held, op);
+    }
+  }
+  {
+    stagelog::Scope t{"rd_tail"};
+    g_heldCallback(encoder, {});
+  }
+  stagelog::Scope t{"rd_events"};
+  process_events();
+  return true;
+}
+
 void end_frame(EndFrameCallback callback) {
   ZoneScoped;
   if (g_cpuFrameStart.time_since_epoch().count() != 0) {
@@ -680,13 +787,34 @@ void end_frame(EndFrameCallback callback) {
   ++g_frameIndex;
 
   const size_t stagingSlot = frame.stagingBuffer;
-  render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, callback = std::move(callback)]() mutable {
+  gx::redraw::Notes notes;
+  if (gx::redraw::g_on) {
+    notes = gx::redraw::take_notes();
+  }
+  render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, callback = std::move(callback), notes = std::move(notes)]() mutable {
     auto& packet = g_framePackets[frameSlot];
-    g_stagingBuffers[stagingSlot].Unmap();
+    if (gx::redraw::g_on) {
+      stagelog::Scope keepTime{"ef_keep"};
+      g_heldUniforms.resize(packet.uniforms.size());
+      copy_from_upload(g_heldUniforms.data(), packet.uniforms.data(), packet.uniforms.size());
+      gx::redraw::keep_vertices(notes, packet.verts.data(), packet.verts.size());
+    }
+    {
+      stagelog::Scope unmapTime{"ef_unmap"};
+      g_stagingBuffers[stagingSlot].Unmap();
+    }
     g_mappingStates[stagingSlot].store(BufferMapState::Unmapped, std::memory_order_release);
     auto encoder = std::move(packet.encoder);
     const auto stats = packet.stats;
     auto afterSubmitCallbacks = std::move(packet.afterSubmitCallbacks);
+    if (gx::redraw::g_on) {
+      g_held = std::move(packet);
+      g_heldCallback = callback;
+      g_patchedHeld = false;
+      forget_redraw_bundles();
+      gx::redraw::hold(std::move(notes));
+      note_held_passes();
+    }
     packet = {};
     g_resources.stats.drawCallCount = stats.drawCallCount;
     g_resources.stats.mergedDrawCallCount = stats.mergedDrawCallCount;
@@ -696,11 +824,16 @@ void end_frame(EndFrameCallback callback) {
     g_resources.stats.lastStorageSize = stats.lastStorageSize;
     g_resources.stats.lastTextureUploadSize = stats.lastTextureUploadSize;
     if (callback) {
+      stagelog::Scope callbackTime{"ef_callback"};
       callback(encoder, std::move(afterSubmitCallbacks));
     }
     g_frameSlots.release(frameSlot);
-    expire_cached_bind_groups();
-    map_staging_buffer(stagingSlot, true);
+    {
+      stagelog::Scope remapTime{"ef_remap"};
+      expire_cached_bind_groups();
+      map_staging_buffer(stagingSlot, true);
+    }
+    stagelog::Scope eventsTime{"process_events"};
     process_events();
   });
 }

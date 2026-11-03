@@ -44,6 +44,12 @@ struct Settings
 // The host, before the video thread draws: loads the library (Aurora itself starts at the GPU thread's first burst,
 // once the guest's RAM is there). Configure({}) at the end stops it.
 void Configure(const Settings& settings);
+// True while the library wants the model files the game reads (the disc thread asks).
+bool WantsModelFiles();
+// Every model on the disc compiled ahead: ray tracing is on (AURORA_RT 1 or 2), or AURORA_WHOLE_DISC=1 asks
+bool WantsWholeDisc();
+// A model or course file the game is reading: its materials' pipelines compile ahead. Disc bytes only; any thread.
+void ModelFile(const std::string& path, const u8* bytes, u64 size, bool later);
 // The Null video backend, at its start: the emulator will draw nothing, so Aurora presents straight into this window
 // (a window system's handle; none in a headless run) and no picture comes back.
 void SetVideoOffWindow(void* window);
@@ -65,6 +71,24 @@ void OverlayFrame(const ImDrawData* data, u32 width, u32 height);
 u64 OverlayCopyTexture(u32 physical);
 // The emulated CPU's thread: the next XFB copy after the stream position `position` (FrameRedraw::WrittenPosition) is a
 // picture between two steps, `fraction` of a field after the true picture before it (the run ahead: fzgx/runahead.h).
+// AURORA_REDRAW: the pictures between (the library's AuroraRedrawRequest, the same shape: this build does not include its header). The
+// game's thread.
+constexpr u32 REDRAW_MOST = 7;
+struct RedrawPicture
+{
+  float fraction;
+  float camera[16];
+  float machine[30][16];
+};
+struct RedrawRequest
+{
+  u64 position;
+  u32 machines;
+  float at[30][3];
+  u32 pictures;
+  RedrawPicture picture[REDRAW_MOST];
+};
+void Redraw(const RedrawRequest* request);
 void NoteBetween(u64 position, float fraction);
 // The summary for the host's log (empty when it was never on).
 std::string Report();

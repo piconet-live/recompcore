@@ -1,3 +1,4 @@
+#include "stagelog.hpp"
 #include "render_worker.hpp"
 
 #include "../thread.hpp"
@@ -46,6 +47,8 @@ void worker_main(std::stop_token token) {
 
     if (item->work) {
       ZoneScopedN("QueueItem work");
+      static const char* const kNames[] = {"w0", "w1", "w2", "w3", "w4", "w5", "w6", "w7"};
+      stagelog::Scope t{kNames[static_cast<int>(item->type) & 7]};
       item->work();
     }
     complete_sync(item->sync);

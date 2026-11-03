@@ -1,6 +1,9 @@
 #include "gx.hpp"
+#include "rt_capture.hpp"
 
 #include "pipeline.hpp"
+#include "shader_info.hpp"
+#include "soft_cards.hpp"
 #include "texture.hpp"
 #include "../dolphin/vi/vi_internal.hpp"
 #include "../webgpu/gpu.hpp"
@@ -386,8 +389,10 @@ gfx::ClipRect map_logical_scissor(const gfx::ClipRect& logicalScissor) noexcept 
 }
 
 void set_logical_viewport(const gfx::Viewport& viewport) noexcept {
+  // (the depth range too: a soft card's uniform has it, soft_cards.hpp)
   if (viewport.left != g_gxState.logicalViewport.left || viewport.width != g_gxState.logicalViewport.width ||
-      viewport.height != g_gxState.logicalViewport.height) {
+      viewport.height != g_gxState.logicalViewport.height || viewport.znear != g_gxState.logicalViewport.znear ||
+      viewport.zfar != g_gxState.logicalViewport.zfar) {
     g_gxState.dirty |= DirtyUniform;
   }
   g_gxState.logicalViewport = viewport;
@@ -461,7 +466,7 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
   };
   const wgpu::RenderPipelineDescriptor descriptor{
       .label = label,
-      .layout = sPipelineLayout,
+      .layout = config.shaderConfig.softCard != 0 ? soft::pipeline_layout() : sPipelineLayout,
       .vertex =
           {
               .module = shader,
@@ -548,9 +553,37 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
     config.shaderConfig.indStages[i] = g_gxState.indStages[i];
   }
   config.shaderConfig.numIndStages = g_gxState.numIndStages;
+  // State no input of a stage reads is left out of the key, or one material makes a new pipeline for whatever the draw
+  // before it left in the registers (a stage's K selection, its swaps, the channels), and only a draw could say which.
+  bool readsRaster = false;
+  for (u8 i = 0; i < g_gxState.numTevStages; ++i) {
+    auto& stage = config.shaderConfig.tevStages[i];
+    const auto reads = [](const auto& pass, auto... args) {
+      return ((pass.a == args || pass.b == args || pass.c == args || pass.d == args) || ...);
+    };
+    if (!reads(stage.colorPass, GX_CC_KONST)) {
+      stage.kcSel = GX_TEV_KCSEL_1;
+    }
+    if (!reads(stage.alphaPass, GX_CA_KONST)) {
+      stage.kaSel = GX_TEV_KASEL_1;
+    }
+    if (!reads(stage.colorPass, GX_CC_RASC, GX_CC_RASA) && !reads(stage.alphaPass, GX_CA_RASA)) {
+      stage.channelId = GX_COLOR_NULL;
+      stage.tevSwapRas = GX_TEV_SWAP0;
+    } else {
+      readsRaster = true;
+    }
+    if (stage.texMapId == GX_TEXMAP_NULL && stage.indTexStage == GX_INDTEXSTAGE0 && stage.indTexMtxId == GX_ITM_OFF) {
+      stage.texCoordId = GX_TEXCOORD0;
+      stage.tevSwapTex = GX_TEV_SWAP0;
+    }
+  }
+  const auto sampledChannels = build_shader_info(config.shaderConfig).sampledColorChannels;
   for (u8 i = 0; i < MaxColorChannels; ++i) {
     const auto& cc = g_gxState.colorChannelConfig[i];
-    if (cc.lightingEnabled) {
+    if (!readsRaster || !sampledChannels.test(i % 2)) {
+      config.shaderConfig.colorChannels[i] = {};
+    } else if (cc.lightingEnabled) {
       config.shaderConfig.colorChannels[i] = cc;
     } else {
       // Only matSrc matters when lighting disabled
@@ -562,6 +595,7 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
   for (u8 i = 0; i < g_gxState.numTexGens; ++i) {
     config.shaderConfig.tcgs[i] = g_gxState.tcgs[i];
   }
+  if (rt::g_neutral) UNLIKELY { rt::neutralise(config.shaderConfig); }
   if (g_gxState.alphaCompare) {
     config.shaderConfig.alphaCompare = g_gxState.alphaCompare;
   }
@@ -597,6 +631,7 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
       .alphaUpdate = alphaUpdate,
       .colorUpdate = g_gxState.colorUpdate,
   };
+  if (soft::on()) UNLIKELY { config.shaderConfig.softCard = soft::kind(primitive); }
 }
 
 GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {
@@ -707,12 +742,14 @@ void initialize() noexcept {
         .immediateSize = sizeof(DrawImmediateData),
     };
     sPipelineLayout = g_device.CreatePipelineLayout(&desc);
+    soft::initialize(layouts[0], layouts[1], layouts[2], sizeof(DrawImmediateData));
   }
 }
 
 void shutdown() noexcept {
   // TODO we should probably store this all in g_state.gx instead
   sTextureBindGroupLayout = {};
+  soft::shutdown();
   for (auto& item : g_gxState.textures) {
     item.ref.reset();
   }

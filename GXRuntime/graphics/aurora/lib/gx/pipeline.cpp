@@ -69,6 +69,9 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   if (data.bindGroups.textureBindGroup) {
     pass.SetBindGroup(2, gfx::find_bind_group(data.bindGroups.textureBindGroup));
   }
+  if (data.bindGroups.softBindGroup) {
+    pass.SetBindGroup(3, gfx::find_bind_group(data.bindGroups.softBindGroup));
+  }
   pass.SetIndexBuffer(resources.indexBuffer, wgpu::IndexFormat::Uint16, data.idxRange.offset, data.idxRange.size);
   if (data.dstAlpha != UINT32_MAX) {
     const wgpu::Color color{0.f, 0.f, 0.f, data.dstAlpha / 255.f};
@@ -87,6 +90,44 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   }
   gfx::bind_pipeline(pipeline.main, pass);
   draw();
+}
+
+bool render_bundle(const DrawData& data, const wgpu::RenderBundleEncoder& bundle, WGPURenderPipeline& current) {
+  gfx::CompiledPipeline pipeline;
+  if (!gfx::get_pipeline(data.pipeline, pipeline)) {
+    return false;
+  }
+  const auto& resources = gfx::detail::resources();
+  bundle.SetImmediates(0, &data.immediateData, sizeof(data.immediateData));
+  const std::array offsets{data.uniformRange.offset};
+  bundle.SetBindGroup(1, resources.uniformBindGroup, offsets.size(), offsets.data());
+  if (data.bindGroups.textureBindGroup) {
+    bundle.SetBindGroup(2, gfx::find_bind_group(data.bindGroups.textureBindGroup));
+  }
+  if (data.bindGroups.softBindGroup) {
+    bundle.SetBindGroup(3, gfx::find_bind_group(data.bindGroups.softBindGroup));
+  }
+  bundle.SetIndexBuffer(resources.indexBuffer, wgpu::IndexFormat::Uint16, data.idxRange.offset, data.idxRange.size);
+  const auto bind = [&](const wgpu::RenderPipeline& p) {
+    if (p.Get() != current) {
+      bundle.SetPipeline(p);
+      current = p.Get();
+    }
+  };
+  const auto draw = [&] {
+    if (data.indexCount == 0) {
+      bundle.Draw(data.vtxCount, data.instanceCount);
+    } else {
+      bundle.DrawIndexed(data.indexCount, data.instanceCount);
+    }
+  };
+  if (pipeline.prepass) {
+    bind(pipeline.prepass);
+    draw();
+  }
+  bind(pipeline.main);
+  draw();
+  return true;
 }
 
 } // namespace aurora::gx

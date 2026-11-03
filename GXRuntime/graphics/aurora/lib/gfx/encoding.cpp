@@ -1,4 +1,5 @@
 #include "encoding.hpp"
+#include "stagelog.hpp"
 #include "timewarp.hpp"
 
 #include "frame.hpp"
@@ -18,7 +19,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -30,6 +33,10 @@ namespace aurora::gfx {
 using namespace detail;
 using webgpu::g_device;
 using webgpu::g_queue;
+
+void (*g_beforeFrameSubmit)() = nullptr;
+void (*g_betweenTask)(wgpu::CommandEncoder& cmd, EncoderTaskId type) = nullptr;
+void (*g_afterFrameSubmit)() = nullptr;
 
 namespace {
 constexpr Module Log{"aurora::gfx"};
@@ -89,6 +96,7 @@ void execute_encoder_task(wgpu::CommandEncoder& cmd, FramePacket& frame, const E
       .indexBuffer = res.indexBuffer,
       .uniformBuffer = res.uniformBuffer,
       .storageBuffer = res.storageBuffer,
+      .frameEncoder = &cmd,
   };
   taskType->callback(context, cmd, task.payload.data(), task.payloadSize, taskType->userdata);
   if (taskType->afterSubmit != nullptr) {
@@ -106,8 +114,106 @@ void execute_encoder_task(wgpu::CommandEncoder& cmd, FramePacket& frame, const E
   }
 }
 
-void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, RenderPass& passInfo) {
+// AURORA_REDRAW_BUNDLES: a held frame's pass, its runs of two or more GX draws in a row (nothing between them but more of the same,
+// each with its pipeline ready and no blend constant) recorded into render bundles at its first picture between and replayed in each
+// after. A bundle reads the uniform buffer as it is when the picture runs, so the patched projections reach it as they reach a draw
+// encoded directly. The rest of the pass (viewports, scissors, stencil references, other draws) is encoded as before; a bundle leaves
+// the viewport and scissor as they were and the pipeline and bind groups unset.
+struct BundleRun {
+  uint32_t first = 0, end = 0;  // the pass's commands [first, end)
+  uint32_t dstAlpha = UINT32_MAX;  // the blend constant its draws use (the pass's, set before the bundle), or none
+  wgpu::RenderBundle bundle;
+};
+struct PassBundles {
+  bool built = false;
+  std::vector<BundleRun> runs;
+};
+std::vector<PassBundles> g_passBundles;  // by the pass's index (the render worker's)
+constexpr uint32_t BundleLeast = 2;
+
+bool bundle_draw(const Command& cmd) noexcept {
+  return cmd.type == CommandType::Draw && cmd.data.draw.encoder == gx_draw_encoder();
+}
+const gx::DrawData& gx_data(const Command& cmd) noexcept {
+  return *reinterpret_cast<const gx::DrawData*>(cmd.data.draw.payload.data());
+}
+
+void build_bundles(PassBundles& out, RenderPass& passInfo) {
+  const auto began = std::chrono::steady_clock::now();
+  uint64_t bundled = 0, direct = 0, runs = 0;
+  out.runs.clear();
+  out.built = true;
+  const auto layout = passInfo.target_layout();
+  std::array<wgpu::TextureFormat, MaxColorAttachments> formats{};
+  for (uint32_t i = 0; i < layout.colorAttachmentCount; ++i) {
+    formats[i] = layout.colorAttachments[i].format;
+  }
+  const wgpu::RenderBundleEncoderDescriptor descriptor{
+      .label = "Picture between bundle",
+      .colorFormatCount = layout.colorAttachmentCount,
+      .colorFormats = formats.data(),
+      .depthStencilFormat = layout.depthStencilFormat,
+      .sampleCount = layout.sampleCount,
+  };
+  const auto& commands = passInfo.commands;
+  for (uint32_t i = 0; i < commands.size();) {
+    if (!bundle_draw(commands[i])) {
+      direct += commands[i].type == CommandType::Draw || commands[i].type == CommandType::CustomDraw;
+      ++i;
+      continue;
+    }
+    // GX draws in a row whose blend constants agree (draws without one go with any; a bundle cannot set it)
+    uint32_t end = i, constant = UINT32_MAX;
+    while (end < commands.size() && bundle_draw(commands[end])) {
+      const uint32_t a = gx_data(commands[end]).dstAlpha;
+      if (a != UINT32_MAX && constant != UINT32_MAX && a != constant) {
+        break;
+      }
+      if (a != UINT32_MAX) {
+        constant = a;
+      }
+      ++end;
+    }
+    // a draw whose pipeline is not ready ends the run before it (it is drawn directly, as before, and tries its pipeline each picture)
+    while (i < end) {
+      uint32_t last = i;
+      if (end - i >= BundleLeast) {
+        auto encoder = g_device.CreateRenderBundleEncoder(&descriptor);
+        encoder.SetBindGroup(0, resources().staticBindGroup);
+        encoder.SetBindGroup(2, gx::g_emptyTextureBindGroup);
+        WGPURenderPipeline current = nullptr;
+        uint32_t runConstant = UINT32_MAX;
+        while (last < end && gx::render_bundle(gx_data(commands[last]), encoder, current)) {
+          if (gx_data(commands[last]).dstAlpha != UINT32_MAX) {
+            runConstant = gx_data(commands[last]).dstAlpha;
+          }
+          ++last;
+        }
+        if (last - i >= BundleLeast) {
+          out.runs.push_back({i, last, runConstant, encoder.Finish()});
+          bundled += last - i;
+          ++runs;
+        } else {
+          last = i;  // (too short: drawn directly)
+        }
+      }
+      direct += last == i;
+      i = std::max(last, i + 1);
+    }
+  }
+  if (stagelog::on()) {  // (the draws bundled; then the draws left direct, as the count of a stretch of its own)
+    stagelog::note("rd_bundles", began, bundled);
+    stagelog::note("rd_bundles_direct", began, direct);
+    stagelog::note("rd_bundles_runs", began, runs);
+  }
+}
+
+void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, RenderPass& passInfo, PassBundles* bundles = nullptr) {
   ZoneScoped;
+  if (bundles != nullptr && !bundles->built) {
+    build_bundles(*bundles, passInfo);
+  }
+  size_t nextRun = 0;
   g_currentPipeline = nullptr;
 #ifdef AURORA_GFX_DEBUG_GROUPS
   std::vector<std::string> lastDebugGroupStack;
@@ -121,7 +227,21 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
   pass.SetBindGroup(0, resources().staticBindGroup);
   pass.SetBindGroup(2, gx::g_emptyTextureBindGroup);
 
-  for (auto& cmd : passInfo.commands) {
+  for (uint32_t at = 0; at < passInfo.commands.size(); ++at) {
+    if (bundles != nullptr && nextRun < bundles->runs.size() && bundles->runs[nextRun].first == at) {
+      const auto& run = bundles->runs[nextRun++];
+      if (run.dstAlpha != UINT32_MAX) {
+        const wgpu::Color color{0.f, 0.f, 0.f, run.dstAlpha / 255.f};
+        pass.SetBlendConstant(&color);
+      }
+      pass.ExecuteBundles(1, &run.bundle);
+      at = run.end - 1;
+      g_currentPipeline = nullptr;
+      pass.SetBindGroup(0, resources().staticBindGroup);
+      pass.SetBindGroup(2, gx::g_emptyTextureBindGroup);
+      continue;
+    }
+    auto& cmd = passInfo.commands[at];
 #ifdef AURORA_GFX_DEBUG_GROUPS
     {
       size_t firstDiff = lastDebugGroupStack.size();
@@ -189,7 +309,7 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
 #endif
 }
 
-void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo, uint32_t passIndex) {
+void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo, uint32_t passIndex, PassBundles* bundles = nullptr) {
   ZoneScoped;
   if (!passInfo.sealed) {
     return;
@@ -256,7 +376,7 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
   };
 
   auto pass = cmd.BeginRenderPass(&renderPassDescriptor);
-  render_pass(pass, frame, passInfo);
+  render_pass(pass, frame, passInfo, bundles);
   pass.End();
 
   if (passInfo.resolveTarget) {
@@ -418,6 +538,12 @@ void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, c
 } // namespace
 
 namespace detail {
+bool g_redrawBundles = [] {
+  const char* v = std::getenv("AURORA_REDRAW_BUNDLES");
+  return v != nullptr && v[0] == '1';
+}();
+void forget_redraw_bundles() noexcept { g_passBundles.clear(); }
+
 void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op) {
   copy_staging_to_high_water(cmd, frame, op);
   switch (op.type) {
@@ -441,6 +567,36 @@ void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op)
     if (op.readbackTask != nullptr) {
       readback::gpu::encode_job(cmd, frame, op.readbackTask->job);
     }
+    break;
+  }
+}
+// The same again for a picture between: nothing uploaded, nothing read back; a ray tracing task's job is gone
+void encode_op_again(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op) {
+  switch (op.type) {
+  case FrameOpType::RenderPass:
+    if (op.renderPass != nullptr) {
+      PassBundles* bundles = nullptr;
+      if (g_redrawBundles) {
+        if (g_passBundles.size() <= op.index) {
+          g_passBundles.resize(op.index + 1);
+        }
+        bundles = &g_passBundles[op.index];
+      }
+      render(cmd, frame, *op.renderPass, op.index, bundles);
+    }
+    break;
+  case FrameOpType::TextureCopy:
+    if (op.textureCopy != nullptr) {
+      cmd.CopyTextureToTexture(&op.textureCopy->src, &op.textureCopy->dst, &op.textureCopy->size);
+    }
+    break;
+  case FrameOpType::EncoderTask:
+    if (g_betweenTask != nullptr) {
+      stagelog::Scope t{"rd_task"};
+      g_betweenTask(cmd, op.encoderTask != nullptr ? op.encoderTask->type : InvalidEncoderTask);
+    }
+    break;
+  default:
     break;
   }
 }

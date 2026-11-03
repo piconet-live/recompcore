@@ -1,5 +1,8 @@
+#include "rt_capture.hpp"
+#include <algorithm>
 #include "shader_info.hpp"
 
+#include "soft_cards.hpp"
 #include "../gfx/recording.hpp"
 
 #include <cmath>
@@ -362,6 +365,10 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
     info.uniformSize += MaxIndTexMtxs * sizeof(Mat2x4<float>);
   }
   info.uniformSize += info.sampledTextures.count() * sizeof(Vec4<float>);
+  if (config.softCard != 0) {
+    info.softCard = config.softCard;
+    info.uniformSize += sizeof(Vec4<float>);  // soft_card: the depth range of the viewport (least, span), the fade's share
+  }
   info.uniformSize = gfx::align_uniform(info.uniformSize);
   if (info.uniformSize > MaxUniformSize) {
     Log.fatal("Uniform size exceeds maximum: {} > {}", info.uniformSize, MaxUniformSize);
@@ -433,7 +440,17 @@ static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
       buf.append(ccs.ambColor);
     }
     if (ccc.matSrc == GX_SRC_REG) {
-      buf.append(ccs.matColor);
+      {
+        // With the game's light off, a draw that asked for light keeps the warmth of its own ambient: the hue alone, its brightest channel at 1 (AURORA_RT_AMBIENT_WARMTH, how much; off by default). The picture only.
+        auto mat = ccs.matColor;
+        if (rt::g_gameLightOff && rt::g_ambientWarmth > 0.f && i < 2 && rt::g_gameLit[i]) {
+          const float most = std::max({ccs.ambColor[0], ccs.ambColor[1], ccs.ambColor[2]});
+          if (most > 0.f)
+            for (int a = 0; a < 3; ++a)
+              mat[a] *= 1.f + rt::g_ambientWarmth * (ccs.ambColor[a] / most - 1.f);
+        }
+        buf.append(mat);
+      }
     }
     const auto& ccca = g_gxState.colorChannelConfig[i + GX_ALPHA0];
     const auto& ccsa = g_gxState.colorChannelState[i + GX_ALPHA0];
@@ -489,6 +506,13 @@ static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
       continue;
     }
     buf.append(texture_size_bias(get_texture(static_cast<GXTexMapID>(i))));
+  }
+  if (info.softCard != 0) {
+    // the depth range the viewport maps to (encoding.cpp apply_viewport), so the shader can take a depth back to a distance
+    const auto& vp = g_gxState.logicalViewport;
+    const float least = UseReversedZ ? 1.f - vp.zfar : vp.znear;
+    const float most = UseReversedZ ? 1.f - vp.znear : vp.zfar;
+    buf.append(Vec4{least, most - least, soft::share(), 0.f});
   }
 }
 

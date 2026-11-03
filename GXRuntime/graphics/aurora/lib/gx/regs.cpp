@@ -1,5 +1,7 @@
 #include <cstdio>
 #include "regs.hpp"
+#include "rt_capture.hpp"
+#include "soft_cards.hpp"
 
 #include "gx_fmt.hpp"
 #include "recomp.hpp"
@@ -410,6 +412,9 @@ void bp_efb_copy(u8, u32 value) noexcept {
     return;
   }
   const bool clear = reg_get(value, 1, 11) != 0;
+  // soft cards' depth snapshot (AURORA_RT_SOFT_CARDS): gone with a clear, and with the frame at its display copy
+  if (clear || reg_get(value, 1, 14) != 0)
+    soft::efb_cleared();
   if (reg_get(value, 1, 14) != 0) {
     copy_xfb(value);
   } else {
@@ -421,6 +426,8 @@ void bp_efb_copy(u8, u32 value) noexcept {
                      g_gxState.texCopySrc.height, g_gxState.texCopyDstWidth, g_gxState.texCopyDstHeight, clear ? 1 : 0,
                      (unsigned)g_gxState.pixelFmt);
       }
+      if (clear)
+        rt::efb_cleared();
       copy_tex(g_gxState.texCopyDest, clear);
     } else {
       Log.warn("Skipping GXCopyTex with unresolved destination");
@@ -923,6 +930,11 @@ void xf_chan_ctrl(u8 reg, u32 value) noexcept {
   auto& chan = g_gxState.colorChannelConfig[chanId];
   chan.matSrc = static_cast<GXColorSrc>(reg_get(value, 1, 0));
   chan.lightingEnabled = reg_get(value, 1, 1) != 0;
+  // AURORA_RT_GAME_LIGHT=0: the picture without the game's lights. What the draw asked for stays known, for the sun; only colour channels: alpha may carry a fade.
+  if (rt::g_gameLightOff && chanId < 2) UNLIKELY {
+    rt::g_gameLit[chanId] = chan.lightingEnabled;
+    chan.lightingEnabled = false;
+  }
   u32 lightsLo = reg_get(value, 4, 2);
   chan.ambSrc = static_cast<GXColorSrc>(reg_get(value, 1, 6));
   chan.diffFn = static_cast<GXDiffuseFn>(reg_get(value, 2, 7));

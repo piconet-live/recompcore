@@ -29,7 +29,7 @@
 extern "C" {
 #endif
 
-#define AURORA_PRESENT_ABI 4
+#define AURORA_PRESENT_ABI 5
 
 typedef struct AuroraPresentConfig {
   uint32_t abi;            // AURORA_PRESENT_ABI
@@ -66,6 +66,7 @@ typedef struct AuroraPresentStats {
   uint64_t overflow_drops;  // draws left out because a frame's buffer was full
   uint32_t fatal;           // 1: a fatal error of Aurora's stopped it (the thread is parked; the game goes on)
   uint32_t scale;           // the render scale in use
+  uint64_t pictures_between;  // pictures drawn between true frames from their draws (AURORA_REDRAW) and presented (ABI 5)
 } AuroraPresentStats;
 
 // The host's overlay, with the emulator drawing nothing: its own drawing (Dear ImGui's lists, flattened; no ImGui type
@@ -114,11 +115,34 @@ AURORA_PRESENT_API void aurora_present_picture_shape(float width_over_height);
 // Dawn) happens on its thread; a failure there shows in the stats.
 AURORA_PRESENT_API int aurora_present_start(const AuroraPresentConfig* config);
 // The GPU thread: `size` bytes of the command stream, in order. Copied; never blocks.
+// A model or course file the game is reading from the disc (its path, its whole bytes, copied here). Its materials' pipelines
+// compile on Aurora's compile threads. Any thread, at any time, before or after the start.
+AURORA_PRESENT_API void aurora_present_model_file(const char* path, const uint8_t* bytes, uint64_t size, int later);
 AURORA_PRESENT_API void aurora_present_write(const uint8_t* bytes, uint32_t size);
 // The GPU thread: the stream so far ends frame `copy` (its XFB copy, numbered from 1). Never blocks.
 // The copy about to be marked is a picture between two steps, shown `fraction` of a field after the true one before it.
 AURORA_PRESENT_API void aurora_present_frame_between(uint64_t copy, float fraction);
 AURORA_PRESENT_API void aurora_present_frame(uint64_t copy);
+// AURORA_REDRAW=1: the pictures between a true picture and the next, drawn from the true frame's own draws with corrected matrices. The
+// game's thread, after the step ahead. `position`: the command stream's written position then; aurora_present_frame_at gives each
+// frame's. Matrices: row-major, column vectors, last row 0 0 0 1. Copied; never blocks; the newest replaces the one before.
+#define AURORA_REDRAW_MACHINES 30
+#define AURORA_REDRAW_MOST 7
+typedef struct AuroraRedrawPicture {
+  float fraction;  // of a field after the true picture
+  float camera[16];
+  float machine[AURORA_REDRAW_MACHINES][16];
+} AuroraRedrawPicture;
+typedef struct AuroraRedrawRequest {
+  uint64_t position;
+  uint32_t machines;  // a bit for each machine with a place
+  float at[AURORA_REDRAW_MACHINES][3];  // its place in the true picture's view
+  uint32_t pictures;
+  AuroraRedrawPicture picture[AURORA_REDRAW_MOST];
+} AuroraRedrawRequest;
+AURORA_PRESENT_API void aurora_present_redraw(const AuroraRedrawRequest* request);
+// The GPU thread, before aurora_present_frame: the read position its XFB copy was at.
+AURORA_PRESENT_API void aurora_present_frame_at(uint64_t position);
 // Any one thread: the newest picture finished since the last take (1), none (0), or -1 once Aurora has stopped for
 // the run (show the emulator's own pictures from then on). Cheap: no wait, one lock.
 AURORA_PRESENT_API int aurora_present_take(AuroraPresentPicture* out);

@@ -5,6 +5,7 @@
 #include "../internal.hpp"
 #include "../gx/gx.hpp"
 #include "../webgpu/gpu.hpp"
+#include "../webgpu/hdr.hpp"
 #include "../webgpu/gpu_prof.hpp"
 #include "texture.hpp"
 #include "../gx/gx_fmt.hpp"
@@ -397,6 +398,59 @@ fn row(uv: vec2f, dy: f32) -> vec4u {
 }
 )"sv;
 
+// The same copy with the picture's float range kept (AURORA_LOOK_HDR=1): the integer one above cuts at 255.
+static constexpr std::string_view XfbFloatShader = R"(
+@group(0) @binding(0) var src_samp: sampler;
+@group(0) @binding(1) var src: texture_2d<f32>;
+
+struct XfbParams {
+    offset: vec2f,
+    scale: vec2f,
+    coef: vec4f,
+    clamp_tb: vec4f,
+};
+@group(0) @binding(2) var<uniform> xf: XfbParams;
+
+struct VertexOutput {
+    @builtin(position) pos: vec4f,
+    @location(0) uv: vec2f,
+};
+
+var<private> positions: array<vec2f, 3> = array(
+    vec2f(-1.0, 1.0),
+    vec2f(-1.0, -3.0),
+    vec2f(3.0, 1.0),
+);
+var<private> uvs: array<vec2f, 3> = array(
+    vec2f(0.0, 0.0),
+    vec2f(0.0, 2.0),
+    vec2f(2.0, 0.0),
+);
+
+@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
+    var out: VertexOutput;
+    out.pos = vec4f(positions[vi], 0.0, 1.0);
+    out.uv = uvs[vi] * xf.scale + xf.offset;
+    return out;
+}
+
+fn row(uv: vec2f, dy: f32) -> vec4f {
+    let texSize = vec2f(textureDimensions(src));
+    let v = clamp(uv.y + dy * xf.clamp_tb.z, xf.clamp_tb.x, xf.clamp_tb.y);
+    let coord = clamp(vec2i(floor(vec2f(uv.x, v) * texSize)), vec2i(0), vec2i(texSize) - vec2i(1));
+    return textureLoad(src, coord, 0);
+}
+
+@fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
+    let cur = row(in.uv, 0.0);
+    var outc = (row(in.uv, -1.0).rgb * xf.coef.x + cur.rgb * xf.coef.y + row(in.uv, 1.0).rgb * xf.coef.z) / 64.0;
+    if (xf.coef.w != 1.0) {
+        outc = pow(max(outc, vec3f(0.0)), vec3f(xf.coef.w));
+    }
+    return vec4f(outc, cur.a);
+}
+)"sv;
+
 struct ConvPipeline {
   GXTexFmt fmt;
   std::string_view fragShader;
@@ -437,6 +491,7 @@ static wgpu::Sampler g_nearestSampler;
 static wgpu::Sampler g_linearSampler;
 static absl::flat_hash_map<GXTexFmt, wgpu::RenderPipeline> g_pipelines;
 static wgpu::RenderPipeline g_blitPipeline;
+static wgpu::RenderPipeline g_xfbFloatPipeline;
 static wgpu::BindGroupLayout g_depthSnapshotBindGroupLayout;
 static wgpu::BindGroupLayout g_depthSnapshotBindGroupLayoutMS;
 static wgpu::RenderPipeline g_depthSnapshotPipeline;
@@ -622,6 +677,10 @@ void initialize() {
   g_pipelines[XfbCopyFormat] =
       create_pipeline({XfbCopyFormat, {}, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv XFB"}, XfbShader,
                       g_bindGroupLayout);
+  if (webgpu::hdr::float_copy()) {
+    g_xfbFloatPipeline = create_pipeline({XfbCopyFormat, {}, wgpu::TextureFormat::RGBA16Float, "TexCopyConv XFB float"},
+                                         XfbFloatShader, g_bindGroupLayout);
+  }
   g_blitPipeline = create_pipeline(
       {GX_TF_RGBA8, FragPassthrough, webgpu::g_graphicsConfig.surfaceConfiguration.format, "TexCopyConv Blit"},
       ShaderPreamble, g_bindGroupLayout);
@@ -665,6 +724,7 @@ void initialize() {
 void shutdown() {
   g_pipelines.clear();
   g_blitPipeline = {};
+  g_xfbFloatPipeline = {};
   g_bindGroupLayout = {};
   g_depthBindGroupLayout = {};
   g_nearestSampler = {};
@@ -751,6 +811,10 @@ static void execute(const wgpu::CommandEncoder& cmd, const ConvRequest& req, con
 }
 
 void run(const wgpu::CommandEncoder& cmd, const ConvRequest& req) {
+  if (req.fmt == XfbCopyFormat && req.dst->format == wgpu::TextureFormat::RGBA16Float) {
+    execute(cmd, req, g_xfbFloatPipeline);
+    return;
+  }
   const auto it = g_pipelines.find(req.fmt);
   if (it == g_pipelines.end()) {
     Log.fatal("No copy conversion pipeline for format {}", static_cast<int>(req.fmt));

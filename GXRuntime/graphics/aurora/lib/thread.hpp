@@ -51,4 +51,11 @@ private:
   std::jthread mThread;
 };
 
+// This thread only while it runs work nothing is waiting for: under the game threads when the PC is short of CPU
+void set_background(bool background) noexcept;
+
+// AURORA_THREADS_UP=1 (off by default): the threads a picture waits for (the game's CPU and video threads, Aurora's FIFO,
+// render, ray and motion threads), found by name, run above normal priority, so other programs' load takes from them last
+void raise_picture_threads_from_env() noexcept;
+
 } // namespace aurora::thread

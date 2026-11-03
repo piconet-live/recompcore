@@ -88,6 +88,11 @@ bool push_custom_draw(DrawTypeId type, const void* payload, size_t payloadSize);
 using EncoderTaskId = uint64_t;
 inline constexpr EncoderTaskId InvalidEncoderTask = 0;
 
+// Around the frame's queue submit, on the render worker: a pass that cut the frame in two runs here
+extern void (*g_beforeFrameSubmit)();
+extern void (*g_afterFrameSubmit)();
+extern void (*g_betweenTask)(wgpu::CommandEncoder& cmd, EncoderTaskId type);  // AURORA_REDRAW: a picture between reaches the frame's ray tracing task
+
 struct EncoderTaskContext {
   wgpu::Device device;
   wgpu::Queue queue;
@@ -95,6 +100,8 @@ struct EncoderTaskContext {
   wgpu::Buffer indexBuffer;
   wgpu::Buffer uniformBuffer;
   wgpu::Buffer storageBuffer;
+  // the frame's encoder, for a task that cuts the frame in two
+  wgpu::CommandEncoder* frameEncoder = nullptr;
 };
 
 struct EncoderTaskCompletionContext {

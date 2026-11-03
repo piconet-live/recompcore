@@ -1,10 +1,12 @@
 #include "gx.hpp"
+#include "../../gx/rt_capture.hpp"
 #include "__gx.h"
 
 #include "../../gfx/texture.hpp"
 #include "../../gfx/recording.hpp"
 #include "../../window.hpp"
 #include "../../webgpu/gpu.hpp"
+#include "../../webgpu/hdr.hpp"
 #include "../../gx/texture.hpp"
 #include "../vi/vi_internal.hpp"
 
@@ -62,6 +64,7 @@ static gfx::TextureHandle g_xfbCopy;
 void release_xfb_copy() noexcept { g_xfbCopy.reset(); }
 
 void copy_xfb(u32 copyValue) noexcept {
+  rt::frame_end();
   // Bits of BP 0x52 (Dolphin's UPE_Copy): 0 clamp top, 1 clamp bottom, 7-8 gamma, 10 y-scale invert, 11 clear
   static const bool enabled = [] {
     const char* v = std::getenv("AURORA_XFB");
@@ -109,7 +112,8 @@ void copy_xfb(u32 copyValue) noexcept {
   }
   auto& s_xfb = g_xfbCopy;
   if (!s_xfb || s_xfb->size.width != width || s_xfb->size.height != lines) {
-    s_xfb = gfx::new_render_texture(width, lines, GX_TF_RGBA8, "XFB copy");
+    s_xfb = gfx::new_render_texture(width, lines, GX_TF_RGBA8, "XFB copy",
+                                    webgpu::hdr::float_copy() ? wgpu::TextureFormat::RGBA16Float : wgpu::TextureFormat::Undefined);
   }
   gfx::resolve_pass_into(s_xfb, rect, clearColor, clearAlpha, clearDepth, g_gxState.clearColor, clear_depth_value(),
                          gfx::tex_copy_conv::XfbCopyFormat, g_gxState.pixelFmt, &params);
