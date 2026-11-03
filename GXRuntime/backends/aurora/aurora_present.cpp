@@ -243,6 +243,9 @@ void wait_until(Clock::time_point due) {
 // held picture is presented. AURORA_PACE=2: the refreshes are timed and logged (stage log pace_vblank), nothing held.
 namespace pace {
 int g_mode = 0;
+// AURORA_PACE_KEEP=1 (with AURORA_PACE=1; off by default): a held picture keeps its hold to the next refresh when a true frame comes,
+// in place of being let go into the refresh another present already has (where the compositor drops one of them)
+bool g_keep = false;
 double g_phase_ms = 0.3, g_fallback_period_ms = 1000.0 / 240.0;
 std::atomic<long long> g_vblank_ns{0};    // the last refresh seen (steady_clock ns)
 std::atomic<long long> g_period_ns{0};    // its measured period
@@ -390,7 +393,7 @@ void before_present() {
   static HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
 #endif
   for (;;) {
-    if (g_true_coming.load(std::memory_order_relaxed)) {
+    if (!g_keep && g_true_coming.load(std::memory_order_relaxed)) {
       let_go = true;
       break;
     }
@@ -430,6 +433,8 @@ void start(void* window) {
     g_mode = 0;
     return;
   }
+  if (const char* k = std::getenv("AURORA_PACE_KEEP"))
+    g_keep = k[0] == '1';
   if (const char* p = std::getenv("AURORA_PACE_PHASE_US"))
     g_phase_ms = std::atof(p) / 1000.0;
   if (const char* h = std::getenv("AURORA_PACE_HZ"); h && std::atof(h) > 1)
