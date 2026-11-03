@@ -309,7 +309,7 @@ const std::vector<std::wstring>& shader_defines() {
                                          {"AURORA_RT_MATTE_HALF", L"MATTE_HALF", 0.f}, {"AURORA_RT_ONE_UP", L"ONE_UP", 0.f}, {"AURORA_RT_BAKE_BOUND", L"BAKE_BOUND", 0.f},
                                          // phase 2: glows and their shadow ray that cannot move a pixel a quarter step left out; main's camera ray capped first
                                          {"AURORA_RT_GLOW_FAST", L"GLOW_FAST", 0.f}, {"AURORA_RT_DEPTH_CAP", L"DEPTH_CAP", 0.f},
-                                         // phase 2: the glow light once per light pixel, read up in main (needs AURORA_RT_HALF and the denoiser)
+                                         // phase 2: the glow light once per light pixel, read up in main (needs AURORA_RT_HALF and the denoiser); 2: the engine lights too
                                          {"AURORA_RT_GLOW_HALF", L"GLOW_HALF", 0.f}};
     for (const auto& n : numbers) {
       const char* v = std::getenv(n.env);
@@ -680,7 +680,7 @@ void make_targets(u32 w, u32 h, wgpu::TextureFormat format) {
     if (half_on())
       d.Width = (w + 1) / 2, d.Height = (h + 1) / 2;
     make(g.refl, F16);
-    if (env_one("AURORA_RT_GLOW_HALF"))
+    if (const char* v = std::getenv("AURORA_RT_GLOW_HALF"); v != nullptr && std::atof(v) > 0)  // 1: glows, 2: engine lights too
       make(g.glowHalf, F16);
     make(g.motion, F16), make(g.noisyOpen, F16), make(g.noisySky, F16);
     for (u32 i = 0; i < 2; ++i) {

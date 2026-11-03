@@ -666,7 +666,8 @@ static const float DepthAgree = 0.05, DepthSlack = 0.03;
 // GLOW_HALF (AURORA_RT_GLOW_HALF=1; rt-speed phase 2; with AURORA_RT_HALF and the denoiser): the glow light (its 64 glows and its one shadow ray)
 // is found once per light pixel in light_pass, at the light pixel's own surface, and main reads it up as it reads the rays' light (up_at: the four
 // light pixels weighted by distance and normal). A quarter of the work; the glow light is smooth across a surface, its shadow's edge softer.
-// Kept in WriteOpen (u12), which neither light_pass nor main uses otherwise.
+// Kept in WriteOpen (u12), which neither light_pass nor main uses otherwise. GLOW_HALF=2 (AURORA_RT_GLOW_HALF=2): the engine lights too, both with
+// their gains in the one texture, on the surfaces that take both (a glowing surface, which takes engine light only, keeps it at full size).
 #ifndef GLOW_HALF
 #define GLOW_HALF 0
 #endif
@@ -821,8 +822,13 @@ void main(uint3 id : SV_DispatchThreadID) {
         float bareM = 1 - smoothstep(0.15, 0.45, seenL - gateL);
         if (MAIN_PROBE == 2) { term = (fr * bareM * 1e-6).xxx; break; }
         Up u1 = (Up)0; bool haveU = false;  // ONE_UP
-        if (MAIN_PROBE != 6 && P.lightGain > 0 && (d.highlight & 4) == 0) light += engine_light(h.pos, N) * P.lightGain * bareM;
-        if (MAIN_PROBE != 4 && P.glowGain > 0 && (d.highlight & 6) == 0) {
+        const bool bothHalf = GLOW_HALF >= 2 && DP.half != 0 && DP.denoised != 0 && (d.highlight & 6) == 0;  // GLOW_HALF=2
+        if (bothHalf) {
+          const Up ug = up_at(id.xy, -h.pos.z, N);
+          light += UP_READ(GlowHalf, ug).rgb * bareM;
+        }
+        if (MAIN_PROBE != 6 && !bothHalf && P.lightGain > 0 && (d.highlight & 4) == 0) light += engine_light(h.pos, N) * P.lightGain * bareM;
+        if (MAIN_PROBE != 4 && !bothHalf && P.glowGain > 0 && (d.highlight & 6) == 0) {
           // GLOW_FAST: what moves this pixel a quarter step (the glow light multiplies the raster here); none at all where nothing would show
           const float onPixel = P.glowGain * bareM * max(raster.r, max(raster.g, raster.b));
           if (GLOW_HALF && DP.half != 0 && DP.denoised != 0) {
@@ -990,7 +996,12 @@ void light_pass(uint3 id : SV_DispatchThreadID) {
       ReadOpen[id.xy] = float4(bounce, open);
       ReadSky[id.xy] = float4(skySeen, 0);
       sunV = sun_term(h.pos, N, t);
-      if (GLOW_HALF && P.glowGain > 0) GlowHalf[id.xy] = float4(glow_light(h.pos, N), 1);
+      if (GLOW_HALF >= 2) {
+        float3 o = 0;
+        if (P.glowGain > 0) o += glow_light(h.pos, N) * P.glowGain;
+        if (P.lightGain > 0 && (d.highlight & 4) == 0) o += engine_light(h.pos, N) * P.lightGain;
+        GlowHalf[id.xy] = float4(o, 1);
+      } else if (GLOW_HALF && P.glowGain > 0) GlowHalf[id.xy] = float4(glow_light(h.pos, N), 1);
     }
     // At half resolution the mirror ray goes here too, from this hit: the primary ray isn't paid twice, and only surfaces with shine pay at all. As main's rule.
     if (DP.half != 0 && (d.highlight & 6) == 0) {
