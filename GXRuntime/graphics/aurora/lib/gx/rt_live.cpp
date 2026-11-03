@@ -73,6 +73,8 @@ struct Params {
 };
 
 constexpr u32 Frames = 3, SlotDescriptors = 13, MaxTextures = 8192, PostLevels = 6;
+// timestamps a slot: 0 start, 1 structures, 2 light, 3 smoothing, 4 main, 5 end; with AURORA_RT_TIMELOG also 6 bottom levels, 7 temporal, 8 flare, 9 uploads
+constexpr u32 QS = 10;
 // As rt.hlsl's PostParams
 struct PostParams {
   float texel[2], range, bloom, dt, grade;
@@ -368,7 +370,7 @@ void init_device() {
   }
   D3D12_QUERY_HEAP_DESC qd{};
   qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-  qd.Count = 6 * Frames;
+  qd.Count = QS * Frames;
   RT_HR(g.dev->CreateQueryHeap(&qd, IID_PPV_ARGS(&g.queries)));
   g.queryResult = make_buffer(D3D12_HEAP_TYPE_READBACK, 8 * qd.Count, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
   RT_HR(g.queue->GetTimestampFrequency(&g.gpuTicks));
@@ -504,7 +506,7 @@ void init_device() {
     g.timeLog = std::fopen(path, "wb");
     if (g.timeLog != nullptr) {
       std::setvbuf(g.timeLog, nullptr, _IOLBF, 4096);
-      std::fprintf(g.timeLog, "copy,build_ms,light_ms,denoise_ms,reflect_ms,compose_ms,tris,lights,uploads\n");
+      std::fprintf(g.timeLog, "kind,copy,build_ms,light_ms,denoise_ms,reflect_ms,compose_ms,tris,lights,uploads,upload_ms,blas_ms,tlas_ms,temporal_ms,atrous_ms,flare_ms,all_ms\n");
     }
   }
   std::fprintf(stderr, "[rt] live pass ready on Dawn's device, %.0f ms, beside the game\n",
@@ -927,6 +929,7 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
                          fr.passFirstVertex - fr.primaryFirstVertex, static_cast<u32>(fr.verts.size()) - fr.passFirstVertex};
   static constexpr u32 masks[6] = {1, 4, 128, 2, 64, 4};
   constexpr u32 Passed = 5;
+  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, QS * g.slot + 9);
   ensure(s.scratch, s.scratchSize, 256u << 20, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   u64 scratchAt = 0;
   {
@@ -941,6 +944,7 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   D3D12_RESOURCE_BARRIER uav{};
   uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
   cl->ResourceBarrier(1, &uav);
+  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, QS * g.slot + 6);
   static thread_local std::vector<D3D12_RAYTRACING_INSTANCE_DESC> inst;
   inst.assign(6, D3D12_RAYTRACING_INSTANCE_DESC{});
   u32 instances = 0;
@@ -984,7 +988,7 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   bd.ScratchAccelerationStructureData = s.scratch->GetGPUVirtualAddress() + scratchAt;
   cl->BuildRaytracingAccelerationStructure(&bd, 0, nullptr);
   cl->ResourceBarrier(1, &uav);
-  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot + 1);
+  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, QS * g.slot + 1);
 
   D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
   sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -1121,12 +1125,13 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
     cl->SetPipelineState(g.lightPass.Get());
     cl->Dispatch((lightW + 7) / 8, (lightH + 7) / 8, 1);
     barrier();
-    cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot + 2);
+    cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, QS * g.slot + 2);
     bind({g.guide[now].Get(), g.motion.Get(), g.noisyOpen.Get(), g.noisySky.Get(), g.guide[old].Get(), g.histOpen[old].Get(), g.histSky[old].Get(), g.moments[old].Get(),
           g.tmpOpen[0].Get(), g.tmpSky[0].Get(), g.moments[now].Get()});
     cl->SetPipelineState(g.temporal.Get());
     cl->Dispatch((lightW + 7) / 8, (lightH + 7) / 8, 1);
     barrier();
+    cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, QS * g.slot + 7);
     // the first step's result is the next frame's history; then back and forth
     ID3D12Resource* fromO = g.tmpOpen[0].Get();
     ID3D12Resource* fromS = g.tmpSky[0].Get();
@@ -1145,9 +1150,9 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
     g.lastLitCopy = job.copy;
     g.flip = old;
   } else {
-    cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot + 2);
+    cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, QS * g.slot + 2);
   }
-  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot + 3);
+  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, QS * g.slot + 3);
   std::memcpy(g.prevProj, job.proj, sizeof g.prevProj);
   std::memcpy(g.prevViewport, job.viewport, sizeof g.prevViewport);
   dp.show = lit ? show : 0;
@@ -1157,7 +1162,7 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   cl->SetPipelineState(g.trace.Get());
   cl->Dispatch((g.rw + 7) / 8, (g.rh + 7) / 8, 1);
   barrier();
-  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot + 4);
+  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, QS * g.slot + 4);
 }
 
 // The look: the frame's high range, a bloom chain, exposure, the tone curve. On the frame's own queue: no frame waits for it.
@@ -1256,6 +1261,13 @@ void run_post(Slot& s, Job& job) {
     transition(g.upRes[i].Get(), false);
 }
 
+// AURORA_RT_TIMELOG: a picture between's row, warp in light_ms's place (b rows: light_ms warp, flare_ms flare, compose_ms the rest)
+void between_row(const u64* t6) {
+  if (g.timeLog == nullptr) return;
+  const double k = 1000.0 / g.gpuTicks;
+  std::fprintf(g.timeLog, "b,%llu,0,%.3f,0,0,%.3f,0,0,0,0,0,0,0,0,%.3f,%.3f\n", static_cast<unsigned long long>(g.betweenCount), double(t6[1] - t6[0]) * k, double(t6[5] - t6[8]) * k, double(t6[8] - t6[4]) * k, double(t6[5] - t6[0]) * k);
+}
+
 // What the rays do for one frame, on Dawn's queue, between the frame's two command buffers
 // One picture between: no rays. The true frame's reflections and light (its term) carried by the corrections, then the picture's own raster
 // beneath them; bloom and exposure as the true frame left them.
@@ -1269,11 +1281,12 @@ void run_between() {
   }
   if (s.between && s.fence != 0) {
     u64* ts = nullptr;
-    const D3D12_RANGE range{8 * 6 * g.slot, 8 * 6 * (g.slot + 1)};
+    const D3D12_RANGE range{8 * QS * g.slot, 8 * QS * (g.slot + 1)};
     if (SUCCEEDED(g.queryResult->Map(0, &range, reinterpret_cast<void**>(&ts)))) {
-      const u64* t6 = ts + 6 * g.slot;
+      const u64* t6 = ts + QS * g.slot;
       g.msBetweenGpu += double(t6[5] - t6[0]) * 1000.0 / g.gpuTicks;
       ++g.betweenGpuCount;
+      between_row(t6);
       g.queryResult->Unmap(0, nullptr);
     }
   }
@@ -1295,7 +1308,9 @@ void run_between() {
   ID3D12GraphicsCommandList4* cl = s.cl.Get();
   ID3D12DescriptorHeap* heaps[] = {g.heap.Get()};
   cl->SetDescriptorHeaps(1, heaps);
-  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot);
+  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, QS * g.slot);
+  for (u32 q = 6; q < QS; ++q)  // (written again where they fall; never left unwritten)
+    cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, QS * g.slot + q);
   const u32 base = g.slot * SlotDescriptors;
   D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
   sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -1328,9 +1343,9 @@ void run_between() {
     cl->SetComputeRootDescriptorTable(6, gpuh(ViewBetween + 1));
     cl->Dispatch((g.rw + 7) / 8, (g.rh + 7) / 8, 1);
   }
-  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot + 1);
+  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, QS * g.slot + 1);
   for (u32 q = 2; q < 5; ++q)
-    cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot + q);
+    cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, QS * g.slot + q);
   transition(g.termBetween.Get(), true);
   if (post_on()) {
     static const float range = post_setting("AURORA_LOOK_RANGE", 12.f), bloom = post_setting("AURORA_LOOK_BLOOM", 0.18f), grade = post_setting("AURORA_LOOK_GRADE", 1.f);
@@ -1356,6 +1371,7 @@ void run_between() {
     const bool flare = flare_on() && g.flareSrc;
     if (flare)
       run_flare(cl);
+    cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, QS * g.slot + 8);
     cl->SetPipelineState(g.betweenCompose.Get());
     cl->SetComputeRootDescriptorTable(5, gpuh(ViewBetween));
     cl->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
@@ -1364,8 +1380,8 @@ void run_between() {
   }
   transition(g.termBetween.Get(), false);
   transition(g.termRes.Get(), false);
-  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot + 5);
-  cl->ResolveQueryData(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot, 6, g.queryResult.Get(), 8 * 6 * g.slot);
+  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, QS * g.slot + 5);
+  cl->ResolveQueryData(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, QS * g.slot, QS, g.queryResult.Get(), 8 * QS * g.slot);
   RT_HR(cl->Close());
   ID3D12CommandList* lists[] = {cl};
   g.queue->ExecuteCommandLists(1, lists);
@@ -1389,13 +1405,14 @@ void run_rays(Job& job) {
   // this slot's last timings, now done
   if (s.fence != 0) {
     u64* ts = nullptr;
-    const D3D12_RANGE range{8 * 6 * g.slot, 8 * 6 * (g.slot + 1)};
+    const D3D12_RANGE range{8 * QS * g.slot, 8 * QS * (g.slot + 1)};
     if (SUCCEEDED(g.queryResult->Map(0, &range, reinterpret_cast<void**>(&ts)))) {
-      const u64* t6 = ts + 6 * g.slot;
+      const u64* t6 = ts + QS * g.slot;
       const double k = 1000.0 / g.gpuTicks, all = double(t6[5] - t6[0]) * k;
       if (s.between) {
         g.msBetweenGpu += all;
         ++g.betweenGpuCount;
+        between_row(t6);
         g.queryResult->Unmap(0, nullptr);
         s.fence = 0;  // (this slot's timing taken)
       } else
@@ -1407,7 +1424,8 @@ void run_rays(Job& job) {
       g.msLight += lightMs, g.msDenoise += denoiseMs;
       // AURORA_RT_TIMELOG=<file>: a line a frame, to find one slow frame by its copy and what it carried
       if (g.timeLog != nullptr)
-        std::fprintf(g.timeLog, "%llu,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%u\n", static_cast<unsigned long long>(s.copy), build, lightMs, denoiseMs, reflectMs, composeMs, s.tris, s.lightCount, s.uploads);
+        std::fprintf(g.timeLog, "t,%llu,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", static_cast<unsigned long long>(s.copy), build, lightMs, denoiseMs, reflectMs, composeMs, s.tris, s.lightCount, s.uploads,
+                     double(t6[9] - t6[0]) * k, double(t6[6] - t6[9]) * k, double(t6[1] - t6[6]) * k, double(t6[7] - t6[2]) * k, double(t6[3] - t6[7]) * k, double(t6[8] - t6[4]) * k, all);
       g.queryResult->Unmap(0, nullptr);
       }
     }
@@ -1420,7 +1438,9 @@ void run_rays(Job& job) {
   ID3D12GraphicsCommandList4* cl = s.cl.Get();
   ID3D12DescriptorHeap* heaps[] = {g.heap.Get()};
   cl->SetDescriptorHeaps(1, heaps);
-  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot);
+  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, QS * g.slot);
+  for (u32 q = 6; q < QS; ++q)  // (written again where they fall; never left unwritten)
+    cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, QS * g.slot + q);
   auto& fr = job.frame;
   const u32 base = g.slot * SlotDescriptors;
   u32 glowCount = 0;
@@ -1445,9 +1465,9 @@ void run_rays(Job& job) {
   cl->SetComputeRootDescriptorTable(1, gpuh(base));
   cl->SetComputeRootDescriptorTable(2, gpuh(Frames * SlotDescriptors));
   if (job.postOnly) {
-    cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot + 1);
+    cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, QS * g.slot + 1);
     for (u32 q = 2; q < 5; ++q)
-      cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot + q);
+      cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, QS * g.slot + q);
   } else {
     trace_part(s, job, base, glowCount);
     if (g.failed)
@@ -1469,6 +1489,7 @@ void run_rays(Job& job) {
     const bool flare = flare_on() && g.flareSrc;
     if (flare)
       run_flare(cl);
+    cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, QS * g.slot + 8);
     cl->SetPipelineState(g.compose.Get());
     cl->Dispatch((g.w + 7) / 8, (g.h + 7) / 8, 1);
     if (flare)
@@ -1476,8 +1497,8 @@ void run_rays(Job& job) {
   }
   std::swap(tb.Transition.StateBefore, tb.Transition.StateAfter);
   cl->ResourceBarrier(1, &tb);
-  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot + 5);
-  cl->ResolveQueryData(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 6 * g.slot, 6, g.queryResult.Get(), 8 * 6 * g.slot);
+  cl->EndQuery(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, QS * g.slot + 5);
+  cl->ResolveQueryData(g.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, QS * g.slot, QS, g.queryResult.Get(), 8 * QS * g.slot);
   RT_HR(cl->Close());
   ID3D12CommandList* lists[] = {cl};
   g.queue->ExecuteCommandLists(1, lists);
