@@ -3,6 +3,7 @@
 // emulator that keeps running the game's GPU, its pictures read back for the emulator to show.
 
 #include "../../graphics/aurora/lib/gfx/stagelog.hpp"
+#include <aurora/gfx.hpp>
 #include "gx/rt_capture.hpp"
 #include "gx/redraw.hpp"
 #include "gfx/render_worker.hpp"
@@ -44,6 +45,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <dbghelp.h>
+#include <dxgi.h>
 #pragma comment(lib, "dbghelp.lib")
 #endif
 
@@ -226,6 +228,219 @@ void wait_until(Clock::time_point due) {
   while (Clock::now() < due)
     std::this_thread::yield();
 }
+
+// AURORA_PACE=1 (off by default): each picture between is presented in a refresh of its own, at a fixed place in it, not as
+// soon as it is drawn. Measured before (c37, 30 racers, DISPLAY1 240 Hz, ETW): of 217.5 presents/s 26.7/s fell in a refresh
+// another one had (the compositor shows one a refresh), and the screen got 191. The true frame is never held. A picture
+// between whose refresh already has a present waits for the next refresh's start; one whose refresh is free goes at once
+// (the render worker has little room in a field: the true frame and three pictures fill most of it, so holding each to a
+// fixed refresh after its true frame lost about one picture a field, measured). Held only on the render worker, just before
+// its Present (its GPU work already submitted), at most one refresh, let go at once when a true frame comes to the worker.
+// Paced pictures are drawn as soon as the worker is free, timed from the true frame's present as the worker made it (about
+// 8 ms after Aurora's thread handed it over, c37 rays off). Nothing the race reads changes: only when pictures reach the screen.
+// The refreshes: IDXGIOutput::WaitForVBlank on a thread of its own, for the monitor the window is on; without it, the
+// measured refresh AURORA_PACE_HZ (240) from the true frame's present. AURORA_PACE_PHASE_US (300): how far into its refresh a
+// held picture is presented. AURORA_PACE=2: the refreshes are timed and logged (stage log pace_vblank), nothing held.
+namespace pace {
+int g_mode = 0;
+double g_phase_ms = 0.3, g_fallback_period_ms = 1000.0 / 240.0;
+std::atomic<long long> g_vblank_ns{0};    // the last refresh seen (steady_clock ns)
+std::atomic<long long> g_period_ns{0};    // its measured period
+std::atomic<bool> g_true_coming{false};   // a true frame is on its way to the render worker
+std::atomic<bool> g_quit{false};
+// the true frame's present as the worker made it, for Aurora's thread to time the pictures after it by: how many true frames
+// were handed to the worker and presented, and the last one's time and refresh
+std::atomic<std::uint64_t> g_true_sent{0}, g_true_presented{0};
+std::atomic<long long> g_true_ns{0};
+// the render worker's own
+float g_picture_fraction = 0;  // >0: the present coming is a picture between, this fraction of a field after its true frame
+long long g_true_slot = 0, g_last_slot = 0;
+Clock::time_point g_true_at{};
+bool g_have_true = false;
+std::uint64_t g_held = 0, g_let_go = 0, g_on_time = 0, g_shifted = 0;
+double g_held_ms = 0;
+double g_last_hold_ms = 0;  // the last picture's hold: not part of what drawing it cost
+
+long long now_ns() { return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count(); }
+
+#if defined(_WIN32)
+using CreateFactory = HRESULT(WINAPI*)(REFIID, void**);
+void vblank_thread(HWND window) {
+  SetThreadDescription(GetCurrentThread(), L"Aurora pace vblank");
+  HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
+  auto create = dxgi ? reinterpret_cast<CreateFactory>(GetProcAddress(dxgi, "CreateDXGIFactory1")) : nullptr;
+  IDXGIFactory1* factory = nullptr;
+  if (create == nullptr || FAILED(create(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory)))) {
+    std::fprintf(stderr, "[aurora-present] pace: no DXGI factory, refresh %.3f ms from the true frame\n", g_fallback_period_ms);
+    return;
+  }
+  IDXGIOutput* output = nullptr;
+  HMONITOR on = nullptr;
+  const auto find = [&] {
+    HMONITOR want = MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY);
+    if (output != nullptr && want == on)
+      return;
+    if (output)
+      output->Release(), output = nullptr;
+    IDXGIAdapter1* adapter = nullptr;
+    for (UINT a = 0; output == nullptr && factory->EnumAdapters1(a, &adapter) != DXGI_ERROR_NOT_FOUND; ++a) {
+      IDXGIOutput* o = nullptr;
+      for (UINT i = 0; adapter->EnumOutputs(i, &o) != DXGI_ERROR_NOT_FOUND; ++i) {
+        DXGI_OUTPUT_DESC d{};
+        o->GetDesc(&d);
+        if (d.Monitor == want) {
+          output = o;
+          std::fprintf(stderr, "[aurora-present] pace: refreshes of %ls\n", d.DeviceName);
+          break;
+        }
+        o->Release();
+      }
+      adapter->Release();
+    }
+    on = want;
+  };
+  long long last = 0;
+  std::vector<long long> first;
+  for (std::uint64_t n = 0; !g_quit.load(std::memory_order_relaxed); ++n) {
+    if (n % 512 == 0)
+      find();
+    if (output == nullptr || FAILED(output->WaitForVBlank())) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      continue;
+    }
+    const long long t = now_ns();
+    if (aurora::gfx::stagelog::on())
+      aurora::gfx::stagelog::note("pace_vblank", Clock::now());
+    if (last != 0) {
+      const long long d = t - last;
+      const long long p = g_period_ns.load(std::memory_order_relaxed);
+      if (p == 0) {
+        first.push_back(d);
+        if (first.size() == 31) {
+          std::nth_element(first.begin(), first.begin() + 15, first.end());
+          g_period_ns.store(first[15], std::memory_order_relaxed);
+          std::fprintf(stderr, "[aurora-present] pace: refresh %.3f ms\n", first[15] / 1e6);
+        }
+      } else if (d > p / 2 && d < p + p / 2) {
+        g_period_ns.store(p + (d - p) / 64, std::memory_order_relaxed);  // (a missed wait's double gap left out)
+      }
+    }
+    last = t;
+    g_vblank_ns.store(t, std::memory_order_relaxed);
+  }
+  if (output)
+    output->Release();
+  factory->Release();
+}
+#endif
+
+// the refresh a time is in, counted from a refresh seen (its boundary g_phase_ms after the vblank), and the time one begins
+struct Grid {
+  long long origin = 0, period = 0;
+  long long slot(long long t) const { return (t - origin) >= 0 ? (t - origin) / period : -((origin - t + period - 1) / period); }
+  long long start(long long k) const { return origin + k * period; }
+};
+Grid grid() {
+  Grid g;
+  g.period = g_period_ns.load(std::memory_order_relaxed);
+  const long long v = g_vblank_ns.load(std::memory_order_relaxed);
+  if (g.period > 0 && v != 0) {
+    g.origin = v + static_cast<long long>(g_phase_ms * 1e6);
+  } else {
+    g.period = static_cast<long long>(g_fallback_period_ms * 1e6);
+    g.origin = std::chrono::duration_cast<std::chrono::nanoseconds>(g_true_at.time_since_epoch()).count();
+  }
+  return g;
+}
+
+void before_present() {
+  const auto now = Clock::now();
+  const long long t = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+  const float fraction = g_picture_fraction;
+  if (fraction <= 0) {
+    // a true frame (or anything not a picture between): never held
+    g_true_at = now;
+    g_have_true = true;
+    g_true_coming.store(false, std::memory_order_relaxed);
+    const Grid g = grid();
+    g_true_slot = g_last_slot = g.slot(t);
+    g_true_ns.store(t, std::memory_order_relaxed);
+    g_true_presented.fetch_add(1, std::memory_order_release);
+    return;
+  }
+  if (!g_have_true || g_mode != 1)
+    return;
+  // the refresh it is in, if no present has it yet; else the next one's start (the render worker has little room in a field:
+  // a hold only when the picture would share a refresh, and never past the next one)
+  const Grid g = grid();
+  const long long period = g.period;
+  const long long after = 1;
+  const long long here = g.slot(t);
+  if (here > g_last_slot) {
+    ++g_on_time;
+    g_last_slot = here;
+    return;
+  }
+  const long long want = g_last_slot + 1;
+  const long long begin = g.start(want);
+  const long long until = std::min(begin, t + period);
+  const auto due = now + std::chrono::nanoseconds(until - t);
+  bool let_go = false;
+#if defined(_WIN32)
+  static HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+#endif
+  for (;;) {
+    if (g_true_coming.load(std::memory_order_relaxed)) {
+      let_go = true;
+      break;
+    }
+    const auto left = due - Clock::now();
+    if (left <= std::chrono::nanoseconds(0))
+      break;
+#if defined(_WIN32)
+    if (timer != nullptr && left > std::chrono::microseconds(700)) {
+      // in steps of at most half a millisecond, to see a true frame coming
+      const auto step = std::min<Clock::duration>(left - std::chrono::microseconds(500), std::chrono::microseconds(500));
+      LARGE_INTEGER when;
+      when.QuadPart = -std::chrono::duration_cast<std::chrono::nanoseconds>(step).count() / 100;
+      if (SetWaitableTimer(timer, &when, 0, nullptr, nullptr, FALSE))
+        WaitForSingleObject(timer, 10);
+      continue;
+    }
+#endif
+    std::this_thread::yield();
+  }
+  const auto end = Clock::now();
+  ++g_held;
+  g_let_go += let_go ? 1 : 0;
+  g_shifted += let_go ? 0 : 1;  // held to the next refresh's start
+  g_last_hold_ms = std::chrono::duration<double, std::milli>(end - now).count();
+  g_held_ms += g_last_hold_ms;
+  g_last_slot = std::max(want, g.slot(std::chrono::duration_cast<std::chrono::nanoseconds>(end.time_since_epoch()).count()));
+  if (aurora::gfx::stagelog::on())
+    aurora::gfx::stagelog::note("pace_hold", now, static_cast<std::uint64_t>(after));
+}
+
+Clock::time_point true_at() { return Clock::time_point(std::chrono::nanoseconds(g_true_ns.load(std::memory_order_relaxed))); }
+
+void start(void* window) {
+  const char* v = std::getenv("AURORA_PACE");
+  g_mode = v != nullptr ? std::atoi(v) : 0;
+  if (g_mode != 1 && g_mode != 2) {
+    g_mode = 0;
+    return;
+  }
+  if (const char* p = std::getenv("AURORA_PACE_PHASE_US"))
+    g_phase_ms = std::atof(p) / 1000.0;
+  if (const char* h = std::getenv("AURORA_PACE_HZ"); h && std::atof(h) > 1)
+    g_fallback_period_ms = 1000.0 / std::atof(h);
+  aurora::gfx::g_beforePresent = before_present;
+#if defined(_WIN32)
+  std::thread(vblank_thread, static_cast<HWND>(window)).detach();
+#endif
+  std::fprintf(stderr, "[aurora-present] pace: AURORA_PACE=%d, a held picture at %.2f ms into its refresh\n", g_mode, g_phase_ms);
+}
+} // namespace pace
 
 struct Picture {
   std::vector<std::uint8_t> rgba;
@@ -659,6 +874,7 @@ void run() {
   const bool discard = env_on("AURORA_DISCARD");
 
   aurora::gfx::timewarp::start();
+  pace::start(s->window);
   FILE* log = s->log_path.empty() ? nullptr : std::fopen(s->log_path.c_str(), "w");
   if (log)
     std::fprintf(log, "copy,in_us,start_us,fed_us,presented_us,picture_us,waiting,bytes,between\n");
@@ -725,9 +941,25 @@ void run() {
         // the first picture whose moment is still ahead by what a picture takes
         const double cost = s->redraw_cost_ms.load(std::memory_order_relaxed);
         const auto& pictures = redraw_for->pictures;
-        const double since = ms(now - last_true);
+        // AURORA_PACE=1: the moments are the refreshes after the true frame's present as the worker made it (it comes some
+        // ms after it was handed over), not after the hand-over
+        const bool paced = pace::g_mode == 1 && !redraw_shot_due(redraw_copy);
+        if (paced && pace::g_true_presented.load(std::memory_order_acquire) < pace::g_true_sent.load(std::memory_order_relaxed)) {
+          if (ms(now - last_true) > kFieldMs) {
+            ++s->redraw_no_request;
+            redraw_frame = false;
+            redraw_for.reset();
+            continue;
+          }
+          s->wake.wait_until(g, now + std::chrono::microseconds(250));
+          continue;
+        }
+        const Clock::time_point from = paced ? pace::true_at() : last_true;
+        const auto moment = [&](std::size_t i) { return pictures[i].fraction * kFieldMs; };
+        const double slack = kFieldMs / (pictures.size() + 1);
+        const double since = ms(now - from);
         // (a test's shot due: its picture is drawn late rather than passed)
-        while (!redraw_shot_due(redraw_copy) && redraw_next < pictures.size() && pictures[redraw_next].fraction * kFieldMs < since + cost - kFieldMs / (pictures.size() + 1)) {
+        while (!redraw_shot_due(redraw_copy) && redraw_next < pictures.size() && moment(redraw_next) < since + cost - slack) {
           ++s->redraw_passed;
           ++redraw_next;
         }
@@ -736,9 +968,11 @@ void run() {
           redraw_for.reset();
           continue;
         }
-        const double at = pictures[redraw_next].fraction * kFieldMs - cost;
+        // (paced: drawn as soon as the worker is free, and held there to its refresh, so that a later picture is not caught
+        // by the next true frame before it was drawn)
+        const double at = paced ? 0.0 : moment(redraw_next) - cost;
         if (since < at) {
-          s->wake.wait_until(g, last_true + std::chrono::microseconds(static_cast<long long>(at * 1000.0)));
+          s->wake.wait_until(g, from + std::chrono::microseconds(static_cast<long long>(at * 1000.0)));
           continue;
         }
         if (!aurora::gfx::render_worker::is_idle()) {
@@ -785,7 +1019,11 @@ void run() {
             save_shot("still");
             aurora_request_framebuffer_readback();
           }
-          if (!aurora::gx::redraw::draw_picture(*request, index))
+          pace::g_picture_fraction = shoot ? 0.0f : request->pictures[index].fraction;  // (a test's shot is never held)
+          pace::g_last_hold_ms = 0;
+          const bool drew = aurora::gx::redraw::draw_picture(*request, index);
+          pace::g_picture_fraction = 0;
+          if (!drew)
             return;
           const auto done = Clock::now();
           if (shoot) {
@@ -817,7 +1055,7 @@ void run() {
               }
             aurora::gx::redraw::test_uncorrected(0);
           }
-          const double took = ms(done - began);
+          const double took = ms(done - began) - pace::g_last_hold_ms;
           if (!shoot)  // (a test's shot waits for its read-backs: not a picture's cost)
             s->redraw_cost_ms.store(s->redraw_cost_ms.load(std::memory_order_relaxed) * 0.9 + took * 0.1, std::memory_order_relaxed);
           s->redraw_cost_sum += took;
@@ -933,6 +1171,8 @@ void run() {
       asked_copy = f.copy;
     }
     aurora::gfx::timewarp::true_frame_coming();
+    pace::g_true_coming.store(true, std::memory_order_relaxed);
+    pace::g_true_sent.fetch_add(1, std::memory_order_relaxed);
     aurora_backend_present();
     aurora::gfx::timewarp::true_frame_done();
     if (aurora::gx::redraw::g_on) {
@@ -1007,6 +1247,11 @@ void run() {
                  s->between_late ? s->between_late_ms / static_cast<double>(s->between_late) : 0.0,
                  static_cast<unsigned long long>(s->between_left_out),
                  static_cast<unsigned long long>(s->between_out_true_waits));
+  if (pace::g_mode != 0)
+    std::fprintf(stderr, "[aurora-present] pace: pictures between held %llu (%.2f ms on average, %llu let go for a true frame), its refresh free %llu, held to the next refresh %llu\n",
+                 static_cast<unsigned long long>(pace::g_held), pace::g_held ? pace::g_held_ms / static_cast<double>(pace::g_held) : 0.0,
+                 static_cast<unsigned long long>(pace::g_let_go), static_cast<unsigned long long>(pace::g_on_time),
+                 static_cast<unsigned long long>(pace::g_shifted));
   if (s->frames_not_drawn != 0)
     std::fprintf(stderr, "[aurora-present] %llu frames not drawn, to catch up\n",
                  static_cast<unsigned long long>(s->frames_not_drawn));
@@ -1204,6 +1449,7 @@ void aurora_present_stats(AuroraPresentStats* out) {
 
 void aurora_present_stop(void) {
   model_pipelines_stop();
+  pace::g_quit.store(true, std::memory_order_relaxed);
   if (s == nullptr)
     return;
   {
