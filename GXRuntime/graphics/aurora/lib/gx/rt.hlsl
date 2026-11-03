@@ -611,6 +611,35 @@ Up up_at(int2 c, float dist, float3 N) {
 #define GATE_MEAN 0
 #endif
 static const int GateMin = (int)(GATE_MIN + 0.5);
+// Speed switches (rt-speed 2026-11-03), all 0 by default: the look as before.
+// MATTE_HALF (AURORA_RT_MATTE_HALF=1): a matte surface's mirror ray (no reflection layer of the game's, spread by MatteRough) is traced on half the
+// light pixels, a fixed checkerboard; main's upscale already takes only the light pixels that traced one (WriteRefl's alpha), so the other half reads
+// its neighbours'. A full or part reflection layer keeps a ray on every light pixel.
+#ifndef MATTE_HALF
+#define MATTE_HALF 0
+#endif
+// ONE_UP (AURORA_RT_ONE_UP=1): main finds a pixel's four light pixels once for light and reflection (the same weights both read): same picture, less work.
+#ifndef ONE_UP
+#define ONE_UP 0
+#endif
+// BAKE_BOUND (AURORA_RT_BAKE_BOUND=1, a measure only, not a look): light_pass casts no sky/bounce rays, as if a bake gave them; open sky, no bounce.
+// The sun's shadow ray and the mirror ray stay. With the denoiser's own time it bounds what a course-light bake could save.
+// MAIN_PROBE (a measure only, never a look; shader define, no switch): 1 main stops at the camera ray's hit; 2 also the material read at the
+// hit (own, around, softer, gate) and stops before lights and reflection; 3 all but the layer pass's look after the loop
+#ifndef MAIN_PROBE
+#define MAIN_PROBE 0
+#endif
+// DEPTH_WINDOW (shader define; rt-speed): main's camera ray looks first only in a window around the depth the light pass already found for
+// the four light pixels around it (Guide.z), when they agree within DepthAgree; slack DepthSlack each side. A look that finds nothing accepted in
+// the window starts over from the camera as before, so only a surface the light pixels all missed in front of the window can differ (a thing
+// thinner than a light pixel). Tuned, not derived.
+#ifndef DEPTH_WINDOW
+#define DEPTH_WINDOW 0
+#endif
+static const float DepthAgree = 0.05, DepthSlack = 0.03;
+#ifndef BAKE_BOUND
+#define BAKE_BOUND 0
+#endif
 // the raster's luminance at picture pixel c (Before when it holds the picture from before the last blends), the darkest within r around, or their mean
 float darkest_seen(int2 c, float2 rasterDim, int r, bool mean = false) {
   float least = 1e9, sum = 0;
@@ -653,6 +682,27 @@ void main(uint3 id : SV_DispatchThreadID) {
         return;
       }
     }
+    float winHi = 100000;
+    bool win = false;
+    if (DEPTH_WINDOW && DP.half != 0 && DP.denoised != 0 && P.spp == 1) {
+      float2 f = (id.xy + 0.5) / DP.litScale - 0.5;
+      int2 b = int2(floor(f));
+      uint gw, gh;
+      Guide.GetDimensions(gw, gh);
+      float lo = 1e30, hi = 0;
+      bool ok = true;
+      for (int k = 0; k < 4; ++k) {
+        float gz = Guide[clamp(b + int2(k & 1, k >> 1), int2(0, 0), int2(gw - 1, gh - 1))].z;
+        ok = ok && gz > 0;
+        lo = min(lo, gz), hi = max(hi, gz);
+      }
+      if (ok && hi < lo * (1 + DepthAgree)) {
+        const float perZ = 1 / max(-v.z, 1e-4);
+        tmin = max(tmin, lo * (1 - DepthSlack) * perZ);
+        winHi = hi * (1 + DepthSlack) * perZ + 0.05;
+        win = true;
+      }
+    }
     float gapAt = -1;  // AURORA_RT_PAIR_GAP: >= 0 when this look is the window for draws around a drawn placement's hit there
     float surfT = 100000;  // AURORA_RT_LAYER_PASS: where the pixel's surface is, for the layers in front of it
     const float3 lightBefore = light;
@@ -661,10 +711,14 @@ void main(uint3 id : SV_DispatchThreadID) {
       const bool gapLook = gapAt >= 0;
       const float gapT = gapAt, gapR = PairGapLeast + gapAt * PairGapShare;
       gapAt = -1;
-      RayDesc ray; ray.Origin = 0; ray.Direction = v; ray.TMin = gapLook ? max(gapT - gapR, 0.01) : tmin; ray.TMax = gapLook ? gapT + gapR : 100000;
+      RayDesc ray; ray.Origin = 0; ray.Direction = v; ray.TMin = gapLook ? max(gapT - gapR, 0.01) : tmin; ray.TMax = gapLook ? gapT + gapR : (win ? winHi : 100000);
       q.TraceRayInline(Scene, RAY_FLAG_NONE, gapLook ? gap_mask() : MaskPrimary, ray);
       q.Proceed();
-      if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) { if (gapLook) continue; break; }
+      if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) {
+        if (gapLook) continue;
+        if (win) { win = false; tmin = 0.01; continue; }  // DEPTH_WINDOW: nothing in the window, the whole ray as before
+        break;
+      }
       float t = q.CommittedRayT();
       Hit h;
       const bool worldHit = q.CommittedInstanceID() >= WorldId;
@@ -686,6 +740,7 @@ void main(uint3 id : SV_DispatchThreadID) {
       }
       hitDepth = t;
       surfT = t;
+      if (MAIN_PROBE == 1) break;
       // a card turned to the picture, the game's overlay in the world (AURORA_RT_HUD_SKIP, rt_rules.hpp faces_picture): no light, no reflection; only this ray meets it
       if ((d.highlight & 16) != 0) break;
       float3 N = h.nrm;
@@ -724,6 +779,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         const float seenL = GateMin > 0 ? darkest_seen(id.xy, rasterDim, GateMin, GATE_MEAN != 0) : lum((P.stableShine & 2) != 0 ? Before[id.xy].rgb : raster);
         float bareM = 1 - smoothstep(0.15, 0.45, seenL - gateL);
+        if (MAIN_PROBE == 2) { term = (fr * bareM * 1e-6).xxx; break; }
+        Up u1 = (Up)0; bool haveU = false;  // ONE_UP
         if (P.lightGain > 0 && (d.highlight & 4) == 0) light += engine_light(h.pos, N) * P.lightGain * bareM;
         if (P.glowGain > 0 && (d.highlight & 6) == 0) light += glow_light(h.pos, N) * P.glowGain * bareM;
         if (P.glowShow != 0 && (d.highlight & 2) != 0) { sum = float3(1, -1, 1); light = 0; break; }
@@ -732,6 +789,7 @@ void main(uint3 id : SV_DispatchThreadID) {
           if (DP.denoised != 0) {
             if (DP.half != 0) {
               Up u = up_at(id.xy, -h.pos.z, N);
+              if (ONE_UP) { u1 = u; haveU = true; }
               float4 a = UP_READ(ReadOpen, u), b = UP_READ(ReadSky, u);
               f = lit_factor(a.a, a.rgb, b.rgb, max(UP_READ(Guide, u).w, 0));
             } else {
@@ -749,7 +807,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         if (DP.half != 0 ? fr > MatReflLeast : fr > 0.002) {
           float3 seen;
           if (DP.half != 0) {
-            Up u = up_at(id.xy, -h.pos.z, N);
+            Up u;
+            if (ONE_UP && haveU) u = u1;
+            else u = up_at(id.xy, -h.pos.z, N);
             float4 s = UP_READ(WriteRefl, u);
             seen = s.a > 0.01 ? s.rgb / s.a : raster;
           } else {
@@ -802,7 +862,7 @@ void main(uint3 id : SV_DispatchThreadID) {
       }
       break;
     }
-    const float shows = layer_pass_on() ? layer_through(0.xxx, v, 0.01, surfT, 0) : 1;
+    const float shows = layer_pass_on() && (MAIN_PROBE == 0) ? layer_through(0.xxx, v, 0.01, surfT, 0) : 1;
     if (shows < 1) {
       // the part the layers cover: the open sky's light, a share of it, on the layers' own colour as the raster has it
       const float3 sky = P.lightRays > 0 ? lit_factor(1, 0.xxx, 0.xxx, 0) : 1.xxx;
@@ -875,7 +935,8 @@ void light_pass(uint3 id : SV_DispatchThreadID) {
     if ((d.highlight & 6) == 0) {
       float2 xi = float2(noise_at(id.xy) + P.frame * 0.7548777, noise_at(id.xy + float2(47, 17)) + P.frame * 0.5698403);
       float open; float3 bounce, skySeen;
-      light_rays(h.pos, N, t, xi, open, bounce, skySeen);
+      if (BAKE_BOUND) open = 1, bounce = 0, skySeen = 0.25.xxx;  // (a bake reads its sky from a table: no ray)
+      else light_rays(h.pos, N, t, xi, open, bounce, skySeen);
       ReadOpen[id.xy] = float4(bounce, open);
       ReadSky[id.xy] = float4(skySeen, 0);
       sunV = sun_term(h.pos, N, t);
@@ -894,7 +955,7 @@ void light_pass(uint3 id : SV_DispatchThreadID) {
       float gloss = lerp(MatteRise + 0.5 * MatPale * pale, MatLayerRise, layer);
       float f0 = 0.04 + MatMetal * layer;
       float fr = (f0 + max(gloss - f0, 0) * pow(1 - cosv, 5)) * shine;
-      if (fr > MatReflLeast)
+      if (fr > MatReflLeast && !(MATTE_HALF && layer <= 0 && ((id.x + id.y) & 1) != 0))
         WriteRefl[id.xy] = float4(min(trace_reflection(h.pos + N * 0.03, matte_dir(v, N, layer, id.xy), 8.0 / max(P.size.y, 1) * 512.0 / 4.0 * DP.litScale), 2.0), 1);
     }
     Guide[id.xy] = float4(oct_of(N), -h.pos.z, sunV);
