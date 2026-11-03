@@ -249,6 +249,8 @@ bool g_keep = false;
 double g_phase_ms = 0.3, g_fallback_period_ms = 1000.0 / 240.0;
 std::atomic<long long> g_vblank_ns{0};    // the last refresh seen (steady_clock ns)
 std::atomic<long long> g_period_ns{0};    // its measured period
+std::atomic<long long> g_vblank_count{0}; // refreshes seen (AURORA_PRESENT_OVERLAP: slots counted from the start, not from the last one)
+bool g_absolute = false;
 std::atomic<bool> g_true_coming{false};   // a true frame is on its way to the render worker
 std::atomic<bool> g_quit{false};
 // the true frame's present as the worker made it, for Aurora's thread to time the pictures after it by: how many true frames
@@ -329,7 +331,9 @@ void vblank_thread(HWND window) {
       }
     }
     last = t;
-    g_vblank_ns.store(t, std::memory_order_relaxed);
+    g_vblank_count.fetch_add(1, std::memory_order_acq_rel);
+    g_vblank_ns.store(t, std::memory_order_release);
+    g_vblank_count.fetch_add(1, std::memory_order_acq_rel);
   }
   if (output)
     output->Release();
@@ -338,15 +342,28 @@ void vblank_thread(HWND window) {
 #endif
 
 // the refresh a time is in, counted from a refresh seen (its boundary g_phase_ms after the vblank), and the time one begins
+// (today's slots count from the last refresh seen, which moves; AURORA_PRESENT_OVERLAP counts them from the first, so that a slot kept
+// from one present compares with the next present's)
 struct Grid {
-  long long origin = 0, period = 0;
-  long long slot(long long t) const { return (t - origin) >= 0 ? (t - origin) / period : -((origin - t + period - 1) / period); }
-  long long start(long long k) const { return origin + k * period; }
+  long long origin = 0, period = 0, base = 0;
+  long long slot(long long t) const { return base + ((t - origin) >= 0 ? (t - origin) / period : -((origin - t + period - 1) / period)); }
+  long long start(long long k) const { return origin + (k - base) * period; }
 };
 Grid grid() {
   Grid g;
   g.period = g_period_ns.load(std::memory_order_relaxed);
-  const long long v = g_vblank_ns.load(std::memory_order_relaxed);
+  long long v = g_vblank_ns.load(std::memory_order_relaxed);
+  if (g_absolute) {
+    for (int tries = 0; tries < 8; ++tries) {
+      const long long c1 = g_vblank_count.load(std::memory_order_acquire);
+      v = g_vblank_ns.load(std::memory_order_acquire);
+      const long long c2 = g_vblank_count.load(std::memory_order_acquire);
+      if (c1 == c2 && (c1 & 1) == 0) {
+        g.base = c1 / 2;
+        break;
+      }
+    }
+  }
   if (g.period > 0 && v != 0) {
     g.origin = v + static_cast<long long>(g_phase_ms * 1e6);
   } else {
@@ -439,6 +456,7 @@ void start(void* window, bool overlap) {
   const char* v = std::getenv("AURORA_PACE");
   g_mode = v != nullptr ? std::atoi(v) : 0;
   if (overlap) {
+    g_absolute = true;
     if (const char* b = std::getenv("AURORA_PRESENT_OVERLAP_BASE_US")) {
       g_overlap_gpu = std::strcmp(b, "gpu") == 0;
       g_overlap_base_ns = g_overlap_gpu ? 0 : static_cast<long long>(std::atof(b) * 1000.0);
