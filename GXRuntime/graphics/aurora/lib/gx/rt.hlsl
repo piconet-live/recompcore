@@ -527,7 +527,21 @@ float3 lit_factor(float open, float3 bounce, float3 skySeen, float sunTerm) {
 }
 // Tuned by eye, the material rule's numbers
 static const float MatGapLow = 0.45, MatGapHigh = 0.95; // own brightness against the texture around it: where shine starts and is full
-static const float MatMatte = 0.2, MatPale = 0.1;      // how far Fresnel rises at a grazing view: any surface, and more if pale
+static const float MatMatte = 0.2, MatPale = 0.1;
+// Matte (owner 2026-11-03: "the roads almost feel like they have a smooth metal finish when they should probably be more matte"): a surface without
+// the game's own reflection layer rises less at a grazing view (MatteRise in place of MatMatte, half of MatPale) and its mirror ray spreads by
+// MatteRough, led by the pixel's own fixed noise so it doesn't shimmer; a full reflection layer keeps the mirror. Tuned by eye; MatteRough 0 and
+// MatteRise 0.2 give the old look back.
+static const float MatteRise = 0.08, MatteRough = 0.3;
+float matte_noise(float2 p) { return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715)))); }
+float3 matte_dir(float3 v, float3 N, float layer, float2 px) {
+  float3 R = reflect(v, N);
+  float r = MatteRough * (1 - layer);
+  if (r <= 0) return R;
+  float3 j = float3(matte_noise(px), matte_noise(px + float2(13, 71)), matte_noise(px + float2(91, 29))) * 2 - 1;
+  float3 D = normalize(R + j * r);
+  return dot(D, N) > 0.02 ? D : R;
+}      // how far Fresnel rises at a grazing view: any surface, and more if pale
 static const float MatLayerRise = 0.6;                  // how far Fresnel rises on a full reflection layer: the layer is already the game's own shine
 static const float MatMetal = 0.15;                      // base reflectance a full reflection layer adds to 0.04
 // AURORA_RT_SHINE_STABLE=1, tuned: the gap test reads the texture this many levels softer, so a dimple's lit rim doesn't take shine a pixel at a time; a reflection adds at most this share of the surface's own brightness (with a floor, so dark road still shows neon)
@@ -697,7 +711,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         float most = max(around.r, max(around.g, around.b)), least = min(around.r, min(around.g, around.b));
         float pale = smoothstep(0.5, 0.9, most) * (1 - saturate((most - least) / max(most, 0.02)));
         float layer = saturate(k);
-        float gloss = lerp(MatMatte + MatPale * pale, MatLayerRise, layer);
+        float gloss = lerp(MatteRise + 0.5 * MatPale * pale, MatLayerRise, layer);
         float f0 = 0.04 + MatMetal * layer;
         float fr = (f0 + max(gloss - f0, 0) * pow(1 - cosv, 5)) * shine;
         float gateL = ownL;
@@ -739,7 +753,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             float4 s = UP_READ(WriteRefl, u);
             seen = s.a > 0.01 ? s.rgb / s.a : raster;
           } else {
-          float3 R = reflect(v, N);
+          float3 R = matte_dir(v, N, layer, id.xy);
           seen = trace_reflection(h.pos + N * 0.03, R, 8.0 / max(P.size.y, 1) * 512.0 / 4.0);
           seen = min(seen, 2.0);
           }
@@ -877,11 +891,11 @@ void light_pass(uint3 id : SV_DispatchThreadID) {
       float most = max(around.r, max(around.g, around.b)), least = min(around.r, min(around.g, around.b));
       float pale = smoothstep(0.5, 0.9, most) * (1 - saturate((most - least) / max(most, 0.02)));
       float layer = saturate(d.strength);
-      float gloss = lerp(MatMatte + MatPale * pale, MatLayerRise, layer);
+      float gloss = lerp(MatteRise + 0.5 * MatPale * pale, MatLayerRise, layer);
       float f0 = 0.04 + MatMetal * layer;
       float fr = (f0 + max(gloss - f0, 0) * pow(1 - cosv, 5)) * shine;
       if (fr > MatReflLeast)
-        WriteRefl[id.xy] = float4(min(trace_reflection(h.pos + N * 0.03, reflect(v, N), 8.0 / max(P.size.y, 1) * 512.0 / 4.0 * DP.litScale), 2.0), 1);
+        WriteRefl[id.xy] = float4(min(trace_reflection(h.pos + N * 0.03, matte_dir(v, N, layer, id.xy), 8.0 / max(P.size.y, 1) * 512.0 / 4.0 * DP.litScale), 2.0), 1);
     }
     Guide[id.xy] = float4(oct_of(N), -h.pos.z, sunV);
     break;
