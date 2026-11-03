@@ -206,6 +206,14 @@ struct State {
   std::unique_ptr<Job> pending;
   bool drawThis = false;
   wgpu::CommandBuffer first;
+  // AURORA_PRESENT_OVERLAP: what pictures between read of the held frame, taken when it was submitted (the next frame's task() sets the
+  // live ones while it records), and their own first command buffer (the next frame's first waits in `first` for its submit)
+  struct Held {
+    wgpu::Texture lastColor;
+    bool drawThis = false, haveTerm = false;
+    float lastView[10]{};
+  } held;
+  wgpu::CommandBuffer firstBetween;
   bool outputOpen = false;
 
   double msTrace = 0, msGpu = 0, msComposeWait = 0, msBuild = 0, msRules = 0, msTranslate = 0;
@@ -1316,9 +1324,10 @@ void run_between() {
   BetweenParams& b = g.betweenParams;
   b.size[0] = static_cast<float>(g.rw), b.size[1] = static_cast<float>(g.rh);
   b.rectXY[0] = b.rectXY[1] = 0;
-  b.rectWH[0] = g.lastView[0], b.rectWH[1] = g.lastView[1];
-  b.vpXY[0] = g.lastView[2], b.vpXY[1] = g.lastView[3], b.vpWH[0] = g.lastView[4], b.vpWH[1] = g.lastView[5];
-  b.pScale[0] = g.lastView[6], b.pScale[1] = g.lastView[7], b.pOffset[0] = g.lastView[8], b.pOffset[1] = g.lastView[9];
+  const float* lastView = gfx::g_overlap ? g.held.lastView : g.lastView;
+  b.rectWH[0] = lastView[0], b.rectWH[1] = lastView[1];
+  b.vpXY[0] = lastView[2], b.vpXY[1] = lastView[3], b.vpWH[0] = lastView[4], b.vpWH[1] = lastView[5];
+  b.pScale[0] = lastView[6], b.pScale[1] = lastView[7], b.pOffset[0] = lastView[8], b.pOffset[1] = lastView[9];
   std::memcpy(s.betweenMap, &b, sizeof b);
   RT_HR(s.alloc->Reset());
   RT_HR(s.cl->Reset(s.alloc.Get(), nullptr));
@@ -1350,7 +1359,7 @@ void run_between() {
     t.Transition.StateAfter = toRead ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     cl->ResourceBarrier(1, &t);
   };
-  const bool rayed = g.haveTerm;
+  const bool rayed = gfx::g_overlap ? g.held.haveTerm : g.haveTerm;
   transition(g.termRes.Get(), true);
   if (rayed) {
     cl->SetComputeRootConstantBufferView(9, s.betweenConstants->GetGPUVirtualAddress());
@@ -1612,12 +1621,14 @@ void task(const gfx::EncoderTaskContext& ctx, const wgpu::CommandEncoder& cmd, c
 void between_task(wgpu::CommandEncoder& cmd, gfx::EncoderTaskId type) {
   if (type != g.task)  // (the before-blends snapshot is the true frame's alone)
     return;
-  if (g.failed || !g.ready || !g.drawThis || !g.lastColor || !g.input || !g.termBetween)
+  const bool drawThis = gfx::g_overlap ? g.held.drawThis : g.drawThis;
+  const wgpu::Texture& lastColor = gfx::g_overlap ? g.held.lastColor : g.lastColor;
+  if (g.failed || !g.ready || !drawThis || !lastColor || !g.input || !g.termBetween)
     return;
-  const wgpu::TexelCopyTextureInfo src{.texture = g.lastColor}, dst{.texture = g.input};
+  const wgpu::TexelCopyTextureInfo src{.texture = lastColor}, dst{.texture = g.input};
   const wgpu::Extent3D size{.width = g.w, .height = g.h, .depthOrArrayLayers = 1};
   cmd.CopyTextureToTexture(&src, &dst, &size);
-  g.first = cmd.Finish();
+  (gfx::g_overlap ? g.firstBetween : g.first) = cmd.Finish();
   cmd = webgpu::g_device.CreateCommandEncoder();
   g.pendingBetween = true;
 }
@@ -1638,7 +1649,7 @@ void before_task(const gfx::EncoderTaskContext&, const wgpu::CommandEncoder& cmd
 }
 
 void draw(const gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass, const void*, size_t, void*) {
-  if (g.failed || !g.bind || !g.drawThis)
+  if (g.failed || !g.bind || !(gfx::g_overlap && gfx::g_drawingBetween ? g.held.drawThis : g.drawThis))
     return;
   if (!g.pipeline || g.pipelineKey != ctx.layout.key) {
     static const char* source = R"(
@@ -1769,6 +1780,20 @@ void between_set(const redraw::Request& q, std::size_t index) {
 }
 
 void before_frame_submit() {
+  if (gfx::g_overlap && gfx::g_drawingBetween) {
+    // a picture between: never the next frame's job or first part (they may be recorded already)
+    if (g.pendingBetween && !g.failed) {
+      g.pendingBetween = false;
+      begin_access(g.inputMem, g.input);
+      webgpu::g_queue.Submit(1, &g.firstBetween);
+      g.firstBetween = {};
+      end_access(g.inputMem, g.input);
+      run_between();
+      begin_access(g.outputMem, g.output);
+      g.outputOpen = true;
+    }
+    return;
+  }
   if (g.pendingBetween && !g.failed) {
     g.pendingBetween = false;
     begin_access(g.inputMem, g.input);
@@ -1819,6 +1844,13 @@ void after_frame_submit() {
   if (g.outputOpen) {
     end_access(g.outputMem, g.output);
     g.outputOpen = false;
+  }
+  if (gfx::g_overlap && !gfx::g_drawingBetween) {
+    // a true frame submitted: what its pictures between read
+    g.held.lastColor = g.lastColor;
+    g.held.drawThis = g.drawThis;
+    g.held.haveTerm = g.haveTerm;
+    std::memcpy(g.held.lastView, g.lastView, sizeof g.lastView);
   }
 }
 bool failed() noexcept { return g.failed; }

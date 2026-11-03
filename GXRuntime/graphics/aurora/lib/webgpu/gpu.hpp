@@ -81,6 +81,9 @@ const TextureWithSampler& present_source() noexcept;
 // The display (XFB) copy's texture as the present source, from the frame it was made on (render worker only).
 void set_present_override(const wgpu::Texture& texture, const wgpu::TextureView& view, wgpu::Extent3D size,
                           wgpu::TextureFormat format) noexcept;
+// AURORA_PRESENT_OVERLAP: a picture between keeps the next frame's display copy as the present source (render worker only)
+TextureWithSampler present_override() noexcept;
+void restore_present_override(const TextureWithSampler& saved) noexcept;
 wgpu::BindGroup create_copy_bind_group(const TextureWithSampler& source);
 void set_resampler(AuroraSampler sampler) noexcept;
 AuroraSampler get_resampler() noexcept;

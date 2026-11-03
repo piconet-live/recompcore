@@ -361,6 +361,9 @@ void set_present_override(const wgpu::Texture& texture, const wgpu::TextureView&
   };
 }
 
+TextureWithSampler present_override() noexcept { return g_presentOverride; }
+void restore_present_override(const TextureWithSampler& saved) noexcept { g_presentOverride = saved; }
+
 const TextureWithSampler& present_source() noexcept {
   if (g_presentOverride.texture) {
     return g_presentOverride;

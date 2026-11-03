@@ -710,10 +710,31 @@ void redraw_write_vertices(uint32_t at, const uint8_t* data, size_t bytes) {
   g_queue.WriteBuffer(g_resources.vertexBuffer, at, data, bytes);
 }
 
+namespace {
+std::atomic<uint64_t> g_framesEnded{0}, g_frameHeld{0};
+} // namespace
+uint64_t frames_ended() noexcept { return g_framesEnded.load(std::memory_order_acquire); }
+uint64_t frame_held() noexcept { return g_frameHeld.load(std::memory_order_acquire); }
+
 bool redraw_held(const std::function<void(uint8_t* uniforms, size_t bytes)>& patch, const std::vector<uint32_t>* blocks) {
   if (!g_heldCallback || g_held.ops.empty()) {
     return false;
   }
+  // AURORA_PRESENT_OVERLAP: the next frame's passes may already be encoded (its display copy set as the present source): this
+  // picture presents its own and leaves the next frame's in place
+  struct Between {
+    webgpu::TextureWithSampler saved;
+    Between() {
+      g_drawingBetween = true;
+      if (g_overlap)
+        saved = webgpu::present_override();
+    }
+    ~Between() {
+      g_drawingBetween = false;
+      if (g_overlap)
+        webgpu::restore_present_override(saved);
+    }
+  } between;
   if (blocks != nullptr) {
     {
       stagelog::Scope t{"rd_patch"};
@@ -791,7 +812,8 @@ void end_frame(EndFrameCallback callback) {
   if (gx::redraw::g_on) {
     notes = gx::redraw::take_notes();
   }
-  render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, callback = std::move(callback), notes = std::move(notes)]() mutable {
+  const uint64_t ended = g_framesEnded.fetch_add(1, std::memory_order_acq_rel) + 1;
+  render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, ended, callback = std::move(callback), notes = std::move(notes)]() mutable {
     auto& packet = g_framePackets[frameSlot];
     if (gx::redraw::g_on) {
       stagelog::Scope keepTime{"ef_keep"};
@@ -809,6 +831,7 @@ void end_frame(EndFrameCallback callback) {
     auto afterSubmitCallbacks = std::move(packet.afterSubmitCallbacks);
     if (gx::redraw::g_on) {
       g_held = std::move(packet);
+      g_frameHeld.store(ended, std::memory_order_release);
       g_heldCallback = callback;
       g_patchedHeld = false;
       forget_redraw_bundles();

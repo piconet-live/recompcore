@@ -94,6 +94,15 @@ extern void (*g_afterFrameSubmit)();
 // Just before a picture's Present, on the render worker, outside the surface lock (AURORA_PACE: a picture between held to its refresh)
 extern void (*g_beforePresent)();
 extern void (*g_betweenTask)(wgpu::CommandEncoder& cmd, EncoderTaskId type);  // AURORA_REDRAW: a picture between reaches the frame's ray tracing task
+// AURORA_PRESENT_OVERLAP=1: pictures between of the held frame go on while the next frame records (its passes encoded on the render
+// worker between them). g_overlap: the switch (set once at start). g_drawingBetween: the render worker is inside a picture between
+// (redraw_held). g_afterDrain: on Aurora's thread, when a frame's stream is decoded, before its end is handed to the worker.
+extern bool g_overlap;
+extern bool g_drawingBetween;
+extern void (*g_afterDrain)();
+// the frames ended (Aurora's thread counts them as it hands each end to the worker) and the one held for pictures between (the worker's)
+uint64_t frames_ended() noexcept;
+uint64_t frame_held() noexcept;
 
 struct EncoderTaskContext {
   wgpu::Device device;

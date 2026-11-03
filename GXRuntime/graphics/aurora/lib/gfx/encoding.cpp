@@ -38,6 +38,9 @@ void (*g_beforeFrameSubmit)() = nullptr;
 void (*g_betweenTask)(wgpu::CommandEncoder& cmd, EncoderTaskId type) = nullptr;
 void (*g_afterFrameSubmit)() = nullptr;
 void (*g_beforePresent)() = nullptr;
+bool g_overlap = false;
+bool g_drawingBetween = false;
+void (*g_afterDrain)() = nullptr;
 
 namespace {
 constexpr Module Log{"aurora::gfx"};

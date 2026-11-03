@@ -50,6 +50,9 @@ static uint64_t timing_now_ns() {
 }
 extern "C" uint64_t aurora_timing_last_submit_ns() { return g_timingSubmitNs.load(std::memory_order_acquire); }
 extern "C" uint64_t aurora_timing_last_gpu_done_ns() { return g_timingGpuDoneNs.load(std::memory_order_acquire); }
+// a true frame's (not a picture between's) GPU done after its submit, smoothed (AURORA_PRESENT_OVERLAP times pictures from it)
+static std::atomic<uint64_t> g_timingTrueLagNs{0};
+extern "C" uint64_t aurora_timing_true_gpu_lag_ns() { return g_timingTrueLagNs.load(std::memory_order_acquire); }
 
 namespace aurora {
 AuroraConfig g_config;
@@ -289,6 +292,8 @@ void end_frame() noexcept {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
   { gfx::stagelog::Scope t{"drain"}; gx::fifo::drain(); }
+  if (gfx::g_afterDrain != nullptr)
+    gfx::g_afterDrain();
   gx::fifo::end_frame();
   gx::texture::end_frame();
   { gfx::stagelog::Scope t{"finish"}; gfx::finish(); }
@@ -441,11 +446,25 @@ void end_frame() noexcept {
       g_queue.Submit(1, &buffer);
       if (gfx::g_afterFrameSubmit != nullptr)
         gfx::g_afterFrameSubmit();
-      g_timingSubmitNs.store(timing_now_ns(), std::memory_order_release);
-      g_queue.OnSubmittedWorkDone(wgpu::CallbackMode::AllowSpontaneous,
-                                  [](wgpu::QueueWorkDoneStatus, wgpu::StringView) {
-                                    g_timingGpuDoneNs.store(timing_now_ns(), std::memory_order_release);
-                                  });
+      const uint64_t submitNs = timing_now_ns();
+      g_timingSubmitNs.store(submitNs, std::memory_order_release);
+      if (gfx::g_overlap && !gfx::g_drawingBetween) {
+        g_queue.OnSubmittedWorkDone(wgpu::CallbackMode::AllowSpontaneous,
+                                    [submitNs](wgpu::QueueWorkDoneStatus, wgpu::StringView) {
+                                      const uint64_t done = timing_now_ns();
+                                      g_timingGpuDoneNs.store(done, std::memory_order_release);
+                                      const uint64_t lag = done > submitNs ? done - submitNs : 0, was = g_timingTrueLagNs.load();
+                                      g_timingTrueLagNs.store(was == 0 ? lag : was + (static_cast<int64_t>(lag) - static_cast<int64_t>(was)) / 8,
+                                                              std::memory_order_release);
+                                      if (gfx::stagelog::on())
+                                        gfx::stagelog::note("true_gpu_lag", std::chrono::steady_clock::now(), lag / 1000);
+                                    });
+      } else {
+        g_queue.OnSubmittedWorkDone(wgpu::CallbackMode::AllowSpontaneous,
+                                    [](wgpu::QueueWorkDoneStatus, wgpu::StringView) {
+                                      g_timingGpuDoneNs.store(timing_now_ns(), std::memory_order_release);
+                                    });
+      }
     }
     {
       gfx::stagelog::Scope readbackTime{"ef_readback"};
