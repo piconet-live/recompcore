@@ -1,4 +1,6 @@
 #include "gfx/stagelog.hpp"
+
+#include <optional>
 #include <aurora/aurora.h>
 #include <aurora/time.hpp>
 
@@ -50,6 +52,9 @@ static uint64_t timing_now_ns() {
 }
 extern "C" uint64_t aurora_timing_last_submit_ns() { return g_timingSubmitNs.load(std::memory_order_acquire); }
 extern "C" uint64_t aurora_timing_last_gpu_done_ns() { return g_timingGpuDoneNs.load(std::memory_order_acquire); }
+// a true frame's (not a picture between's) GPU done after its submit, smoothed (AURORA_PRESENT_OVERLAP times pictures from it)
+static std::atomic<uint64_t> g_timingTrueLagNs{0};
+extern "C" uint64_t aurora_timing_true_gpu_lag_ns() { return g_timingTrueLagNs.load(std::memory_order_acquire); }
 
 namespace aurora {
 AuroraConfig g_config;
@@ -289,6 +294,8 @@ void end_frame() noexcept {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
   { gfx::stagelog::Scope t{"drain"}; gx::fifo::drain(); }
+  if (gfx::g_afterDrain != nullptr)
+    gfx::g_afterDrain();
   gx::fifo::end_frame();
   gx::texture::end_frame();
   { gfx::stagelog::Scope t{"finish"}; gfx::finish(); }
@@ -319,6 +326,15 @@ void end_frame() noexcept {
     wgpu::Texture currentTexture;
     wgpu::TextureView currentView;
     auto surfaceStatus = wgpu::SurfaceGetCurrentTextureStatus::Error;
+    // (AURORA_STAGELOG: a picture between's tail in parts, rd_t_*; a true frame's has its own rows)
+    struct Part {
+      std::optional<gfx::stagelog::Scope> scope;
+      explicit Part(const char* what) {
+        if (gfx::g_drawingBetween)
+          scope.emplace(what);
+      }
+    };
+    std::optional<Part> part{std::in_place, "rd_t_acquire"};
     {
       window::SurfaceLock surfaceLock;
       if (window::is_presentable() && g_surface) {
@@ -335,6 +351,7 @@ void end_frame() noexcept {
     }
 
     const bool canPresent = currentTexture && currentView;
+    part.emplace("rd_t_passes");
     if (canPresent) {
       // This frame's present source is known only here, on the render worker after its passes were encoded (the
       // display copy sets it); the main thread's viewport came from a frame before (or the EFB's 640x480 at the
@@ -430,33 +447,56 @@ void end_frame() noexcept {
     const wgpu::CommandBufferDescriptor cmdBufDescriptor{.label = "Redraw command buffer"};
     wgpu::CommandBuffer buffer;
     {
+      part.emplace("rd_t_finish");
       gfx::stagelog::Scope finishTime{"ef_finish"};
       buffer = encoder.Finish(&cmdBufDescriptor);
     }
     {
       ZoneScopedN("Queue Submit");
+      part.emplace("rd_t_before");
       if (gfx::g_beforeFrameSubmit != nullptr)
         gfx::g_beforeFrameSubmit();
+      part.emplace("rd_t_submit");
       gfx::stagelog::Scope submitTime{"submit"};
       g_queue.Submit(1, &buffer);
+      part.emplace("rd_t_after");
       if (gfx::g_afterFrameSubmit != nullptr)
         gfx::g_afterFrameSubmit();
-      g_timingSubmitNs.store(timing_now_ns(), std::memory_order_release);
-      g_queue.OnSubmittedWorkDone(wgpu::CallbackMode::AllowSpontaneous,
-                                  [](wgpu::QueueWorkDoneStatus, wgpu::StringView) {
-                                    g_timingGpuDoneNs.store(timing_now_ns(), std::memory_order_release);
-                                  });
+      const uint64_t submitNs = timing_now_ns();
+      g_timingSubmitNs.store(submitNs, std::memory_order_release);
+      if (gfx::g_overlap && !gfx::g_drawingBetween) {
+        g_queue.OnSubmittedWorkDone(wgpu::CallbackMode::AllowSpontaneous,
+                                    [submitNs](wgpu::QueueWorkDoneStatus, wgpu::StringView) {
+                                      const uint64_t done = timing_now_ns();
+                                      g_timingGpuDoneNs.store(done, std::memory_order_release);
+                                      const uint64_t lag = done > submitNs ? done - submitNs : 0, was = g_timingTrueLagNs.load();
+                                      g_timingTrueLagNs.store(was == 0 ? lag : was + (static_cast<int64_t>(lag) - static_cast<int64_t>(was)) / 8,
+                                                              std::memory_order_release);
+                                      if (gfx::stagelog::on())
+                                        gfx::stagelog::note("true_gpu_lag", std::chrono::steady_clock::now(), lag / 1000);
+                                    });
+      } else {
+        g_queue.OnSubmittedWorkDone(wgpu::CallbackMode::AllowSpontaneous,
+                                    [](wgpu::QueueWorkDoneStatus, wgpu::StringView) {
+                                      g_timingGpuDoneNs.store(timing_now_ns(), std::memory_order_release);
+                                    });
+      }
     }
     {
+      part.emplace("rd_t_readback");
       gfx::stagelog::Scope readbackTime{"ef_readback"};
       webgpu::gpu_prof::after_submit();
       gfx::efb_readback::after_submit();
     }
+    part.emplace("rd_t_present");
     if (canPresent && g_surface) {
       ZoneScopedN("Present");
       wgpu::ConvertibleStatus status = wgpu::Status::Error;
-      if (gfx::g_beforePresent != nullptr)
+      if (gfx::g_beforePresent != nullptr) {
+        part.reset();  // (a held picture's wait is pace_hold's)
         gfx::g_beforePresent();
+        part.emplace("rd_t_present");
+      }
       {
         window::SurfaceLock surfaceLock;
         if (window::is_presentable()) {
@@ -497,11 +537,13 @@ void end_frame() noexcept {
         break;
       }
     }
+    part.emplace("rd_t_callbacks");
     for (auto& callback : afterSubmitCallbacks) {
       if (callback) {
         callback();
       }
     }
+    part.reset();
 
     TracyPlotConfig("aurora: lastVertSize", tracy::PlotFormatType::Memory, false, true, 0);
     TracyPlotConfig("aurora: lastUniformSize", tracy::PlotFormatType::Memory, false, true, 0);

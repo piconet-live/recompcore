@@ -679,6 +679,17 @@ std::vector<uint8_t> g_heldUniforms, g_patched;
 bool g_patchedHeld = false;  // g_patched is the held frame's uniforms but for its patched blocks (AURORA_REDRAW_BUNDLES)
 EndFrameCallback g_heldCallback;
 std::vector<bool> g_heldOffscreen;
+// AURORA_REDRAW_SKIP_OFFSCREEN=1 (off by default): the held frame's first ops that are offscreen passes (small copies made before the
+// scene, c37: 12 passes of 256x206 copies; their draws are never corrected, so a picture draws them the same) are not drawn again in a
+// picture between: their copies are still the true frame's. Only when the first of them clears the EFB's colour and depth as it
+// begins; the scene pass after them then begins with that clear (the offscreen passes draw into their copies' rectangles, which each
+// copy clears again: the EFB the scene finds is that clear; AURORA_REDRAW_SKIP_CHECK compares the two ways). g_heldSkip: how many.
+bool g_skipOffscreen = [] {
+  const char* v = std::getenv("AURORA_REDRAW_SKIP_OFFSCREEN");
+  return v != nullptr && v[0] == '1';
+}();
+size_t g_heldSkip = 0;
+std::array<int, 8> g_heldSkipWhy{};  // (AURORA_REDRAW_SKIP_CHECK's line) offscreen ops first, the scene pass's colour load/clear, depth load/clear/has, discard
 
 void note_held_passes() {
   // A pass into another size than the picture's, or ending in a copy smaller than half of it: an offscreen pass
@@ -701,19 +712,64 @@ void note_held_passes() {
     }
     g_heldOffscreen.push_back(off);
   }
+  g_heldSkip = 0;
+  size_t k = 0;
+  while (k < g_held.ops.size() && g_held.ops[k].type == FrameOpType::RenderPass && g_held.ops[k].renderPass != nullptr &&
+         g_held.ops[k].index < g_heldOffscreen.size() && g_heldOffscreen[g_held.ops[k].index]) {
+    ++k;
+  }
+  g_heldSkipWhy = {static_cast<int>(k), -1, -1, -1, -1, -1, -1, static_cast<int>(g_heldOffscreen.size())};
+  if (k != 0 && k < g_held.ops.size() && g_held.ops[k].type == FrameOpType::RenderPass && g_held.ops[k].renderPass != nullptr) {
+    const auto& scene = *g_held.ops[0].renderPass;  // (the first offscreen pass: its clear as it begins)
+    g_heldSkipWhy = {static_cast<int>(k), static_cast<int>(scene.colorAttachments[SceneColorAttachmentIndex].loadOp),
+                     scene.colorAttachments[SceneColorAttachmentIndex].clear ? 1 : 0, static_cast<int>(scene.depthLoadOp), scene.clearDepth ? 1 : 0,
+                     scene.hasDepth ? 1 : 0, scene.discardable ? 1 : 0, static_cast<int>(g_heldOffscreen.size())};
+    const auto& color = scene.colorAttachments[SceneColorAttachmentIndex];
+    const bool clears = scene.colorAttachmentCount != 0 &&
+                        (color.loadOp == wgpu::LoadOp::Clear || (color.loadOp == wgpu::LoadOp::Undefined && color.clear));
+    const bool depthClears = !scene.depthStencilView || !scene.hasDepth || scene.depthLoadOp == wgpu::LoadOp::Clear ||
+                             (scene.depthLoadOp == wgpu::LoadOp::Undefined && scene.clearDepth);
+    if (clears && depthClears && !g_held.ops[k].renderPass->discardable && g_held.ops[k].renderPass->colorAttachmentCount != 0)
+      g_heldSkip = k;
+  }
 }
 } // namespace
 
 bool redraw_pass_offscreen(uint32_t pass) noexcept { return pass < g_heldOffscreen.size() && g_heldOffscreen[pass]; }
+bool redraw_skip_offscreen() noexcept { return g_skipOffscreen; }
+void set_redraw_skip_offscreen(bool on) noexcept { g_skipOffscreen = on; }
+size_t redraw_skipped_ops() noexcept { return g_heldSkip; }
+std::array<int, 8> redraw_skip_why() noexcept { return g_heldSkipWhy; }
 
 void redraw_write_vertices(uint32_t at, const uint8_t* data, size_t bytes) {
   g_queue.WriteBuffer(g_resources.vertexBuffer, at, data, bytes);
 }
 
+namespace {
+std::atomic<uint64_t> g_framesEnded{0}, g_frameHeld{0};
+} // namespace
+uint64_t frames_ended() noexcept { return g_framesEnded.load(std::memory_order_acquire); }
+uint64_t frame_held() noexcept { return g_frameHeld.load(std::memory_order_acquire); }
+
 bool redraw_held(const std::function<void(uint8_t* uniforms, size_t bytes)>& patch, const std::vector<uint32_t>* blocks) {
   if (!g_heldCallback || g_held.ops.empty()) {
     return false;
   }
+  // AURORA_PRESENT_OVERLAP: the next frame's passes may already be encoded (its display copy set as the present source): this
+  // picture presents its own and leaves the next frame's in place
+  struct Between {
+    webgpu::TextureWithSampler saved;
+    Between() {
+      g_drawingBetween = true;
+      if (g_overlap)
+        saved = webgpu::present_override();
+    }
+    ~Between() {
+      g_drawingBetween = false;
+      if (g_overlap)
+        webgpu::restore_present_override(saved);
+    }
+  } between;
   if (blocks != nullptr) {
     {
       stagelog::Scope t{"rd_patch"};
@@ -756,12 +812,64 @@ bool redraw_held(const std::function<void(uint8_t* uniforms, size_t bytes)>& pat
     stagelog::Scope t{"rd_uniforms", g_patched.size()};
     g_queue.WriteBuffer(g_resources.uniformBuffer, 0, g_patched.data(), AURORA_ALIGN(g_patched.size(), 4));
   }
+  // AURORA_RT_GPU_SPLIT=1 (a measuring tool, with AURORA_RT_GPU_ROWS): each op up to the ray tracing's task in a command buffer of its own,
+  // handed to the queue at once after a GPU mark (gm_op, the op's index): what each op of a picture costs the GPU. The order on the queue
+  // is the same; the ray tracing's task and all after it go as before.
+  // (AURORA_RT_GPU_SPLIT=<n>: every n-th picture only, so that the marks' own cost leaves the rest as they were)
+  static const uint64_t split = [] {
+    const char* v = std::getenv("AURORA_RT_GPU_SPLIT");
+    return v != nullptr ? std::strtoull(v, nullptr, 10) : 0ull;
+  }();
+  // AURORA_REDRAW_SURVEY=<n> (a measuring tool): the held frame's ops to stderr at the n-th picture between
+  static const uint64_t surveyAt = [] {
+    const char* v = std::getenv("AURORA_REDRAW_SURVEY");
+    return v != nullptr ? std::strtoull(v, nullptr, 10) : 0ull;
+  }();
+  static uint64_t pictures = 0;
+  ++pictures;
   {
     stagelog::Scope t{"rd_encode"};
-    for (const auto& op : g_held.ops) {
-      encode_op_again(encoder, g_held, op);
+    bool splitting = split != 0 && g_gpuMark != nullptr && pictures % split == 0;
+    for (size_t k = g_skipOffscreen ? g_heldSkip : 0; k < g_held.ops.size(); ++k) {
+      const auto& op = g_held.ops[k];
+      if (splitting) {
+        // the mark's number: the op's index, its kind << 8 (0 a scene pass, 1 an offscreen pass, 2 a texture copy, 3 an encoder task, 4 other;
+        // +8 a pass ending in a copy), its draws << 12
+        uint64_t kind = 4, draws = 0;
+        if (op.type == FrameOpType::RenderPass && op.renderPass != nullptr) {
+          kind = redraw_pass_offscreen(op.index) ? 1 : 0;
+          kind += op.renderPass->resolveTarget ? 8 : 0;
+          for (const auto& c : op.renderPass->commands)
+            draws += c.type == CommandType::Draw || c.type == CommandType::CustomDraw;
+        } else if (op.type == FrameOpType::TextureCopy) {
+          kind = 2;
+        } else if (op.type == FrameOpType::EncoderTask) {
+          kind = 3;
+        }
+        g_gpuMark("gm_op", k | kind << 8 | draws << 12);
+      }
+      const WGPUCommandEncoder was = encoder.Get();
+      {
+        std::optional<stagelog::Scope> t;
+        if (splitting)
+          t.emplace("rd_op_encode", k);
+        const bool afterSkip = g_skipOffscreen && g_heldSkip != 0 && k == g_heldSkip;
+        encode_op_again(encoder, g_held, op, afterSkip ? g_held.ops[0].renderPass : nullptr);
+      }
+      if (splitting) {
+        if (encoder.Get() != was) {  // (the ray tracing's task took the encoder: its first part goes at the submit, gm_btw_p1)
+          splitting = false;
+          continue;
+        }
+        stagelog::Scope t{"rd_op_submit", k};  // (Dawn records the op into D3D12 here)
+        const wgpu::CommandBuffer part = encoder.Finish();
+        g_queue.Submit(1, &part);
+        encoder = g_device.CreateCommandEncoder(&EncoderDescriptor);
+      }
     }
   }
+  if (surveyAt != 0 && pictures == surveyAt)
+    survey_held(g_held);
   {
     stagelog::Scope t{"rd_tail"};
     g_heldCallback(encoder, {});
@@ -791,7 +899,8 @@ void end_frame(EndFrameCallback callback) {
   if (gx::redraw::g_on) {
     notes = gx::redraw::take_notes();
   }
-  render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, callback = std::move(callback), notes = std::move(notes)]() mutable {
+  const uint64_t ended = g_framesEnded.fetch_add(1, std::memory_order_acq_rel) + 1;
+  render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, ended, callback = std::move(callback), notes = std::move(notes)]() mutable {
     auto& packet = g_framePackets[frameSlot];
     if (gx::redraw::g_on) {
       stagelog::Scope keepTime{"ef_keep"};
@@ -809,6 +918,7 @@ void end_frame(EndFrameCallback callback) {
     auto afterSubmitCallbacks = std::move(packet.afterSubmitCallbacks);
     if (gx::redraw::g_on) {
       g_held = std::move(packet);
+      g_frameHeld.store(ended, std::memory_order_release);
       g_heldCallback = callback;
       g_patchedHeld = false;
       forget_redraw_bundles();

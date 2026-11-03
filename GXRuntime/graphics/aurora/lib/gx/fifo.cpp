@@ -59,6 +59,7 @@ void process_to(uint64_t target, std::memory_order order) noexcept {
                     sStreamBase + detail::sBufferSize);
       const auto start = static_cast<uint32_t>(processed - sStreamBase);
       const auto size = static_cast<uint32_t>(target - processed);
+      gfx::stagelog::SumScope processTime{stream_process_sum()};
       result = process(detail::sBufferData + start, size);
     }
     AURORA_ASSERT(result.bytesProcessed > 0 && result.bytesProcessed <= target - processed,
@@ -148,6 +149,7 @@ void begin_frame() noexcept {
 
 void end_frame() noexcept {
   sFrameActive = false;
+  stream_sum_rows();  // (after the drain: the stream thread is done with this frame's sums)
   clear_draw_cache(); // command_processor
 }
 

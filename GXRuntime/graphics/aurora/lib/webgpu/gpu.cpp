@@ -361,6 +361,9 @@ void set_present_override(const wgpu::Texture& texture, const wgpu::TextureView&
   };
 }
 
+TextureWithSampler present_override() noexcept { return g_presentOverride; }
+void restore_present_override(const TextureWithSampler& saved) noexcept { g_presentOverride = saved; }
+
 const TextureWithSampler& present_source() noexcept {
   if (g_presentOverride.texture) {
     return g_presentOverride;
@@ -1062,12 +1065,34 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         // https://github.com/TwilitRealm/dusklight/issues/2563
         "use_spirv_reconvergence_mode",
     };
+    // AURORA_DAWN_TRUSTED=<bits> (off by default): Dawn toggles that guard against an untrusted caller or cost CPU on every pass,
+    // off for our own trusted app. 1: lazy_clear_resource_on_first_use and the clear of buffers mapped at creation (no zeroing of a
+    // texture or buffer before its first use: Aurora writes or clears its own); 2: use_d3d12_residency_management (Dawn's per-use
+    // heap tracking and MakeResident at each submit; the OS pages if VRAM runs short); 4: use_user_defined_labels_in_backend (no
+    // D3D12 object names). skip_validation and disable_robustness are already on in release builds, resource states/barriers stay.
+    std::vector<const char*> enableList(enableToggles.begin(), enableToggles.end());
+    std::vector<const char*> disableList(disableToggles.begin(), disableToggles.end());
+    const unsigned trusted = [] {
+      const char* v = std::getenv("AURORA_DAWN_TRUSTED");
+      return v != nullptr ? static_cast<unsigned>(std::strtoul(v, nullptr, 10)) : 0u;
+    }();
+    if ((trusted & 1) != 0) {
+      disableList.push_back("lazy_clear_resource_on_first_use");
+      enableList.push_back("disable_lazy_clear_for_mapped_at_creation_buffer");
+    }
+    if ((trusted & 2) != 0) {
+      disableList.push_back("use_d3d12_residency_management");
+    }
+    if ((trusted & 4) != 0) {
+      std::erase_if(enableList, [](const char* t) { return std::string_view{t} == "use_user_defined_labels_in_backend"; });
+      disableList.push_back("use_user_defined_labels_in_backend");
+    }
     wgpu::DawnTogglesDescriptor togglesDescriptor(wgpu::DawnTogglesDescriptor::Init{
         .nextInChain = &cacheDescriptor,
-        .enabledToggleCount = enableToggles.size(),
-        .enabledToggles = enableToggles.data(),
-        .disabledToggleCount = disableToggles.size(),
-        .disabledToggles = disableToggles.data(),
+        .enabledToggleCount = enableList.size(),
+        .enabledToggles = enableList.data(),
+        .disabledToggleCount = disableList.size(),
+        .disabledToggles = disableList.data(),
     });
 #endif
     wgpu::DeviceDescriptor deviceDescriptor({
@@ -1116,6 +1141,17 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
       return false;
     }
     g_device.SetLoggingCallback(wgpu_log);
+#ifdef WEBGPU_DAWN
+    if (std::getenv("AURORA_DAWN_TRUSTED") != nullptr) {
+      // (the toggles the device runs with, as Dawn reports them)
+      std::string used;
+      for (const char* t : dawn::native::GetTogglesUsed(g_device.Get())) {
+        used += ' ';
+        used += t;
+      }
+      std::fprintf(stderr, "[aurora-dawn] AURORA_DAWN_TRUSTED=%s, toggles used:%s\n", std::getenv("AURORA_DAWN_TRUSTED"), used.c_str());
+    }
+#endif
   }
   g_queue = g_device.GetQueue();
 

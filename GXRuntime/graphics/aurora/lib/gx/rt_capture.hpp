@@ -40,6 +40,7 @@ extern bool g_hook;  // the rays or the look (AURORA_LOOK_POST=1) want to know w
 
 // The command processor, once a draw's pipeline and textures are settled: `vertices` are the draw's raw bytes
 void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertices, size_t rawBytes) noexcept;
+void capture_sum_rows() noexcept;  // AURORA_STAGELOG: the stream thread's capture parts a frame (st_cap_*), written and cleared
 // copy_xfb, before the copy: a frame ends here
 void frame_end() noexcept;
 // The host's display copy about to be drawn. AURORA_RT_CAPTURE_COPY=<copy>: capture exactly that frame, the one its test picture shows

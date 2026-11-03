@@ -84,5 +84,7 @@ void synchronize();
 
 bool is_worker_thread() noexcept;
 bool is_idle() noexcept;
+// called on the worker when it has done its last waiting item (set before the work starts; AURORA_PRESENT_SLOTS)
+extern void (*g_onIdle)();
 
 } // namespace aurora::gfx::render_worker

@@ -1016,7 +1016,8 @@ void stream_reset(Frame& f) {
   f.streamViews = 0;
 }
 
-bool stream_skip(Frame& f, Scene& sc, u32 prim, u32 count, const u8* bytes, size_t used, const float m[12], const float proj[16], u32 triVerts, u32 tick, u64 stateKey) {
+bool stream_skip(Frame& f, Scene& sc, u32 prim, u32 count, const u8* bytes, size_t used, const float m[12], const float proj[16], u32 triVerts, u32 tick, u64 stateKey,
+                 u64 (*keyNow)()) {
   const ListGroup* g = find_group(sc, list_key(prim, count, bytes, used));
   if (g == nullptr)
     return false;
@@ -1062,7 +1063,11 @@ bool stream_skip(Frame& f, Scene& sc, u32 prim, u32 count, const u8* bytes, size
       return false;
   }
   // the state's key differs: translated now, and observe() takes the list out at once
-  if (L->state.load(std::memory_order_relaxed) != ListState::Proved || L->stateKey != stateKey || ((tick + L->index) % AuditEvery) == 0)
+  if (L->state.load(std::memory_order_relaxed) != ListState::Proved || ((tick + L->index) % AuditEvery) == 0)
+    return false;
+  if (keyNow != nullptr)
+    stateKey = keyNow();
+  if (L->stateKey != stateKey)
     return false;
   v->vertices += triVerts, ++v->skipped;
   v->largest = std::max(v->largest, L->extent);

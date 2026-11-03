@@ -181,7 +181,9 @@ void match(const DrawRec* draws, std::uint32_t count, const Vertex* verts, const
            float proj0, float proj5, Frame& out);
 // From the stream, before a draw is translated. Static placement, proved list, and this draw needs no translation: true. m: its one matrix.
 void stream_reset(Frame& f);
-bool stream_skip(Frame& f, Scene& sc, std::uint32_t prim, std::uint32_t count, const std::uint8_t* bytes, std::size_t used, const float m[12], const float proj[16], std::uint32_t triVerts, std::uint32_t tick, std::uint64_t stateKey);
+// keyNow (AURORA_RT_CAPTURE_ASYNC=1): stateKey is worked out only when a proved list asks for it.
+bool stream_skip(Frame& f, Scene& sc, std::uint32_t prim, std::uint32_t count, const std::uint8_t* bytes, std::size_t used, const float m[12], const float proj[16], std::uint32_t triVerts, std::uint32_t tick, std::uint64_t stateKey,
+                 std::uint64_t (*keyNow)() = nullptr);
 // The rules thread, AURORA_RT_SCENE_STATIC=1: as match, and learns the draws it sees; fr gets the static draws after its own, fr's assemble_frame takes out.drop.
 void match_static(const DrawRec* draws, std::uint32_t count, const Vertex* verts, const float (*texMeans)[4], std::uint32_t texCount, float proj0, float proj5, aurora::gx::rt::Frame& fr, Frame& out);
 // The same hash on the same bytes as the file's lists: FNV's start, then 64-bit words

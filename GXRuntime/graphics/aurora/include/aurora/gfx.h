@@ -49,6 +49,8 @@ void aurora_pump_framebuffer_readback();
  * submitted the last frame, and when the GPU reported that work done. */
 uint64_t aurora_timing_last_submit_ns();
 uint64_t aurora_timing_last_gpu_done_ns();
+/* AURORA_PRESENT_OVERLAP: a true frame's submit to its GPU done, smoothed (ns; 0 before the first). */
+uint64_t aurora_timing_true_gpu_lag_ns();
 
 #ifdef __cplusplus
 }
