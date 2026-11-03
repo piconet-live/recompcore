@@ -198,6 +198,15 @@ void note(const char* what, Clock::time_point start, std::uint64_t copy) noexcep
   s_lines.insert(s_lines.end(), b, b + n);
 }
 
+void row(const char* what, std::uint64_t start_us, std::uint64_t dur_us, std::uint64_t copy) noexcept {
+  if (!on())
+    return;
+  char b[96];
+  const int n = std::snprintf(b, sizeof b, "S,%llu,%llu,%s,%llu\n", static_cast<unsigned long long>(start_us), static_cast<unsigned long long>(dur_us), what, static_cast<unsigned long long>(copy));
+  std::lock_guard g{s_lock};
+  s_lines.insert(s_lines.end(), b, b + n);
+}
+
 void sum_row(const char* what, Sum& sum) noexcept {
   if (!stream_on() || !on())
     return;

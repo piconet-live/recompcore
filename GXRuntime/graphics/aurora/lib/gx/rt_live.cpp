@@ -206,6 +206,7 @@ struct State {
   std::unique_ptr<Job> pending;
   bool drawThis = false;
   wgpu::CommandBuffer first;
+  u64 markCopy = 0;  // AURORA_RT_GPU_ROWS: the true frame's copy, for its last mark
   // AURORA_PRESENT_OVERLAP: what pictures between read of the held frame, taken when it was submitted (the next frame's task() sets the
   // live ones while it records), and their own first command buffer (the next frame's first waits in `first` for its submit)
   struct Held {
@@ -221,7 +222,7 @@ struct State {
   double msGpuMost = 0;
   u64 tris = 0, lightsSeen = 0, lightsMost = 0, reports = 0;
   FILE* timeLog = nullptr;
-  u32 count = 0;
+  u32 count = 0, gpuTimed = 0;
 } g;
 
 std::mutex s_poolLock;
@@ -289,6 +290,133 @@ bool flare_on() {
 bool hot_core_on() {
   static const bool on = env_one("AURORA_RT_HOT_CORE");
   return on;
+}
+
+// AURORA_RT_GPU_ROWS=1 (a measuring tool, off by default; with AURORA_STAGELOG): GPU times as stage rows on the CPU's clock. A mark is a
+// timestamp a queue writes when it gets to it (all before it done): gm_* rows (start the GPU's moment, length how long after it was handed
+// to the queue the queue got to it). The slots' own timestamps
+// give gpu_rays (a true frame's rays, start to end) and gpu_btw (a picture between's ray part).
+bool gpu_rows_on() {
+  static const bool on = env_one("AURORA_RT_GPU_ROWS") && gfx::stagelog::on();
+  return on;
+}
+struct GpuClock {
+  u64 gpu0 = 0, ticks = 0;
+  double us0 = 0;
+  u32 uses = 0;
+  void calibrate(ID3D12CommandQueue* q) {
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    u64 gpu = 0, cpu = 0;
+    if (ticks == 0)
+      q->GetTimestampFrequency(&ticks);
+    if (SUCCEEDED(q->GetClockCalibration(&gpu, &cpu)))
+      gpu0 = gpu, us0 = double(cpu / u64(f.QuadPart)) * 1e6 + double(cpu % u64(f.QuadPart)) * 1e6 / double(f.QuadPart);
+    uses = 0;
+  }
+  // microseconds of steady_clock (MSVC's: the performance counter from 0)
+  u64 us(ID3D12CommandQueue* q, u64 t) {
+    if (ticks == 0 || ++uses > 400)
+      calibrate(q);
+    return static_cast<u64>(us0 + double(static_cast<std::int64_t>(t - gpu0)) * 1e6 / double(ticks));
+  }
+};
+GpuClock s_directClock, s_computeClock;
+struct Marks {
+  static constexpr u32 N = 256;
+  ComPtr<ID3D12QueryHeap> heap;
+  ComPtr<ID3D12Resource> read;
+  ComPtr<ID3D12Fence> fence;
+  u64 value = 0;
+  struct E {
+    ComPtr<ID3D12CommandAllocator> alloc;
+    ComPtr<ID3D12GraphicsCommandList> cl;
+    u64 done = 0, cpu = 0;  // cpu: when it was handed to the queue (us)
+    const char* what = nullptr;
+    u64 copy = 0;
+    bool live = false;
+  } e[2][N];  // [0] Dawn's queue, [1] the rays' compute queue
+  u32 next[2]{};
+} s_marks;
+void marks_harvest(u32 k, ID3D12CommandQueue* q, GpuClock& c) {
+  auto& m = s_marks;
+  const u64 completed = m.fence->GetCompletedValue();
+  for (u32 i = 0; i < Marks::N; ++i) {
+    auto& e = m.e[k][i];
+    if (!e.live || e.done > completed)
+      continue;
+    u64* ts = nullptr;
+    const u32 at = k * Marks::N + i;
+    const D3D12_RANGE range{8 * at, 8 * (at + 1)};
+    if (SUCCEEDED(m.read->Map(0, &range, reinterpret_cast<void**>(&ts)))) {
+      const u64 t = c.us(q, ts[at]);
+      gfx::stagelog::row(e.what, t, t > e.cpu ? t - e.cpu : 0, e.copy);  // (its length: how long after it was handed over the queue got to it)
+      const D3D12_RANGE none{0, 0};
+      m.read->Unmap(0, &none);
+    }
+    e.live = false;
+  }
+}
+// on Dawn's queue (compute: on the rays' own)
+void gpu_mark(const char* what, u64 copy, ID3D12CommandQueue* q = nullptr) {
+  if (!gpu_rows_on() || g.failed || !g.ready)
+    return;
+  const bool compute = q != nullptr && q != g.queue.Get();
+  if (q == nullptr)
+    q = g.queue.Get();
+  auto& m = s_marks;
+  if (!m.heap) {
+    D3D12_QUERY_HEAP_DESC qd{};
+    qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    qd.Count = 2 * Marks::N;
+    RT_HR(g.dev->CreateQueryHeap(&qd, IID_PPV_ARGS(&m.heap)));
+    m.read = make_buffer(D3D12_HEAP_TYPE_READBACK, 8 * qd.Count, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    RT_HR(g.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m.fence)));
+  }
+  const u32 k = compute ? 1 : 0;
+  GpuClock& c = compute ? s_computeClock : s_directClock;
+  marks_harvest(k, q, c);
+  const u32 i = m.next[k];
+  m.next[k] = (i + 1) % Marks::N;
+  auto& e = m.e[k][i];
+  if (e.live) {  // (256 marks still on their way: wait for the oldest)
+    if (m.fence->GetCompletedValue() < e.done) {
+      HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+      m.fence->SetEventOnCompletion(e.done, ev);
+      WaitForSingleObject(ev, INFINITE);
+      CloseHandle(ev);
+    }
+    marks_harvest(k, q, c);
+  }
+  const auto type = compute ? D3D12_COMMAND_LIST_TYPE_COMPUTE : D3D12_COMMAND_LIST_TYPE_DIRECT;
+  if (!e.alloc) {
+    RT_HR(g.dev->CreateCommandAllocator(type, IID_PPV_ARGS(&e.alloc)));
+    RT_HR(g.dev->CreateCommandList(0, type, e.alloc.Get(), nullptr, IID_PPV_ARGS(&e.cl)));
+  } else {
+    RT_HR(e.alloc->Reset());
+    RT_HR(e.cl->Reset(e.alloc.Get(), nullptr));
+  }
+  const u32 at = k * Marks::N + i;
+  e.cl->EndQuery(m.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, at);
+  e.cl->ResolveQueryData(m.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, at, 1, m.read.Get(), 8 * at);
+  RT_HR(e.cl->Close());
+  ID3D12CommandList* lists[] = {e.cl.Get()};
+  e.cpu = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+  q->ExecuteCommandLists(1, lists);
+  e.done = ++m.value;
+  RT_HR(q->Signal(m.fence.Get(), e.done));
+  e.what = what, e.copy = copy, e.live = true;
+}
+// a slot's timestamps 0 (start) and 5 (end) as a row
+void gpu_slot_row(const char* what, const u64* t6, u64 copy, ID3D12CommandQueue* q = nullptr) {
+  if (!gpu_rows_on())
+    return;
+  const bool compute = q != nullptr && q != g.queue.Get();
+  GpuClock& c = compute ? s_computeClock : s_directClock;
+  if (q == nullptr)
+    q = g.queue.Get();
+  const u64 a = c.us(q, t6[0]), b = c.us(q, t6[5]);
+  gfx::stagelog::row(what, a, b > a ? b - a : 0, copy);
 }
 const std::vector<std::wstring>& shader_defines() {
   static const std::vector<std::wstring> defines = [] {
@@ -1293,6 +1421,40 @@ void between_row(const u64* t6) {
   std::fprintf(g.timeLog, "b,%llu,0,%.3f,0,0,%.3f,0,0,0,0,0,0,0,0,%.3f,%.3f\n", static_cast<unsigned long long>(g.betweenCount), double(t6[1] - t6[0]) * k, double(t6[5] - t6[8]) * k, double(t6[8] - t6[4]) * k, double(t6[5] - t6[0]) * k);
 }
 
+// A slot's last timings, its work done: a picture between's (b row) or a true frame's (t row; before 2026-11-03 phase 9 a true frame's slot
+// taken next by a picture between lost its timing, so true frames' figures were those of frames with few pictures after them)
+void take_timing(Slot& s, u32 slot) {
+  if (s.fence == 0)
+    return;
+  u64* ts = nullptr;
+  const D3D12_RANGE range{8 * QS * slot, 8 * QS * (slot + 1)};
+  if (FAILED(g.queryResult->Map(0, &range, reinterpret_cast<void**>(&ts))))
+    return;
+  const u64* t6 = ts + QS * slot;
+  const double k = 1000.0 / g.gpuTicks, all = double(t6[5] - t6[0]) * k;
+  if (s.between) {
+    g.msBetweenGpu += all;
+    ++g.betweenGpuCount;
+    between_row(t6);
+    gpu_slot_row("gpu_btw", t6, s.copy);
+  } else {
+    const double build = double(t6[1] - t6[0]) * k, lightMs = double(t6[2] - t6[1]) * k, denoiseMs = double(t6[3] - t6[2]) * k, reflectMs = double(t6[4] - t6[3]) * k, composeMs = double(t6[5] - t6[4]) * k;
+    g.msGpu += all;
+    g.msGpuMost = std::max(g.msGpuMost, all);
+    g.msTrace += reflectMs;
+    g.msLight += lightMs, g.msDenoise += denoiseMs;
+    ++g.gpuTimed;
+    gpu_slot_row("gpu_rays", t6, s.copy);
+    // AURORA_RT_TIMELOG=<file>: a line a frame, to find one slow frame by its copy and what it carried
+    if (g.timeLog != nullptr)
+      std::fprintf(g.timeLog, "t,%llu,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", static_cast<unsigned long long>(s.copy), build, lightMs, denoiseMs, reflectMs, composeMs, s.tris, s.lightCount, s.uploads,
+                   double(t6[9] - t6[0]) * k, double(t6[6] - t6[9]) * k, double(t6[1] - t6[6]) * k, double(t6[7] - t6[2]) * k, double(t6[3] - t6[7]) * k, double(t6[8] - t6[4]) * k, all);
+  }
+  g.queryResult->Unmap(0, nullptr);
+  s.fence = 0;  // (taken)
+}
+
+
 // What the rays do for one frame, on Dawn's queue, between the frame's two command buffers
 // One picture between: no rays. The true frame's reflections and light (its term) carried by the corrections, then the picture's own raster
 // beneath them; bloom and exposure as the true frame left them.
@@ -1304,18 +1466,9 @@ void run_between() {
     RT_HR(g.fence->SetEventOnCompletion(s.fence, g.event));
     WaitForSingleObject(g.event, INFINITE);
   }
-  if (s.between && s.fence != 0) {
-    u64* ts = nullptr;
-    const D3D12_RANGE range{8 * QS * g.slot, 8 * QS * (g.slot + 1)};
-    if (SUCCEEDED(g.queryResult->Map(0, &range, reinterpret_cast<void**>(&ts)))) {
-      const u64* t6 = ts + QS * g.slot;
-      g.msBetweenGpu += double(t6[5] - t6[0]) * 1000.0 / g.gpuTicks;
-      ++g.betweenGpuCount;
-      between_row(t6);
-      g.queryResult->Unmap(0, nullptr);
-    }
-  }
+  take_timing(s, g.slot);
   s.between = true;
+  s.copy = g.betweenCount;  // (a picture's number, for its rows)
   s.keep.clear();
   if (!s.betweenConstants) {
     s.betweenConstants = make_buffer(D3D12_HEAP_TYPE_UPLOAD, (sizeof(BetweenParams) + 255) & ~255ull, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -1428,34 +1581,7 @@ void run_rays(Job& job) {
     RT_HR(g.fence->SetEventOnCompletion(s.fence, g.event));
     WaitForSingleObject(g.event, INFINITE);
   }
-  // this slot's last timings, now done
-  if (s.fence != 0) {
-    u64* ts = nullptr;
-    const D3D12_RANGE range{8 * QS * g.slot, 8 * QS * (g.slot + 1)};
-    if (SUCCEEDED(g.queryResult->Map(0, &range, reinterpret_cast<void**>(&ts)))) {
-      const u64* t6 = ts + QS * g.slot;
-      const double k = 1000.0 / g.gpuTicks, all = double(t6[5] - t6[0]) * k;
-      if (s.between) {
-        g.msBetweenGpu += all;
-        ++g.betweenGpuCount;
-        between_row(t6);
-        g.queryResult->Unmap(0, nullptr);
-        s.fence = 0;  // (this slot's timing taken)
-      } else
-      {
-      const double build = double(t6[1] - t6[0]) * k, lightMs = double(t6[2] - t6[1]) * k, denoiseMs = double(t6[3] - t6[2]) * k, reflectMs = double(t6[4] - t6[3]) * k, composeMs = double(t6[5] - t6[4]) * k;
-      g.msGpu += all;
-      g.msGpuMost = std::max(g.msGpuMost, all);
-      g.msTrace += reflectMs;
-      g.msLight += lightMs, g.msDenoise += denoiseMs;
-      // AURORA_RT_TIMELOG=<file>: a line a frame, to find one slow frame by its copy and what it carried
-      if (g.timeLog != nullptr)
-        std::fprintf(g.timeLog, "t,%llu,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", static_cast<unsigned long long>(s.copy), build, lightMs, denoiseMs, reflectMs, composeMs, s.tris, s.lightCount, s.uploads,
-                     double(t6[9] - t6[0]) * k, double(t6[6] - t6[9]) * k, double(t6[1] - t6[6]) * k, double(t6[7] - t6[2]) * k, double(t6[3] - t6[7]) * k, double(t6[8] - t6[4]) * k, all);
-      g.queryResult->Unmap(0, nullptr);
-      }
-    }
-  }
+  take_timing(s, g.slot);
   s.keep.clear();
   s.between = false;
   s.copy = job.copy, s.tris = static_cast<u32>(job.frame.verts.size() / 3), s.lightCount = static_cast<u32>(job.frame.lights.size()), s.uploads = static_cast<u32>(job.textures.size());
@@ -1547,16 +1673,16 @@ void run_rays(Job& job) {
     return v != nullptr ? static_cast<u32>(std::atoi(v)) : 300u;
   }();
   if (++g.count == every) {
-    const double n = g.count;
-    std::fprintf(stderr, "[rt] lit: light rays %.2f ms, smoothing %.2f ms, reflections %.2f ms; motion: camera agreed %.2f of what was compared, %.2f of vertices known by their own bytes\n", g.msLight / n, g.msDenoise / n, g.msTrace / n, g.motionAgree / n, g.motionOwn / n);
+    const double n = g.count, gn = std::max<double>(g.gpuTimed, 1);  // gn: the frames whose GPU timings were read
+    std::fprintf(stderr, "[rt] lit: light rays %.2f ms, smoothing %.2f ms, reflections %.2f ms; motion: camera agreed %.2f of what was compared, %.2f of vertices known by their own bytes\n", g.msLight / gn, g.msDenoise / gn, g.msTrace / gn, g.motionAgree / n, g.motionOwn / n);
     std::fprintf(stderr, "[rt] per frame, %u frames at %ux%u: GPU build %.2f ms and rays+cleanup %.2f ms (all %.2f, worst %.2f); CPU in the stream %.2f ms, translation beside it %.2f ms, rules %.2f ms, worker %.2f ms; %.0f triangles, lights %.1f (most %llu), picks %.1f, merged %.1f, glows %.1f from %.0f pieces of %.1f draws, one draw held most %.1f\n",
-                 g.count, g.w, g.h, (g.msGpu - g.msTrace - g.msLight - g.msDenoise) / n, g.msTrace / n, g.msGpu / n, g.msGpuMost, g.msBuild / n, g.msTranslate / n, g.msRules / n, g.msComposeWait / n, double(g.tris) / n, double(g.lightsSeen) / n,
+                 g.count, g.w, g.h, (g.msGpu - g.msTrace - g.msLight - g.msDenoise) / gn, g.msTrace / gn, g.msGpu / gn, g.msGpuMost, g.msBuild / n, g.msTranslate / n, g.msRules / n, g.msComposeWait / n, double(g.tris) / n, double(g.lightsSeen) / n,
                  static_cast<unsigned long long>(g.lightsMost), g.picks / n, g.merged / n, g.glowsSeen / n, g.glowPieces / n, g.glowDraws / n, g.glowTop / n);
     world_report(n);
     if (g_noEngineStar)
       std::fprintf(stderr, "[rt] engine stars not drawn: %llu so far\n", static_cast<unsigned long long>(g_starsSkipped.load(std::memory_order_relaxed)));
     g.msLight = g.msDenoise = g.motionAgree = g.motionOwn = 0;
-    g.count = 0, g.msGpuMost = 0, g.msGpu = g.msTrace = g.msBuild = g.msRules = g.msTranslate = g.msComposeWait = 0, g.tris = 0, g.lightsSeen = 0, g.lightsMost = 0, g.picks = g.merged = g.glowsSeen = g.glowPieces = g.glowDraws = g.glowTop = 0;
+    g.count = 0, g.gpuTimed = 0, g.msGpuMost = 0, g.msGpu = g.msTrace = g.msBuild = g.msRules = g.msTranslate = g.msComposeWait = 0, g.tris = 0, g.lightsSeen = 0, g.lightsMost = 0, g.picks = g.merged = g.glowsSeen = g.glowPieces = g.glowDraws = g.glowTop = 0;
   }
 }
 
@@ -1784,6 +1910,7 @@ void before_frame_submit() {
     // a picture between: never the next frame's job or first part (they may be recorded already)
     if (g.pendingBetween && !g.failed) {
       g.pendingBetween = false;
+      gpu_mark("gm_btw_p1", g.betweenCount);
       begin_access(g.inputMem, g.input);
       webgpu::g_queue.Submit(1, &g.firstBetween);
       g.firstBetween = {};
@@ -1796,6 +1923,7 @@ void before_frame_submit() {
   }
   if (g.pendingBetween && !g.failed) {
     g.pendingBetween = false;
+    gpu_mark("gm_btw_p1", g.betweenCount);
     begin_access(g.inputMem, g.input);
     webgpu::g_queue.Submit(1, &g.first);
     g.first = {};
@@ -1820,6 +1948,8 @@ void before_frame_submit() {
       g.haveTerm = false;
     }
   }
+  g.markCopy = g.pending->copy;
+  gpu_mark("gm_true_p1", g.markCopy);
   begin_access(g.inputMem, g.input);
   if (g.before)
     begin_access(g.beforeMem, g.before);
@@ -1845,6 +1975,8 @@ void after_frame_submit() {
     end_access(g.outputMem, g.output);
     g.outputOpen = false;
   }
+  if (gpu_rows_on())
+    gfx::g_drawingBetween ? gpu_mark("gm_btw_end", g.betweenCount - 1) : gpu_mark("gm_true_end", g.markCopy);
   if (gfx::g_overlap && !gfx::g_drawingBetween) {
     // a true frame submitted: what its pictures between read
     g.held.lastColor = g.lastColor;

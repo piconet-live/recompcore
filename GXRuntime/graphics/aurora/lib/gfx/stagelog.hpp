@@ -9,6 +9,8 @@
 namespace aurora::gfx::stagelog {
 bool on() noexcept;
 void note(const char* what, std::chrono::steady_clock::time_point start, std::uint64_t copy = 0) noexcept;
+// A row of a time taken elsewhere (the GPU's, put on this clock: AURORA_RT_GPU_ROWS), in microseconds of steady_clock; kept whatever its length
+void row(const char* what, std::uint64_t start_us, std::uint64_t dur_us, std::uint64_t copy) noexcept;
 struct Scope {
   const char* what;
   std::uint64_t copy;
