@@ -367,7 +367,10 @@ float3 engine_light(float3 pos, float3 N) {
 #ifndef GLOW_FAST
 #define GLOW_FAST 0
 #endif
-static const float GlowTol = 0.25 / 255;
+#ifndef GLOW_TOL
+#define GLOW_TOL 0.25
+#endif
+static const float GlowTol = GLOW_TOL / 255;  // (in display steps: GLOW_TOL, shader define, a measure)
 float3 glow_light(float3 pos, float3 N, float tol = 0) {
   float3 sum = 0, topLight = 0, topDir = 0;
   float top = 0, topMax = 0;
@@ -658,6 +661,14 @@ static const float DepthAgree = 0.05, DepthSlack = 0.03;
 #ifndef DEPTH_CAP
 #define DEPTH_CAP 0
 #endif
+// GLOW_HALF (AURORA_RT_GLOW_HALF=1; rt-speed phase 2; with AURORA_RT_HALF and the denoiser): the glow light (its 64 glows and its one shadow ray)
+// is found once per light pixel in light_pass, at the light pixel's own surface, and main reads it up as it reads the rays' light (up_at: the four
+// light pixels weighted by distance and normal). A quarter of the work; the glow light is smooth across a surface, its shadow's edge softer.
+// Kept in WriteOpen (u12), which neither light_pass nor main uses otherwise.
+#ifndef GLOW_HALF
+#define GLOW_HALF 0
+#endif
+#define GlowHalf WriteOpen
 #ifndef BAKE_BOUND
 #define BAKE_BOUND 0
 #endif
@@ -809,7 +820,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         if (MAIN_PROBE != 4 && P.glowGain > 0 && (d.highlight & 6) == 0) {
           // GLOW_FAST: what moves this pixel a quarter step (the glow light multiplies the raster here); none at all where nothing would show
           const float onPixel = P.glowGain * bareM * max(raster.r, max(raster.g, raster.b));
-          if (!GLOW_FAST || onPixel > 0) light += glow_light(h.pos, N, GLOW_FAST ? GlowTol / onPixel : 0) * P.glowGain * bareM;
+          if (GLOW_HALF && DP.half != 0 && DP.denoised != 0) {
+            const Up ug = up_at(id.xy, -h.pos.z, N);
+            light += UP_READ(GlowHalf, ug).rgb * P.glowGain * bareM;
+          } else if (!GLOW_FAST || onPixel > 0) light += glow_light(h.pos, N, GLOW_FAST ? GlowTol / onPixel : 0) * P.glowGain * bareM;
         }
         if (P.glowShow != 0 && (d.highlight & 2) != 0) { sum = float3(1, -1, 1); light = 0; break; }
         if (MAIN_PROBE != 8 && P.lightRays > 0 && (d.highlight & 6) == 0) {
@@ -919,6 +933,7 @@ void light_pass(uint3 id : SV_DispatchThreadID) {
   float3 v = normalize(float3((ndc + P.pOffset) / P.pScale, -1));
   float tmin = 0.01;
   Guide[id.xy] = float4(0, 0, 0, -1);
+  if (GLOW_HALF) GlowHalf[id.xy] = 0;
   ReadOpen[id.xy] = 0;
   ReadSky[id.xy] = 0;
   // nothing there: only the camera moved it
@@ -968,6 +983,7 @@ void light_pass(uint3 id : SV_DispatchThreadID) {
       ReadOpen[id.xy] = float4(bounce, open);
       ReadSky[id.xy] = float4(skySeen, 0);
       sunV = sun_term(h.pos, N, t);
+      if (GLOW_HALF && P.glowGain > 0) GlowHalf[id.xy] = float4(glow_light(h.pos, N), 1);
     }
     // At half resolution the mirror ray goes here too, from this hit: the primary ray isn't paid twice, and only surfaces with shine pay at all. As main's rule.
     if (DP.half != 0 && (d.highlight & 6) == 0) {
