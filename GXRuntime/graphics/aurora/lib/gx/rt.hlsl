@@ -643,7 +643,9 @@ static const int GateMin = (int)(GATE_MIN + 0.5);
 // The sun's shadow ray and the mirror ray stay. With the denoiser's own time it bounds what a course-light bake could save.
 // MAIN_PROBE (a measure only, never a look; shader define, no switch): 1 main stops at the camera ray's hit; 2 also the material read at the
 // hit (own, around, softer, gate) and stops before lights and reflection; 3 all but the layer pass's look after the loop; on the material rule's
-// path: 4 no glow light, 5 glow light without its shadow ray, 6 no engine light, 7 no reflection compose, 8 no light upscale
+// path: 4 no glow light, 5 glow light without its shadow ray, 6 no engine light, 7 no reflection compose, 8 no light upscale; 9 shows the camera
+// ray's traces a pixel (1 as the picture's black, 2 red, 3 green, 4 or more blue); 10 why it looked again: red a world copy
+// with no draw of it (then the pair-gap look), green the backdrop, blue a card's see-through texel or a passed class
 #ifndef MAIN_PROBE
 #define MAIN_PROBE 0
 #endif
@@ -741,6 +743,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     float gapAt = -1;  // AURORA_RT_PAIR_GAP: >= 0 when this look is the window for draws around a drawn placement's hit there
     float surfT = 100000;  // AURORA_RT_LAYER_PASS: where the pixel's surface is, for the layers in front of it
     const float3 lightBefore = light;
+    uint traces = 0, whyGap = 0, whyWorld = 0, whyBack = 0, whyCard = 0;  // MAIN_PROBE 9, 10
     for (int i = 0; i < PrimaryLooks; ++i) {
       RayQuery<CameraRay> q;
       const bool gapLook = gapAt >= 0;
@@ -749,6 +752,7 @@ void main(uint3 id : SV_DispatchThreadID) {
       RayDesc ray; ray.Origin = 0; ray.Direction = v; ray.TMin = gapLook ? max(gapT - gapR, 0.01) : tmin; ray.TMax = gapLook ? gapT + gapR : (win ? winHi : 100000);
       q.TraceRayInline(Scene, RAY_FLAG_NONE, gapLook ? gap_mask() : MaskPrimary, ray);
       q.Proceed();
+      ++traces;
       if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) {
         if (gapLook) continue;
         if (win) { win = false; if (DEPTH_CAP) --i; else tmin = 0.01; continue; }  // DEPTH_WINDOW: nothing in the window, the whole ray as before (DEPTH_CAP: the rest of it, the look not counted)
@@ -759,19 +763,20 @@ void main(uint3 id : SV_DispatchThreadID) {
       const bool worldHit = q.CommittedInstanceID() >= WorldId;
       if (worldHit) {
         WorldMesh wm = world_mesh(q.CommittedInstanceID(), q.CommittedGeometryIndex());
-        if (wm.cls == 3) { tmin = t + 0.02; continue; }  // the scene's backdrop: the raster has it as the game drew it, rays pass it
+        if (wm.cls == 3) { tmin = t + 0.02; ++whyBack; continue; }  // the scene's backdrop: the raster has it as the game drew it, rays pass it
         // a part still drawn: its draw is in the rays; a part never drawn: the raster has nothing of it here
-        if (!world_fetch(wm, q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), q.CommittedObjectToWorld3x4(), h)) { tmin = t + 0.02; if (pair_gap_on()) gapAt = t; continue; }
+        if (!world_fetch(wm, q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), q.CommittedObjectToWorld3x4(), h)) { tmin = t + 0.02; ++whyWorld; if (pair_gap_on()) gapAt = t; continue; }
       } else {
         h = fetch(q.CommittedInstanceID() + q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
       }
       Draw d = Draws[h.draw];
       if (P.mode == 7) { dbg = float3(h.draw & 255, (h.draw >> 8) & 255, 1) / 255.0; break; }
-      if (d.cls >= 2) { tmin = t + 0.02; continue; }
+      if (gapLook) ++whyGap;
+      if (d.cls >= 2) { tmin = t + 0.02; ++whyCard; continue; }
       float4 surf = 0;
       if (d.cls == 1 && d.strength <= 0) {
         surf = shade(h, 0);
-        if (surf.a < 0.5) { tmin = t + 0.02; continue; }
+        if (surf.a < 0.5) { tmin = t + 0.02; ++whyCard; continue; }
       }
       hitDepth = t;
       surfT = t;
@@ -911,6 +916,8 @@ void main(uint3 id : SV_DispatchThreadID) {
       light = lightBefore + (light - lightBefore) * shows + (1 - shows) * LayerSkyShare * (sky - 1);
       term *= shows;
     }
+    if (MAIN_PROBE == 10) { Out[id.xy] = float4(whyWorld > 0 ? 1 : 0, whyBack > 0 ? 1 : 0, whyCard > 0 ? 1 : 0, 1); return; }
+    if (MAIN_PROBE == 9) { Out[id.xy] = float4(traces <= 1 ? 0.xxx : traces == 2 ? float3(1, 0, 0) : traces == 3 ? float3(0, 1, 0) : float3(0, 0, 1), 1); return; }
     sum += term;
   }
   // own light falls on the surface: on what lies under the last blended effects, not on them. They are drawn over as they are.
