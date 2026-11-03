@@ -1016,7 +1016,14 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   p.gain = 1;
   p.roadShine = job.road;
   p.rough = 0.002f;
-  p.frame = g.frame++;
+  // AURORA_TEST_LOCKSTEP=1 (the look check, aurora_present.cpp): the rays' noise follows the copy, not the frames traced since the rays came up
+  // (when the shaders are ready varies run to run), so two runs of one race give each copy the same noise
+  static const bool lockstep = [] {
+    const char* v = std::getenv("AURORA_TEST_LOCKSTEP");
+    return v != nullptr && v[0] == '1';
+  }();
+  p.frame = lockstep ? static_cast<u32>(job.copy) : g.frame;
+  ++g.frame;
   p.textures = g.textures;
   p.conserve = 0.7f;
   p.lightGain = job.light;
