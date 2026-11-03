@@ -4,6 +4,7 @@
 #include "fifo.hpp"
 
 #include "../gfx/recording.hpp"
+#include "../gfx/stagelog.hpp"
 #include "../gfx/timewarp.hpp"
 #include "../internal.hpp"
 #include "dolphin/gd/GDGeometry.h"
@@ -840,8 +841,21 @@ static void note_for_redraw(GXVtxFmt fmt, u16 vtxCount, const u8* vertices, gfx:
                     sDrawCache.lineMode, gfx::detail::current_pass_index(), texture, g_gxState.vtxDesc[GX_VA_PNMTXIDX] != GX_NONE);
 }
 
+// AURORA_STAGELOG: the stream thread's draws, summed a frame (rows st_*, written at fifo::end_frame after the drain)
+enum StreamSum { SsDraw, SsRtPre, SsVerts, SsMerge, SsUnmerged, SsRedraw, SsCapture, SsTimewarp, SsProcess, SsCount };
+static gfx::stagelog::Sum sStreamSum[SsCount];
+static constexpr const char* kStreamSumNames[SsCount] = {"st_draw", "st_rt_pre", "st_verts", "st_merge", "st_unmerged",
+                                                         "st_redraw_note", "st_rt_capture", "st_timewarp", "st_process"};
+void stream_sum_rows() noexcept {
+  for (u32 i = 0; i < SsCount; ++i)
+    gfx::stagelog::sum_row(kStreamSumNames[i], sStreamSum[i]);
+  rt::capture_sum_rows();
+}
+gfx::stagelog::Sum& stream_process_sum() noexcept { return sStreamSum[SsProcess]; }
+
 static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& reader) noexcept {
   ZoneScoped;
+  gfx::stagelog::SumScope drawTime{sStreamSum[SsDraw]};
   u32 vtxSize;
   if (g_gxState.lastVtxFmt == fmt)
     LIKELY { vtxSize = g_gxState.lastVtxSize; }
@@ -851,16 +865,23 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
   u32 totalVtxBytes = vtxCount * vtxSize;
   if (totalVtxBytes > reader.remaining())
     UNLIKELY { handle_draw_overrun(totalVtxBytes, reader); }
-  if (rt::g_hook) UNLIKELY { rt::note_draw(vtxCount, prim, fmt, reader.data() + reader.offset()); }
-  if (g_gxState.cullMode == GX_CULL_ALL || g_drawingOff || (rt::g_noHud && rt::skip_draw()) || (rt::g_noGameShadow && rt::is_game_shadow()) ||
-      (rt::g_noEngineStar && rt::is_engine_star(prim, fmt, vtxCount, reader.data() + reader.offset())))
+  bool culled;
+  {
+    gfx::stagelog::SumScope rtTime{sStreamSum[SsRtPre]};
+    if (rt::g_hook) UNLIKELY { rt::note_draw(vtxCount, prim, fmt, reader.data() + reader.offset()); }
+    culled = g_gxState.cullMode == GX_CULL_ALL || g_drawingOff || (rt::g_noHud && rt::skip_draw()) || (rt::g_noGameShadow && rt::is_game_shadow()) ||
+             (rt::g_noEngineStar && rt::is_engine_star(prim, fmt, vtxCount, reader.data() + reader.offset()));
+    if (!culled) {
+      if (rt::g_hook) UNLIKELY { rt::before_draw(); }
+      if (soft::on()) UNLIKELY { soft::before_draw(prim); }
+    }
+  }
+  if (culled)
     UNLIKELY {
       // GX_CULL_ALL rasterises nothing (the hardware culls both faces; lines and points too)
       reader.skip(totalVtxBytes);
       return;
     }
-  if (rt::g_hook) UNLIKELY { rt::before_draw(); }
-  if (soft::on()) UNLIKELY { soft::before_draw(prim); }
   if (recomp::has_guest_address_resolver()) {
     reserve_indexed_arrays(fmt, vtxCount, reader.data() + reader.offset());
   }
@@ -883,10 +904,15 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
 
   // Push raw vertex data to buffer. Merged draws must remain contiguous with the previous range.
   const auto vertexData = reader.take(totalVtxBytes);
-  gfx::Range vertRange = gfx::push_verts(vertexData.data(), vertexData.size(), canMerge ? 0 : 4);
+  gfx::Range vertRange;
+  {
+    gfx::stagelog::SumScope vertsTime{sStreamSum[SsVerts]};
+    vertRange = gfx::push_verts(vertexData.data(), vertexData.size(), canMerge ? 0 : 4);
+  }
 
   // Try to merge with previous draw call
   if (canMerge) {
+    gfx::stagelog::SumScope mergeTime{sStreamSum[SsMerge]};  // (holds the merged draw's st_redraw_note and st_rt_capture)
     u32 numIndices = 0;
     gfx::Range idxRange;
     static ByteBuffer idxBuf;
@@ -919,14 +945,29 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
     lastDraw->vtxCount += vtxCount;
     lastDraw->indexCount += numIndices;
     gfx::detail::increment_merged_draw_count();
-    if (redraw::g_on) UNLIKELY { note_for_redraw(fmt, vtxCount, vertexData.data(), vertRange); }
-    if (rt::g_capturing) UNLIKELY { rt::capture_draw(prim, fmt, vtxCount, vertexData.data(), vertexData.size()); }
+    if (redraw::g_on) UNLIKELY {
+      gfx::stagelog::SumScope t{sStreamSum[SsRedraw]};
+      note_for_redraw(fmt, vtxCount, vertexData.data(), vertRange);
+    }
+    if (rt::g_capturing) UNLIKELY {
+      gfx::stagelog::SumScope t{sStreamSum[SsCapture]};
+      rt::capture_draw(prim, fmt, vtxCount, vertexData.data(), vertexData.size());
+    }
     return;
   }
 
-  handle_draw_unmerged(prim, fmt, vtxCount, vertRange);
-  if (redraw::g_on) UNLIKELY { note_for_redraw(fmt, vtxCount, vertexData.data(), vertRange); }
-  if (rt::g_capturing) UNLIKELY { rt::capture_draw(prim, fmt, vtxCount, vertexData.data(), vertexData.size()); }
+  {
+    gfx::stagelog::SumScope t{sStreamSum[SsUnmerged]};
+    handle_draw_unmerged(prim, fmt, vtxCount, vertRange);
+  }
+  if (redraw::g_on) UNLIKELY {
+    gfx::stagelog::SumScope t{sStreamSum[SsRedraw]};
+    note_for_redraw(fmt, vtxCount, vertexData.data(), vertRange);
+  }
+  if (rt::g_capturing) UNLIKELY {
+    gfx::stagelog::SumScope t{sStreamSum[SsCapture]};
+    rt::capture_draw(prim, fmt, vtxCount, vertexData.data(), vertexData.size());
+  }
 }
 
 static void handle_draw(u8 cmd, ByteReader& reader) noexcept {
@@ -934,6 +975,7 @@ static void handle_draw(u8 cmd, ByteReader& reader) noexcept {
   const auto prim = static_cast<GXPrimitive>(cmd & CP_OPCODE_MASK);
   const u16 vtxCount = reader.read<u16>();
   if (gfx::timewarp::g_on && !g_drawingOff) {
+    gfx::stagelog::SumScope t{sStreamSum[SsTimewarp]};
     gfx::timewarp::note_draw(cmd, vtxCount, reader.data() + reader.offset(), reader.remaining());
     if (gfx::timewarp::g_pin) {
       gfx::set_stencil_ref(gfx::timewarp::draw_class());

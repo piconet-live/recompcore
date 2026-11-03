@@ -197,4 +197,15 @@ void note(const char* what, Clock::time_point start, std::uint64_t copy) noexcep
   std::lock_guard g{s_lock};
   s_lines.insert(s_lines.end(), b, b + n);
 }
+
+void sum_row(const char* what, Sum& sum) noexcept {
+  if (!stream_on() || !on())
+    return;
+  const auto us = sum.ns / 1000;
+  char b[96];
+  const int n = std::snprintf(b, sizeof b, "S,%llu,%llu,%s,%u\n", static_cast<unsigned long long>(us_of(Clock::now()) - us), static_cast<unsigned long long>(us), what, sum.n);
+  sum = {};
+  std::lock_guard g{s_lock};
+  s_lines.insert(s_lines.end(), b, b + n);
+}
 } // namespace aurora::gfx::stagelog

@@ -28,6 +28,7 @@
 #include <string>
 #include <tuple>
 #include <vector>
+#include <unordered_set>
 
 // The capture's file (read by rt-tool): all little-endian, floats 32-bit.
 //   "RTC3", u32 counts: draws, vertices, textures; then the frame's XFB source rect (x, y, w, h as f32)
@@ -318,6 +319,7 @@ struct Packet {
   u16 vtxCount;
   u32 samplesCopy;
   std::uint64_t stateKey;
+  u32 keyLater;    // AURORA_RT_CAPTURE_ASYNC=1: stateKey is worked out from this packet by translate
   u32 rawOffset, rawBytes, stagesOffset, mtxOffset, mtxCount, lightsOffset;
   decltype(GXState::proj) proj;
   decltype(GXState::logicalViewport) logicalViewport;
@@ -367,8 +369,11 @@ static const bool s_fadeAsDraw = [] {
 }();
 // What the translation of a proved list reads besides its bytes, read only as the draw's own stages read it: registers no stage reads go stale without the surface changing.
 // Texture matrices, the texture by its data, the colours a stage or channel takes from a register. No vertex data, no per-frame table: some dozens of words a draw, and most draws have no matrix.
-static std::uint64_t state_key() noexcept {
-  const auto& st = g_gxState;
+// The same key from any view of the state: S gives the texture generators, a generator's matrices, the stages and a stage's texture,
+// the K colours, the colour registers and the channels. The stream's own state (state_key) and a packet's copy of it (key_of_packet,
+// AURORA_RT_CAPTURE_ASYNC=1 on the translate threads) give the same words, so the same key.
+template <class S>
+static std::uint64_t key_of(const S& v) noexcept {
   std::uint64_t h = 0xcbf29ce484222325ull;
   const auto mix = [&h](std::uint64_t w) {
     h = (h ^ w) * 0x9E3779B97F4A7C15ull;
@@ -379,28 +384,29 @@ static std::uint64_t state_key() noexcept {
     for (size_t i = 0; i < bytes / 4; ++i)
       mix(u[i]);
   };
-  const u32 gens = std::min<u32>(st.numTexGens, MaxUv);
+  const auto& tcgs = v.tcgs();
+  const u32 gens = std::min<u32>(v.numTexGens(), MaxUv);
   mix(gens);
   for (u32 t = 0; t < gens; ++t) {
-    const auto& g = st.tcgs[t];
+    const auto& g = tcgs[t];
     if (g.mtx != GX_IDENTITY && g.mtx >= GX_TEXMTX0 && (g.mtx - GX_TEXMTX0) / 3 < MaxTexMtx && g.src != GX_TG_NRM)
-      words(&st.texMtxs[(g.mtx - GX_TEXMTX0) / 3], sizeof(st.texMtxs[0]));
+      words(&v.texMtx(t), sizeof(Mat3x4<float>));
     if (g.postMtx != GX_PTIDENTITY && g.postMtx >= GX_PTTEXMTX0 && (g.postMtx - GX_PTTEXMTX0) / 3 < MaxPTTexMtx && g.src != GX_TG_NRM)
-      words(&st.ptTexMtxs[(g.postMtx - GX_PTTEXMTX0) / 3], sizeof(st.ptTexMtxs[0]));
+      words(&v.ptTexMtx(t), sizeof(Mat3x4<float>));
   }
-  const u32 stages = std::min<u32>(st.numTevStages, 16u);
+  const u32 stages = std::min<u32>(v.numTevStages(), 16u);
   bool reads[4]{}, readsRas = false;
   u32 chan = 0;
   for (u32 i = 0; i < stages; ++i) {
-    const TevStage& s = st.tevStages[i];
+    const TevStage& s = v.stage(i);
     readsRas = readsRas || s.colorPass.a == GX_CC_RASC || s.colorPass.b == GX_CC_RASC || s.colorPass.c == GX_CC_RASC || s.colorPass.d == GX_CC_RASC || s.colorPass.a == GX_CC_RASA || s.colorPass.b == GX_CC_RASA || s.colorPass.c == GX_CC_RASA || s.colorPass.d == GX_CC_RASA;
     if (s.channelId == GX_COLOR1A1 || s.channelId == GX_COLOR1 || s.channelId == GX_ALPHA1)
       chan = 1;
     // a reflection layer's own fields, as material_of leaves them out
-    if (is_reflection_stage(s, st.tcgs))
+    if (is_reflection_stage(s, tcgs))
       continue;
     if (s.texMapId != GX_TEXMAP_NULL && s.texMapId < MaxTextures)
-      mix(reinterpret_cast<std::uintptr_t>(st.textures[s.texMapId].texObj.data));
+      mix(reinterpret_cast<std::uintptr_t>(v.texData(i)));
     for (const auto a : {s.colorPass.a, s.colorPass.b, s.colorPass.c, s.colorPass.d})
       if (a < GX_CC_TEXC)
         reads[a / 2] = true;
@@ -411,17 +417,62 @@ static std::uint64_t state_key() noexcept {
     if (pc.a == GX_CC_KONST || pc.b == GX_CC_KONST || pc.c == GX_CC_KONST || pc.d == GX_CC_KONST) {
       mix(s.kcSel);
       if (s.kcSel >= GX_TEV_KCSEL_K0)
-        words(&st.kcolors[(s.kcSel - GX_TEV_KCSEL_K0) & 3], 12);
+        words(&v.kcolors()[(s.kcSel - GX_TEV_KCSEL_K0) & 3], 12);
     }
   }
   for (int r = 0; r < 4; ++r)
     if (reads[r])
-      words(&st.colorRegs[r], 12);
-  const auto& cc = st.colorChannelConfig[GX_COLOR0 + chan];
+      words(&v.colorRegs()[r], 12);
+  const auto& cc = v.colorChannelConfig()[GX_COLOR0 + chan];
   if (readsRas && cc.matSrc != GX_SRC_VTX)
-    words(&st.colorChannelState[GX_COLOR0 + chan].matColor, 12);
+    words(&v.colorChannelState()[GX_COLOR0 + chan].matColor, 12);
   return h | 1;
 }
+struct LiveKeyView {
+  const GXState& st;
+  u32 numTexGens() const { return st.numTexGens; }
+  const auto& tcgs() const { return st.tcgs; }
+  const Mat3x4<float>& texMtx(u32 t) const { return st.texMtxs[(st.tcgs[t].mtx - GX_TEXMTX0) / 3]; }
+  const Mat3x4<float>& ptTexMtx(u32 t) const { return st.ptTexMtxs[(st.tcgs[t].postMtx - GX_PTTEXMTX0) / 3]; }
+  u32 numTevStages() const { return st.numTevStages; }
+  const TevStage& stage(u32 i) const { return st.tevStages[i]; }
+  const void* texData(u32 i) const { return st.textures[st.tevStages[i].texMapId].texObj.data; }
+  const auto& kcolors() const { return st.kcolors; }
+  const auto& colorRegs() const { return st.colorRegs; }
+  const auto& colorChannelConfig() const { return st.colorChannelConfig; }
+  const auto& colorChannelState() const { return st.colorChannelState; }
+};
+// make_packet copies each of these under the same conditions key_of reads them: a generator's matrix when it has one in range, a stage's texture when its map is in range
+struct PacketKeyView {
+  const Packet& p;
+  const TevStage* stages;
+  const TexSnap* snaps;
+  explicit PacketKeyView(const Packet& in) noexcept
+      : p(in), stages(reinterpret_cast<const TevStage*>(reinterpret_cast<const u8*>(&in) + in.stagesOffset)),
+        snaps(reinterpret_cast<const TexSnap*>(stages + std::min<u32>(in.numTevStages, 16u))) {}
+  u32 numTexGens() const { return p.numTexGens; }
+  const auto& tcgs() const { return p.tcgs; }
+  const Mat3x4<float>& texMtx(u32 t) const { return p.texMtx[t]; }
+  const Mat3x4<float>& ptTexMtx(u32 t) const { return p.ptTexMtx[t]; }
+  u32 numTevStages() const { return p.numTevStages; }
+  const TevStage& stage(u32 i) const { return stages[i]; }
+  const void* texData(u32 i) const { return snaps[i].obj.data; }
+  const auto& kcolors() const { return p.kcolors; }
+  const auto& colorRegs() const { return p.colorRegs; }
+  const auto& colorChannelConfig() const { return p.colorChannelConfig; }
+  const auto& colorChannelState() const { return p.colorChannelState; }
+};
+static std::uint64_t state_key() noexcept { return key_of(LiveKeyView{g_gxState}); }
+static std::uint64_t key_of_packet(const Packet& p) noexcept { return key_of(PacketKeyView{p}); }
+// AURORA_RT_CAPTURE_ASYNC=1: the stream no longer works out a captured draw's state key (the translate threads do, from its packet),
+// a static candidate's only when its list is proved; nor does it time each draw for the report's "CPU in the stream".
+// AURORA_RT_CAPTURE_ASYNC_CHECK=1 (with it): the stream works both out as before as well, and the translate threads count where they differ.
+static const bool s_captureAsync = [] {
+  const char* v = std::getenv("AURORA_RT_CAPTURE_ASYNC");
+  return v != nullptr && v[0] == '1';
+}();
+static const bool s_captureAsyncCheck = s_captureAsync && std::getenv("AURORA_RT_CAPTURE_ASYNC_CHECK") != nullptr;
+std::atomic<u64> g_keyChecked{0}, g_keyDiffer{0};
 // Anywhere, in any order: the packet says where its draw and triangles go
 void translate(const Packet& st, DrawRec& d, Vertex* outVerts) noexcept {
   const auto* base = reinterpret_cast<const u8*>(&st);
@@ -441,7 +492,15 @@ void translate(const Packet& st, DrawRec& d, Vertex* outVerts) noexcept {
   d.projType = st.projType;
   d.stages = st.numTevStages;
   d.samplesCopy = st.samplesCopy;
-  d.stateKey = st.stateKey;
+  if (st.keyLater != 0) {
+    d.stateKey = key_of_packet(st);
+    if (s_captureAsyncCheck) {
+      g_keyChecked.fetch_add(1, std::memory_order_relaxed);
+      if (d.stateKey != st.stateKey)
+        g_keyDiffer.fetch_add(1, std::memory_order_relaxed);
+    }
+  } else
+    d.stateKey = st.stateKey;
   d.blendMode = st.blendMode, d.blendSrc = st.blendFacSrc, d.blendDst = st.blendFacDst;
   d.depthUpdate = st.depthUpdate, d.depthCompare = st.depthCompare, d.cull = st.cullMode, d.colorUpdate = st.colorUpdate;
   d.prim = prim, d.vtxCount = vtxCount;
@@ -1114,8 +1173,50 @@ static void log_draw_states(const DrawRec* draws, u32 count, const Vertex* verts
                  d.sceneKey != 0 ? 1 : 0, drop != nullptr ? drop[i] : 255u, d.stages > 0 ? static_cast<int>(d.stage[0].tex) : -1);
   }
 }
+// AURORA_RT_CACHE_PROBE=1 (a measuring tool): how many of a frame's translated draws (those the static scene didn't take) a cache could have
+// kept from the frame before. "same": the draw record and its translated vertices byte for byte as one of last frame's; "model": the same
+// bytes and state (motionKey, stateKey) but the record or vertices differ (moved, lit or coloured otherwise). Every 600 frames on stderr.
+static void cache_probe(const live::Job& j) noexcept {
+  static const bool on = std::getenv("AURORA_RT_CACHE_PROBE") != nullptr;
+  if (!on)
+    return;
+  static std::mutex lock;
+  static std::unordered_set<u64> lastFull, lastModel;
+  static u64 frames = 0, draws = 0, same = 0, model = 0, verts = 0, sameVerts = 0, recBytes = 0;
+  const auto hashBytes = [](const void* p, size_t n, u64 h) {
+    const auto* b = static_cast<const u8*>(p);
+    for (size_t i = 0; i < n; ++i)
+      h = (h ^ b[i]) * 0x100000001b3ull;
+    return h;
+  };
+  std::unordered_set<u64> full, mod;
+  u64 d0 = 0, s0 = 0, m0 = 0, v0 = 0, sv0 = 0;
+  for (u32 i = 0; i < j.drawCount; ++i) {
+    const DrawRec& d = j.draws[j.baseDraw + i];
+    const u64 mk = hashBytes(&d.stateKey, 8, hashBytes(&d.motionKey, 8, 0xcbf29ce484222325ull));
+    u64 fk = hashBytes(&d, offsetof(DrawRec, stage) + sizeof(StageRec) * std::min<u32>(d.stages, 16u), mk);
+    fk = hashBytes(j.verts.get() + j.baseVert + d.firstVertex, sizeof(Vertex) * d.vertices, fk);
+    ++d0, v0 += d.vertices;
+    if (lastFull.count(fk))
+      ++s0, sv0 += d.vertices;
+    else if (lastModel.count(mk))
+      ++m0;
+    full.insert(fk), mod.insert(mk);
+  }
+  std::lock_guard g{lock};
+  lastFull.swap(full), lastModel.swap(mod);
+  ++frames, draws += d0, same += s0, model += m0, verts += v0, sameVerts += sv0, recBytes += d0 * sizeof(DrawRec);
+  if (frames % 600 == 0) {
+    std::fprintf(stderr, "[rt] cache probe %llu frames: translated draws %.0f a frame, same as last frame %.0f (%.1f%%), same model+state but changed %.0f; vertices %.0f a frame, in same draws %.0f (%.1f%%); vertex bytes %.0f KB, records %.0f KB a frame\n",
+                 static_cast<unsigned long long>(frames), double(draws) / frames, double(same) / frames, 100.0 * same / std::max<u64>(draws, 1), double(model) / frames,
+                 double(verts) / frames, double(sameVerts) / frames, 100.0 * sameVerts / std::max<u64>(verts, 1), double(verts) * sizeof(Vertex) / frames / 1024, double(recBytes) / frames / 1024);
+    frames = draws = same = model = verts = sameVerts = recBytes = 0;
+  }
+}
+
 void run_rules(live::Job& j) {
   const auto t0 = std::chrono::steady_clock::now();
+  cache_probe(j);
   Tuning tuning;
   if (const char* v = std::getenv("AURORA_RT_LIGHT_FULL"))
     tuning.lightFull = static_cast<float>(std::atof(v));
@@ -1646,6 +1747,15 @@ void note_draw(const u16 vtxCount, const GXPrimitive prim, const GXVtxFmt fmt, c
                int(st.colorUpdate), int(st.alphaUpdate), int(samples_copy()), st.numTevStages, st.numTexGens, vtxCount, int(st.cullMode), int(is_game_shadow()), st.numTevStages > 0 && st.tevStages[0].texMapId < MaxTextures ? st.textures[st.tevStages[0].texMapId].texObj.data : nullptr, m.pos.m0.w(), m.pos.m1.w(), m.pos.m2.w());
 }
 static std::uint64_t s_stateKeyNow = 0;  // this draw's, while it's captured: on the stream's thread
+static bool s_keyLater = false;  // AURORA_RT_CAPTURE_ASYNC=1: this draw's state key is for its packet's translation to work out
+// AURORA_STAGELOG: capture_draw's parts on the stream thread, summed a frame (rows st_cap_*)
+enum CapSum { CsKey, CsSkip, CsSkipped, CsPacket, CsBytes, CsCount };  // CsBytes: candidate bytes hashed (the row's us column is bytes)
+static gfx::stagelog::Sum s_capSum[CsCount];
+void capture_sum_rows() noexcept {
+  static constexpr const char* names[CsCount] = {"st_cap_key", "st_cap_skip", "st_cap_skipped", "st_cap_packet", "st_cap_bytes"};
+  for (u32 i = 0; i < CsCount; ++i)
+    gfx::stagelog::sum_row(names[i], s_capSum[i]);
+}
 static void make_packet(u8* room, const size_t size, const u32 stages, const u32 mtxCount, const bool lit, GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
                         const u8* vertices, const u32 rawBytes, u32 drawSlot, u32 vertSlot, u32 drawIndex, u32 firstVertex, u32 epoch) noexcept {
   auto& st = g_gxState;
@@ -1698,6 +1808,7 @@ static void make_packet(u8* room, const size_t size, const u32 stages, const u32
   p.gameLit = g_gameLightOff ? (g_gameLit[0] ? 1u : 0u) | (g_gameLit[1] ? 2u : 0u)
                              : (st.colorChannelConfig[GX_COLOR0].lightingEnabled ? 1u : 0u) | (st.colorChannelConfig[GX_COLOR1].lightingEnabled ? 2u : 0u);
   p.stateKey = s_stateKeyNow;
+  p.keyLater = s_keyLater ? 1u : 0u;
   std::memcpy(room + at, vertices, rawBytes);
 }
 
@@ -1719,7 +1830,9 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
     return;
   if (g_live && st.projType != GX_PERSPECTIVE)
     return;
-  const auto liveStart = g_live ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  // the report's "CPU in the stream": two clock reads a draw, ~10k draws a frame; AURORA_RT_CAPTURE_ASYNC=1 leaves it out (stage rows measure the stream)
+  const bool timed = g_live && !s_captureAsync;
+  const auto liveStart = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 #if defined(AURORA_RT_LIVE)
   // The sun: the strongest light any draw of this frame asked for, as the stream has it
   if (s_sunLog && st.vtxDesc[GX_VA_NRM] != GX_NONE && st.vtxDesc[GX_VA_PNMTXIDX] == GX_NONE)
@@ -1743,7 +1856,12 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
   }
 #endif
 #if defined(AURORA_RT_LIVE)
-  s_stateKeyNow = g_live && scene::static_on() ? state_key() : 0;
+  {
+    gfx::stagelog::SumScope t{s_capSum[CsKey]};
+    // AURORA_RT_CAPTURE_ASYNC=1: not here (the check works it out here as well, to compare)
+    s_keyLater = s_captureAsync && g_live && scene::static_on();
+    s_stateKeyNow = g_live && scene::static_on() && (!s_keyLater || s_captureAsyncCheck) ? state_key() : 0;
+  }
   // AURORA_RT_SCENE_STATIC=1: a draw the static scene holds, proved the same, costs its bytes' hash here and nothing further on. Additive and no-depth passes always go on: a second pass over the same list isn't the surface.
   if (g_live && scene::static_on() && (prim == GX_TRIANGLES || prim == GX_TRIANGLESTRIP || prim == GX_TRIANGLEFAN) && vtxCount >= 3 && st.vtxDesc[GX_VA_PNMTXIDX] == GX_NONE && st.vtxDesc[GX_VA_POS] == GX_DIRECT && st.depthUpdate && st.depthCompare && st.colorUpdate && !(st.blendMode == 1 && st.blendFacDst == 1) && !draw_fading()) {
     ensure_job();
@@ -1752,8 +1870,18 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
       float m[12] = {mtx.m0.x(), mtx.m0.y(), mtx.m0.z(), mtx.m0.w(), mtx.m1.x(), mtx.m1.y(), mtx.m1.z(), mtx.m1.w(), mtx.m2.x(), mtx.m2.y(), mtx.m2.z(), mtx.m2.w()};
       float proj[16];
       std::memcpy(proj, &st.proj, sizeof proj);
-      if (scene::stream_skip(s_job->world, *sc, prim, vtxCount, vertices, rawBytes, m, proj, triangle_vertices(prim, vtxCount), s_rulesTick, s_stateKeyNow)) {
-        s_captureMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - liveStart).count();
+      bool skip;
+      if (gfx::stagelog::stream_on())
+        s_capSum[CsBytes].ns += rawBytes * 1000, ++s_capSum[CsBytes].n;
+      {
+        gfx::stagelog::SumScope t{s_capSum[CsSkip]};
+        skip = scene::stream_skip(s_job->world, *sc, prim, vtxCount, vertices, rawBytes, m, proj, triangle_vertices(prim, vtxCount), s_rulesTick, s_stateKeyNow,
+                                  s_keyLater && !s_captureAsyncCheck ? &state_key : nullptr);
+      }
+      if (skip) {
+        gfx::stagelog::SumScope t{s_capSum[CsSkipped]};
+        if (timed)
+          s_captureMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - liveStart).count();
         return;
       }
     }
@@ -1769,6 +1897,7 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
   const u32 tv = triangle_vertices(prim, vtxCount);
 #if defined(AURORA_RT_LIVE)
   if (g_live) {
+    gfx::stagelog::SumScope packetTime{s_capSum[CsPacket]};
     u8* room = packet_room(size);
     if (s_nextDraw >= MostDraws || s_nextVert + tv > MostVerts) {
       // beyond the buffers: not traced, the frame goes on
@@ -1785,7 +1914,8 @@ void capture_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vertic
       s_late.push_back(std::move(r));
     }
     s_nextDraw += 1, s_nextVert += tv;
-    s_captureMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - liveStart).count();
+    if (timed)
+      s_captureMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - liveStart).count();
     return;
   }
 #endif
@@ -1941,6 +2071,12 @@ void frame_end() noexcept {
     gfx::efb_readback::request();
 #if defined(AURORA_RT_LIVE)
   if (g_hook) {
+    if (s_captureAsyncCheck) {
+      static u32 frames = 0;
+      if (++frames % 600 == 0)
+        std::fprintf(stderr, "[rt] capture async check: state keys worked out from packets %llu, differing from the stream's %llu\n",
+                     static_cast<unsigned long long>(g_keyChecked.load()), static_cast<unsigned long long>(g_keyDiffer.load()));
+    }
     if (s_seenPerspective)
       send_rays();
     s_zLast = s_zNow, s_zNow = 0, s_beforeTaken = false;
