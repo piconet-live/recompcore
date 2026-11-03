@@ -629,6 +629,14 @@ static const int GateMin = (int)(GATE_MIN + 0.5);
 #ifndef MAIN_PROBE
 #define MAIN_PROBE 0
 #endif
+// DEPTH_WINDOW (shader define; rt-speed): main's camera ray looks first only in a window around the depth the light pass already found for
+// the four light pixels around it (Guide.z), when they agree within DepthAgree; slack DepthSlack each side. A look that finds nothing accepted in
+// the window starts over from the camera as before, so only a surface the light pixels all missed in front of the window can differ (a thing
+// thinner than a light pixel). Tuned, not derived.
+#ifndef DEPTH_WINDOW
+#define DEPTH_WINDOW 0
+#endif
+static const float DepthAgree = 0.05, DepthSlack = 0.03;
 #ifndef BAKE_BOUND
 #define BAKE_BOUND 0
 #endif
@@ -674,6 +682,27 @@ void main(uint3 id : SV_DispatchThreadID) {
         return;
       }
     }
+    float winHi = 100000;
+    bool win = false;
+    if (DEPTH_WINDOW && DP.half != 0 && DP.denoised != 0 && P.spp == 1) {
+      float2 f = (id.xy + 0.5) / DP.litScale - 0.5;
+      int2 b = int2(floor(f));
+      uint gw, gh;
+      Guide.GetDimensions(gw, gh);
+      float lo = 1e30, hi = 0;
+      bool ok = true;
+      for (int k = 0; k < 4; ++k) {
+        float gz = Guide[clamp(b + int2(k & 1, k >> 1), int2(0, 0), int2(gw - 1, gh - 1))].z;
+        ok = ok && gz > 0;
+        lo = min(lo, gz), hi = max(hi, gz);
+      }
+      if (ok && hi < lo * (1 + DepthAgree)) {
+        const float perZ = 1 / max(-v.z, 1e-4);
+        tmin = max(tmin, lo * (1 - DepthSlack) * perZ);
+        winHi = hi * (1 + DepthSlack) * perZ + 0.05;
+        win = true;
+      }
+    }
     float gapAt = -1;  // AURORA_RT_PAIR_GAP: >= 0 when this look is the window for draws around a drawn placement's hit there
     float surfT = 100000;  // AURORA_RT_LAYER_PASS: where the pixel's surface is, for the layers in front of it
     const float3 lightBefore = light;
@@ -682,10 +711,14 @@ void main(uint3 id : SV_DispatchThreadID) {
       const bool gapLook = gapAt >= 0;
       const float gapT = gapAt, gapR = PairGapLeast + gapAt * PairGapShare;
       gapAt = -1;
-      RayDesc ray; ray.Origin = 0; ray.Direction = v; ray.TMin = gapLook ? max(gapT - gapR, 0.01) : tmin; ray.TMax = gapLook ? gapT + gapR : 100000;
+      RayDesc ray; ray.Origin = 0; ray.Direction = v; ray.TMin = gapLook ? max(gapT - gapR, 0.01) : tmin; ray.TMax = gapLook ? gapT + gapR : (win ? winHi : 100000);
       q.TraceRayInline(Scene, RAY_FLAG_NONE, gapLook ? gap_mask() : MaskPrimary, ray);
       q.Proceed();
-      if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) { if (gapLook) continue; break; }
+      if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) {
+        if (gapLook) continue;
+        if (win) { win = false; tmin = 0.01; continue; }  // DEPTH_WINDOW: nothing in the window, the whole ray as before
+        break;
+      }
       float t = q.CommittedRayT();
       Hit h;
       const bool worldHit = q.CommittedInstanceID() >= WorldId;
