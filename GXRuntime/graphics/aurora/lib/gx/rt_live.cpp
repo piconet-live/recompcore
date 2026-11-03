@@ -161,6 +161,7 @@ struct State {
   double msBetweenGpu = 0, msBetweenCpu = 0;
   u64 betweenCount = 0, betweenGpuCount = 0;
   // Light across frames (AURORA_RT_DENOISE=1): textures for this frame and the last; a texture with its descriptors written per step
+  ComPtr<ID3D12Resource> glowHalf;  // AURORA_RT_GLOW_HALF: the glow light per light pixel (rt.hlsl GLOW_HALF)
   ComPtr<ID3D12Resource> refl, guide[2], motion, noisyOpen, noisySky, histOpen[2], histSky[2], moments[2], tmpOpen[2], tmpSky[2];
   u32 flip = 0;
   float prevProj[16]{}, prevViewport[4]{};
@@ -305,7 +306,11 @@ const std::vector<std::wstring>& shader_defines() {
                                          // 1: that area's mean, not its darkest (rt.hlsl GATE_MEAN)
                                          {"AURORA_RT_GATE_MEAN", L"GATE_MEAN", 0.f},
                                          // speed switches (rt.hlsl): matte mirror rays on half the light pixels; one upscale lookup in main; a measure with no sky/bounce rays
-                                         {"AURORA_RT_MATTE_HALF", L"MATTE_HALF", 0.f}, {"AURORA_RT_ONE_UP", L"ONE_UP", 0.f}, {"AURORA_RT_BAKE_BOUND", L"BAKE_BOUND", 0.f}};
+                                         {"AURORA_RT_MATTE_HALF", L"MATTE_HALF", 0.f}, {"AURORA_RT_ONE_UP", L"ONE_UP", 0.f}, {"AURORA_RT_BAKE_BOUND", L"BAKE_BOUND", 0.f},
+                                         // phase 2: glows and their shadow ray that cannot move a pixel a quarter step left out; main's camera ray capped first
+                                         {"AURORA_RT_GLOW_FAST", L"GLOW_FAST", 0.f}, {"AURORA_RT_DEPTH_CAP", L"DEPTH_CAP", 0.f},
+                                         // phase 2: the glow light once per light pixel, read up in main (needs AURORA_RT_HALF and the denoiser); 2: the engine lights too
+                                         {"AURORA_RT_GLOW_HALF", L"GLOW_HALF", 0.f}};
     for (const auto& n : numbers) {
       const char* v = std::getenv(n.env);
       const float f = v != nullptr && v[0] != '\0' ? static_cast<float>(std::atof(v)) : n.otherwise;
@@ -675,6 +680,8 @@ void make_targets(u32 w, u32 h, wgpu::TextureFormat format) {
     if (half_on())
       d.Width = (w + 1) / 2, d.Height = (h + 1) / 2;
     make(g.refl, F16);
+    if (const char* v = std::getenv("AURORA_RT_GLOW_HALF"); v != nullptr && std::atof(v) > 0)  // 1: glows, 2: engine lights too
+      make(g.glowHalf, F16);
     make(g.motion, F16), make(g.noisyOpen, F16), make(g.noisySky, F16);
     for (u32 i = 0; i < 2; ++i) {
       make(g.guide[i], DXGI_FORMAT_R32G32B32A32_FLOAT);
@@ -1016,7 +1023,14 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   p.gain = 1;
   p.roadShine = job.road;
   p.rough = 0.002f;
-  p.frame = g.frame++;
+  // AURORA_TEST_LOCKSTEP=1 (the look check, aurora_present.cpp): the rays' noise follows the copy, not the frames traced since the rays came up
+  // (when the shaders are ready varies run to run), so two runs of one race give each copy the same noise
+  static const bool lockstep = [] {
+    const char* v = std::getenv("AURORA_TEST_LOCKSTEP");
+    return v != nullptr && v[0] == '1';
+  }();
+  p.frame = lockstep ? static_cast<u32>(job.copy) : g.frame;
+  ++g.frame;
   p.textures = g.textures;
   p.conserve = 0.7f;
   p.lightGain = job.light;
@@ -1123,7 +1137,7 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   dp.litScale = half_on() ? 2.f : 1.f, dp.half = half_on() ? 1 : 0;
   if (lit && p.lightRays > 0) {
     dp.denoised = 1;
-    bind({g.guide[now].Get(), g.motion.Get(), g.noisyOpen.Get(), g.noisySky.Get(), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, g.refl.Get()});
+    bind({g.guide[now].Get(), g.motion.Get(), g.noisyOpen.Get(), g.noisySky.Get(), nullptr, nullptr, nullptr, nullptr, g.glowHalf.Get(), nullptr, nullptr, g.refl.Get()});
     cl->SetPipelineState(g.lightPass.Get());
     cl->Dispatch((lightW + 7) / 8, (lightH + 7) / 8, 1);
     barrier();
@@ -1160,7 +1174,8 @@ void trace_part(Slot& s, Job& job, u32 base, u32& glowCount) {
   dp.show = lit ? show : 0;
   // AURORA_RT_SHOW=4: the raw rays in the place of the smoothed
   if (show == 4 && lit) litOpen = g.noisyOpen.Get(), litSky = g.noisySky.Get();
-  bind({lit ? g.guide[now].Get() : nullptr, lit ? g.motion.Get() : nullptr, litOpen, litSky, nullptr, nullptr, nullptr, lit ? g.moments[now].Get() : nullptr, nullptr, nullptr, nullptr, lit ? g.refl.Get() : nullptr});
+  bind({lit ? g.guide[now].Get() : nullptr, lit ? g.motion.Get() : nullptr, litOpen, litSky, nullptr, nullptr, nullptr, lit ? g.moments[now].Get() : nullptr,
+        lit ? g.glowHalf.Get() : nullptr, nullptr, nullptr, lit ? g.refl.Get() : nullptr});
   cl->SetPipelineState(g.trace.Get());
   cl->Dispatch((g.rw + 7) / 8, (g.rh + 7) / 8, 1);
   barrier();

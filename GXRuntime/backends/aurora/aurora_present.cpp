@@ -1414,6 +1414,22 @@ void aurora_present_frame(uint64_t copy) {
     s->stats.most_behind = std::max<uint64_t>(s->stats.most_behind, s->queue.size());
   }
   s->wake.notify_one();
+  // AURORA_TEST_LOCKSTEP=1 (tests only, off by default): the game waits here until Aurora has taken every frame before this one, so none
+  // waits behind another and none is left undrawn: every true frame is drawn and traced, in order, whatever else the PC runs. Two runs of
+  // one race then give the rays the same frames and the same history, and a test picture at a copy is the same moment (the look check).
+  static const bool lockstep = [] {
+    const char* v = std::getenv("AURORA_TEST_LOCKSTEP");
+    return v != nullptr && v[0] == '1';
+  }();
+  if (lockstep)
+    for (;;) {
+      {
+        std::lock_guard g{s->lock};
+        if (s->queue.empty() || s->stopped.load(std::memory_order_relaxed))
+          break;
+      }
+      std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
 }
 
 int aurora_present_take(AuroraPresentPicture* out) {

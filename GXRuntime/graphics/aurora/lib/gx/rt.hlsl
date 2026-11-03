@@ -356,13 +356,30 @@ float3 engine_light(float3 pos, float3 N) {
 }
 // Glowing surfaces: each a ball of the piece's area, seen from here as form factor. All of them add without noise; one ray, to the one that
 // gives this point the most, takes that one out when something stands in between. No random choice, so nothing sparkles between frames.
-float3 glow_light(float3 pos, float3 N) {
+#ifndef GLOW_NO_RAY
+#define GLOW_NO_RAY 0
+#endif
+// GLOW_FAST (AURORA_RT_GLOW_FAST=1; rt-speed phase 2): the same light within a quarter of a display step. tol is how much glow light (this
+// function's units) moves the pixel by a quarter step (main: GlowTol over the gain, the gate and the raster it multiplies). A glow whose most
+// (its brightest channel, facing the point, area over distance) is below tol/64 is left out: all of them together move the pixel less than a
+// quarter step, and none of them can be the brightest, which is at least 0.005 when a ray goes. The shadow ray goes only when what it could take
+// out (0.85 of the brightest glow) is at least tol. tol <= 0: as ever.
+#ifndef GLOW_FAST
+#define GLOW_FAST 0
+#endif
+#ifndef GLOW_TOL
+#define GLOW_TOL 0.25
+#endif
+static const float GlowTol = GLOW_TOL / 255;  // (in display steps: GLOW_TOL, shader define, a measure)
+float3 glow_light(float3 pos, float3 N, float tol = 0) {
   float3 sum = 0, topLight = 0, topDir = 0;
   float top = 0, topMax = 0;
+  const float least = tol * (1.0 / 64);
   for (uint i = 0; i < P.glowCount; ++i) {
     GlowLight g = Glows[i];
     float3 d = g.pos - pos;
     float dd = dot(d, d);
+    if (GLOW_FAST && max(g.colour.r, max(g.colour.g, g.colour.b)) * g.area < least * (3.14159 * dd + g.area)) continue;
     float cosv = saturate(dot(N, d) / sqrt(max(dd, 1e-4)) * 0.85 + 0.15);
     if (cosv <= 0) continue;
     float3 c = g.colour * cosv * g.area / (3.14159 * dd + g.area);
@@ -370,7 +387,7 @@ float3 glow_light(float3 pos, float3 N) {
     sum += c;
     if (w > top) { top = w; topLight = c; topDir = d; topMax = sqrt(dd) - g.radius; }
   }
-  if (top < 0.005 || topMax < 0.2) return sum;
+  if (top < 0.005 || topMax < 0.2 || GLOW_NO_RAY || (GLOW_FAST && tol > 0 && 0.85 * max(topLight.r, max(topLight.g, topLight.b)) < tol)) return sum;
   RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
   RayDesc ray; ray.Origin = pos + N * 0.03; ray.Direction = normalize(topDir); ray.TMin = 0.02; ray.TMax = topMax;
   q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskRaySolid, ray);
@@ -625,7 +642,10 @@ static const int GateMin = (int)(GATE_MIN + 0.5);
 // BAKE_BOUND (AURORA_RT_BAKE_BOUND=1, a measure only, not a look): light_pass casts no sky/bounce rays, as if a bake gave them; open sky, no bounce.
 // The sun's shadow ray and the mirror ray stay. With the denoiser's own time it bounds what a course-light bake could save.
 // MAIN_PROBE (a measure only, never a look; shader define, no switch): 1 main stops at the camera ray's hit; 2 also the material read at the
-// hit (own, around, softer, gate) and stops before lights and reflection; 3 all but the layer pass's look after the loop
+// hit (own, around, softer, gate) and stops before lights and reflection; 3 all but the layer pass's look after the loop; on the material rule's
+// path: 4 no glow light, 5 glow light without its shadow ray, 6 no engine light, 7 no reflection compose, 8 no light upscale; 9 shows the camera
+// ray's traces a pixel (1 as the picture's black, 2 red, 3 green, 4 or more blue); 10 why it looked again: red a world copy
+// with no draw of it (then the pair-gap look), green the backdrop, blue a card's see-through texel or a passed class
 #ifndef MAIN_PROBE
 #define MAIN_PROBE 0
 #endif
@@ -637,6 +657,21 @@ static const int GateMin = (int)(GATE_MIN + 0.5);
 #define DEPTH_WINDOW 0
 #endif
 static const float DepthAgree = 0.05, DepthSlack = 0.03;
+// DEPTH_CAP (AURORA_RT_DEPTH_CAP=1; rt-speed phase 2): exact. Main's camera ray first looks only as far as a little past the deepest of the four light
+// pixels around it (Guide.z, all four hit), from the camera as ever: the nearest surface it takes there is the nearest of the whole ray, so the pixel
+// is the same; nothing taken there, the look goes on past that, the whole ray as before. Only the far part of the scene is left out of the search.
+#ifndef DEPTH_CAP
+#define DEPTH_CAP 0
+#endif
+// GLOW_HALF (AURORA_RT_GLOW_HALF=1; rt-speed phase 2; with AURORA_RT_HALF and the denoiser): the glow light (its 64 glows and its one shadow ray)
+// is found once per light pixel in light_pass, at the light pixel's own surface, and main reads it up as it reads the rays' light (up_at: the four
+// light pixels weighted by distance and normal). A quarter of the work; the glow light is smooth across a surface, its shadow's edge softer.
+// Kept in WriteOpen (u12), which neither light_pass nor main uses otherwise. GLOW_HALF=2 (AURORA_RT_GLOW_HALF=2): the engine lights too, both with
+// their gains in the one texture, on the surfaces that take both (a glowing surface, which takes engine light only, keeps it at full size).
+#ifndef GLOW_HALF
+#define GLOW_HALF 0
+#endif
+#define GlowHalf WriteOpen
 #ifndef BAKE_BOUND
 #define BAKE_BOUND 0
 #endif
@@ -684,7 +719,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
     float winHi = 100000;
     bool win = false;
-    if (DEPTH_WINDOW && DP.half != 0 && DP.denoised != 0 && P.spp == 1) {
+    if ((DEPTH_WINDOW || DEPTH_CAP) && DP.half != 0 && DP.denoised != 0 && P.spp == 1) {
       float2 f = (id.xy + 0.5) / DP.litScale - 0.5;
       int2 b = int2(floor(f));
       uint gw, gh;
@@ -696,7 +731,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         ok = ok && gz > 0;
         lo = min(lo, gz), hi = max(hi, gz);
       }
-      if (ok && hi < lo * (1 + DepthAgree)) {
+      if (DEPTH_CAP && ok) {
+        winHi = hi * (1 + DepthSlack) / max(-v.z, 1e-4) + 0.05;
+        win = true;
+      } else if (ok && hi < lo * (1 + DepthAgree)) {
         const float perZ = 1 / max(-v.z, 1e-4);
         tmin = max(tmin, lo * (1 - DepthSlack) * perZ);
         winHi = hi * (1 + DepthSlack) * perZ + 0.05;
@@ -706,6 +744,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     float gapAt = -1;  // AURORA_RT_PAIR_GAP: >= 0 when this look is the window for draws around a drawn placement's hit there
     float surfT = 100000;  // AURORA_RT_LAYER_PASS: where the pixel's surface is, for the layers in front of it
     const float3 lightBefore = light;
+    uint traces = 0, whyGap = 0, whyWorld = 0, whyBack = 0, whyCard = 0;  // MAIN_PROBE 9, 10
     for (int i = 0; i < PrimaryLooks; ++i) {
       RayQuery<CameraRay> q;
       const bool gapLook = gapAt >= 0;
@@ -714,9 +753,10 @@ void main(uint3 id : SV_DispatchThreadID) {
       RayDesc ray; ray.Origin = 0; ray.Direction = v; ray.TMin = gapLook ? max(gapT - gapR, 0.01) : tmin; ray.TMax = gapLook ? gapT + gapR : (win ? winHi : 100000);
       q.TraceRayInline(Scene, RAY_FLAG_NONE, gapLook ? gap_mask() : MaskPrimary, ray);
       q.Proceed();
+      ++traces;
       if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) {
         if (gapLook) continue;
-        if (win) { win = false; tmin = 0.01; continue; }  // DEPTH_WINDOW: nothing in the window, the whole ray as before
+        if (win) { win = false; if (DEPTH_CAP) --i; else tmin = 0.01; continue; }  // DEPTH_WINDOW: nothing in the window, the whole ray as before (DEPTH_CAP: the rest of it, the look not counted)
         break;
       }
       float t = q.CommittedRayT();
@@ -724,19 +764,20 @@ void main(uint3 id : SV_DispatchThreadID) {
       const bool worldHit = q.CommittedInstanceID() >= WorldId;
       if (worldHit) {
         WorldMesh wm = world_mesh(q.CommittedInstanceID(), q.CommittedGeometryIndex());
-        if (wm.cls == 3) { tmin = t + 0.02; continue; }  // the scene's backdrop: the raster has it as the game drew it, rays pass it
+        if (wm.cls == 3) { tmin = t + 0.02; ++whyBack; continue; }  // the scene's backdrop: the raster has it as the game drew it, rays pass it
         // a part still drawn: its draw is in the rays; a part never drawn: the raster has nothing of it here
-        if (!world_fetch(wm, q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), q.CommittedObjectToWorld3x4(), h)) { tmin = t + 0.02; if (pair_gap_on()) gapAt = t; continue; }
+        if (!world_fetch(wm, q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), q.CommittedObjectToWorld3x4(), h)) { tmin = t + 0.02; ++whyWorld; if (pair_gap_on()) gapAt = t; continue; }
       } else {
         h = fetch(q.CommittedInstanceID() + q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
       }
       Draw d = Draws[h.draw];
       if (P.mode == 7) { dbg = float3(h.draw & 255, (h.draw >> 8) & 255, 1) / 255.0; break; }
-      if (d.cls >= 2) { tmin = t + 0.02; continue; }
+      if (gapLook) ++whyGap;
+      if (d.cls >= 2) { tmin = t + 0.02; ++whyCard; continue; }
       float4 surf = 0;
       if (d.cls == 1 && d.strength <= 0) {
         surf = shade(h, 0);
-        if (surf.a < 0.5) { tmin = t + 0.02; continue; }
+        if (surf.a < 0.5) { tmin = t + 0.02; ++whyCard; continue; }
       }
       hitDepth = t;
       surfT = t;
@@ -781,10 +822,22 @@ void main(uint3 id : SV_DispatchThreadID) {
         float bareM = 1 - smoothstep(0.15, 0.45, seenL - gateL);
         if (MAIN_PROBE == 2) { term = (fr * bareM * 1e-6).xxx; break; }
         Up u1 = (Up)0; bool haveU = false;  // ONE_UP
-        if (P.lightGain > 0 && (d.highlight & 4) == 0) light += engine_light(h.pos, N) * P.lightGain * bareM;
-        if (P.glowGain > 0 && (d.highlight & 6) == 0) light += glow_light(h.pos, N) * P.glowGain * bareM;
+        const bool bothHalf = GLOW_HALF >= 2 && DP.half != 0 && DP.denoised != 0 && (d.highlight & 6) == 0;  // GLOW_HALF=2
+        if (bothHalf) {
+          const Up ug = up_at(id.xy, -h.pos.z, N);
+          light += UP_READ(GlowHalf, ug).rgb * bareM;
+        }
+        if (MAIN_PROBE != 6 && !bothHalf && P.lightGain > 0 && (d.highlight & 4) == 0) light += engine_light(h.pos, N) * P.lightGain * bareM;
+        if (MAIN_PROBE != 4 && !bothHalf && P.glowGain > 0 && (d.highlight & 6) == 0) {
+          // GLOW_FAST: what moves this pixel a quarter step (the glow light multiplies the raster here); none at all where nothing would show
+          const float onPixel = P.glowGain * bareM * max(raster.r, max(raster.g, raster.b));
+          if (GLOW_HALF && DP.half != 0 && DP.denoised != 0) {
+            const Up ug = up_at(id.xy, -h.pos.z, N);
+            light += UP_READ(GlowHalf, ug).rgb * P.glowGain * bareM;
+          } else if (!GLOW_FAST || onPixel > 0) light += glow_light(h.pos, N, GLOW_FAST ? GlowTol / onPixel : 0) * P.glowGain * bareM;
+        }
         if (P.glowShow != 0 && (d.highlight & 2) != 0) { sum = float3(1, -1, 1); light = 0; break; }
-        if (P.lightRays > 0 && (d.highlight & 6) == 0) {
+        if (MAIN_PROBE != 8 && P.lightRays > 0 && (d.highlight & 6) == 0) {
           float3 f;
           if (DP.denoised != 0) {
             if (DP.half != 0) {
@@ -804,7 +857,7 @@ void main(uint3 id : SV_DispatchThreadID) {
           light += (f - 1) * bareM;
         }
         if (P.mode == 2) { dbg += fr.xxx; break; }
-        if (DP.half != 0 ? fr > MatReflLeast : fr > 0.002) {
+        if (MAIN_PROBE != 7 && (DP.half != 0 ? fr > MatReflLeast : fr > 0.002)) {
           float3 seen;
           if (DP.half != 0) {
             Up u;
@@ -869,6 +922,8 @@ void main(uint3 id : SV_DispatchThreadID) {
       light = lightBefore + (light - lightBefore) * shows + (1 - shows) * LayerSkyShare * (sky - 1);
       term *= shows;
     }
+    if (MAIN_PROBE == 10) { Out[id.xy] = float4(whyWorld > 0 ? 1 : 0, whyBack > 0 ? 1 : 0, whyCard > 0 ? 1 : 0, 1); return; }
+    if (MAIN_PROBE == 9) { Out[id.xy] = float4(traces <= 1 ? 0.xxx : traces == 2 ? float3(1, 0, 0) : traces == 3 ? float3(0, 1, 0) : float3(0, 0, 1), 1); return; }
     sum += term;
   }
   // own light falls on the surface: on what lies under the last blended effects, not on them. They are drawn over as they are.
@@ -891,6 +946,7 @@ void light_pass(uint3 id : SV_DispatchThreadID) {
   float3 v = normalize(float3((ndc + P.pOffset) / P.pScale, -1));
   float tmin = 0.01;
   Guide[id.xy] = float4(0, 0, 0, -1);
+  if (GLOW_HALF) GlowHalf[id.xy] = 0;
   ReadOpen[id.xy] = 0;
   ReadSky[id.xy] = 0;
   // nothing there: only the camera moved it
@@ -940,6 +996,12 @@ void light_pass(uint3 id : SV_DispatchThreadID) {
       ReadOpen[id.xy] = float4(bounce, open);
       ReadSky[id.xy] = float4(skySeen, 0);
       sunV = sun_term(h.pos, N, t);
+      if (GLOW_HALF >= 2) {
+        float3 o = 0;
+        if (P.glowGain > 0) o += glow_light(h.pos, N) * P.glowGain;
+        if (P.lightGain > 0 && (d.highlight & 4) == 0) o += engine_light(h.pos, N) * P.lightGain;
+        GlowHalf[id.xy] = float4(o, 1);
+      } else if (GLOW_HALF && P.glowGain > 0) GlowHalf[id.xy] = float4(glow_light(h.pos, N), 1);
     }
     // At half resolution the mirror ray goes here too, from this hit: the primary ray isn't paid twice, and only surfaces with shine pay at all. As main's rule.
     if (DP.half != 0 && (d.highlight & 6) == 0) {
