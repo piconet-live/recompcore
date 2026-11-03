@@ -305,7 +305,9 @@ const std::vector<std::wstring>& shader_defines() {
                                          // 1: that area's mean, not its darkest (rt.hlsl GATE_MEAN)
                                          {"AURORA_RT_GATE_MEAN", L"GATE_MEAN", 0.f},
                                          // speed switches (rt.hlsl): matte mirror rays on half the light pixels; one upscale lookup in main; a measure with no sky/bounce rays
-                                         {"AURORA_RT_MATTE_HALF", L"MATTE_HALF", 0.f}, {"AURORA_RT_ONE_UP", L"ONE_UP", 0.f}, {"AURORA_RT_BAKE_BOUND", L"BAKE_BOUND", 0.f}};
+                                         {"AURORA_RT_MATTE_HALF", L"MATTE_HALF", 0.f}, {"AURORA_RT_ONE_UP", L"ONE_UP", 0.f}, {"AURORA_RT_BAKE_BOUND", L"BAKE_BOUND", 0.f},
+                                         // phase 2: glows and their shadow ray that cannot move a pixel a quarter step left out; main's camera ray capped first
+                                         {"AURORA_RT_GLOW_FAST", L"GLOW_FAST", 0.f}, {"AURORA_RT_DEPTH_CAP", L"DEPTH_CAP", 0.f}};
     for (const auto& n : numbers) {
       const char* v = std::getenv(n.env);
       const float f = v != nullptr && v[0] != '\0' ? static_cast<float>(std::atof(v)) : n.otherwise;
