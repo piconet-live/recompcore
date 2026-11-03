@@ -680,8 +680,10 @@ bool g_patchedHeld = false;  // g_patched is the held frame's uniforms but for i
 EndFrameCallback g_heldCallback;
 std::vector<bool> g_heldOffscreen;
 // AURORA_REDRAW_SKIP_OFFSCREEN=1 (off by default): the held frame's first ops that are offscreen passes (small copies made before the
-// scene; their draws are never corrected) are not drawn again in a picture between: their copies are still the true frame's. Only when
-// the first scene pass after them clears its colour and depth (nothing of theirs is left in the EFB for it). g_heldSkip: how many.
+// scene, c37: 12 passes of 256x206 copies; their draws are never corrected, so a picture draws them the same) are not drawn again in a
+// picture between: their copies are still the true frame's. Only when the first of them clears the EFB's colour and depth as it
+// begins; the scene pass after them then begins with that clear (the offscreen passes draw into their copies' rectangles, which each
+// copy clears again: the EFB the scene finds is that clear; AURORA_REDRAW_SKIP_CHECK compares the two ways). g_heldSkip: how many.
 bool g_skipOffscreen = [] {
   const char* v = std::getenv("AURORA_REDRAW_SKIP_OFFSCREEN");
   return v != nullptr && v[0] == '1';
@@ -718,7 +720,7 @@ void note_held_passes() {
   }
   g_heldSkipWhy = {static_cast<int>(k), -1, -1, -1, -1, -1, -1, static_cast<int>(g_heldOffscreen.size())};
   if (k != 0 && k < g_held.ops.size() && g_held.ops[k].type == FrameOpType::RenderPass && g_held.ops[k].renderPass != nullptr) {
-    const auto& scene = *g_held.ops[k].renderPass;
+    const auto& scene = *g_held.ops[0].renderPass;  // (the first offscreen pass: its clear as it begins)
     g_heldSkipWhy = {static_cast<int>(k), static_cast<int>(scene.colorAttachments[SceneColorAttachmentIndex].loadOp),
                      scene.colorAttachments[SceneColorAttachmentIndex].clear ? 1 : 0, static_cast<int>(scene.depthLoadOp), scene.clearDepth ? 1 : 0,
                      scene.hasDepth ? 1 : 0, scene.discardable ? 1 : 0, static_cast<int>(g_heldOffscreen.size())};
@@ -727,7 +729,7 @@ void note_held_passes() {
                         (color.loadOp == wgpu::LoadOp::Clear || (color.loadOp == wgpu::LoadOp::Undefined && color.clear));
     const bool depthClears = !scene.depthStencilView || !scene.hasDepth || scene.depthLoadOp == wgpu::LoadOp::Clear ||
                              (scene.depthLoadOp == wgpu::LoadOp::Undefined && scene.clearDepth);
-    if (clears && depthClears && !scene.discardable)
+    if (clears && depthClears && !g_held.ops[k].renderPass->discardable && g_held.ops[k].renderPass->colorAttachmentCount != 0)
       g_heldSkip = k;
   }
 }
@@ -851,7 +853,8 @@ bool redraw_held(const std::function<void(uint8_t* uniforms, size_t bytes)>& pat
         std::optional<stagelog::Scope> t;
         if (splitting)
           t.emplace("rd_op_encode", k);
-        encode_op_again(encoder, g_held, op);
+        const bool afterSkip = g_skipOffscreen && g_heldSkip != 0 && k == g_heldSkip;
+        encode_op_again(encoder, g_held, op, afterSkip ? g_held.ops[0].renderPass : nullptr);
       }
       if (splitting) {
         if (encoder.Get() != was) {  // (the ray tracing's task took the encoder: its first part goes at the submit, gm_btw_p1)

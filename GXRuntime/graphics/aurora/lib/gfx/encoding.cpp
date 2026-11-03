@@ -314,7 +314,9 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
 #endif
 }
 
-void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo, uint32_t passIndex, PassBundles* bundles = nullptr) {
+// clearFrom (AURORA_REDRAW_SKIP_OFFSCREEN): the pass begins cleared to that pass's clear values (colour, depth, stencil), not as its own say
+void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo, uint32_t passIndex, PassBundles* bundles = nullptr,
+            const RenderPass* clearFrom = nullptr) {
   ZoneScoped;
   if (!passInfo.sealed) {
     return;
@@ -369,6 +371,23 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
       depthStencilAttachment.stencilClearValue = 0;
     }
     depthStencilAttachmentPtr = &depthStencilAttachment;
+  }
+  if (clearFrom != nullptr) {
+    for (uint32_t i = 0; i < passInfo.colorAttachmentCount; ++i) {
+      const auto& from = clearFrom->colorAttachments[std::min(i, clearFrom->colorAttachmentCount - 1)];
+      attachments[i].loadOp = wgpu::LoadOp::Clear;
+      attachments[i].clearValue = {.r = from.clearValue.x(), .g = from.clearValue.y(), .b = from.clearValue.z(), .a = from.clearValue.w()};
+    }
+    if (depthStencilAttachmentPtr != nullptr) {
+      if (passInfo.hasDepth) {
+        depthStencilAttachment.depthLoadOp = wgpu::LoadOp::Clear;
+        depthStencilAttachment.depthClearValue = clearFrom->clearDepthValue;
+      }
+      if (passInfo.hasStencil || passInfo.depthStencilFormat == wgpu::TextureFormat::Depth32FloatStencil8) {
+        depthStencilAttachment.stencilLoadOp = wgpu::LoadOp::Clear;
+        depthStencilAttachment.stencilClearValue = passInfo.depthStencilFormat == wgpu::TextureFormat::Depth32FloatStencil8 ? 0 : clearFrom->stencilClearValue;
+      }
+    }
   }
   const auto label = passInfo.label.empty() ? fmt::format("Render pass {}", passIndex)
                                             : fmt::format("{} {}", passInfo.label, passIndex);
@@ -656,7 +675,7 @@ void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op)
   }
 }
 // The same again for a picture between: nothing uploaded, nothing read back; a ray tracing task's job is gone
-void encode_op_again(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op) {
+void encode_op_again(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op, const RenderPass* clearFrom) {
   switch (op.type) {
   case FrameOpType::RenderPass:
     if (op.renderPass != nullptr) {
@@ -667,7 +686,7 @@ void encode_op_again(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameO
         }
         bundles = &g_passBundles[op.index];
       }
-      render(cmd, frame, *op.renderPass, op.index, bundles);
+      render(cmd, frame, *op.renderPass, op.index, bundles, clearFrom);
     }
     break;
   case FrameOpType::TextureCopy:

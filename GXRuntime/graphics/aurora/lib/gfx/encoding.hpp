@@ -11,7 +11,8 @@ detail::DrawEncoder gx_draw_encoder() noexcept;
 
 namespace detail {
 void encode_op(wgpu::CommandEncoder& encoder, FramePacket& frame, const FrameOp& op);
-void encode_op_again(wgpu::CommandEncoder& encoder, FramePacket& frame, const FrameOp& op);
+// clearFrom: a render pass op begins cleared to that pass's clear values (AURORA_REDRAW_SKIP_OFFSCREEN)
+void encode_op_again(wgpu::CommandEncoder& encoder, FramePacket& frame, const FrameOp& op, const RenderPass* clearFrom = nullptr);
 // AURORA_REDRAW_BUNDLES=1 (off by default): a picture between's runs of GX draws from render bundles recorded once for the held frame
 extern bool g_redrawBundles;
 // A new frame is held: its bundles are recorded again at its first picture
