@@ -54,6 +54,9 @@ public:
   bool DispatchableAt(u32 address);
   bool FastDispatchableAt(u32 address);
   bool IsHostCallAddress(u32 address) const;
+  // A second CPU context that runs the module (the fzgx runner's deep-rollback worker) hands the module a pipe of its
+  // own for a job; this hands back the one PublishGatherPipe gave it (or none), saying nothing.
+  void RestoreGatherPipe() { PublishGatherPipe(false); }
   bool ShouldYieldAt(u32 address);
 
   // True when `address` is the head of a guest busy-wait loop, so the
@@ -172,7 +175,7 @@ private:
   // calls this when 32 bytes or more are in it. It does what the tail of a pipe write through HookExternalWrite
   // does: the clock is brought up to date, the burst goes to the FIFO, the budget is set again.
   static void HookGatherPipeFlush(CPUState* cpu);
-  void PublishGatherPipe();
+  void PublishGatherPipe(bool say = true);
   static bool HookHostCall(CPUState* cpu, u32 address);
 
   // Keep Dolphin's MSR-derived state (translation mode, feature flags) in step

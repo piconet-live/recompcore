@@ -215,7 +215,7 @@ void StaticRecompCore::HookGatherPipeFlush(CPUState* cpu)
 // Hands the module the write-gather pipe (or takes it away): the address of Dolphin's pipe pointer, the start of
 // the pipe buffer and the flush hook. Not while the lockstep verifier journals hardware writes, which must all
 // pass through HookExternalWrite. FZGX_GATHER_INLINE=0 keeps every pipe write on the hook (for comparisons).
-void StaticRecompCore::PublishGatherPipe()
+void StaticRecompCore::PublishGatherPipe(bool say)
 {
   if (!m_set_gather_pipe)
     return;
@@ -227,7 +227,8 @@ void StaticRecompCore::PublishGatherPipe()
     m_set_gather_pipe(&ppc.gather_pipe_ptr, ppc.gather_pipe_base_ptr, &HookGatherPipeFlush);
   else
     m_set_gather_pipe(nullptr, nullptr, nullptr);
-  std::fprintf(stderr, "[staticrecomp] gather pipe written by generated code: %s\n", inline_ok ? "yes" : "no");
+  if (say)
+    std::fprintf(stderr, "[staticrecomp] gather pipe written by generated code: %s\n", inline_ok ? "yes" : "no");
 }
 
 u32 StaticRecompCore::HookExternalRead32(CPUState* cpu, u32 ea, u8 rid)
