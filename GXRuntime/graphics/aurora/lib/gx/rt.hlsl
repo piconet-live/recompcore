@@ -423,6 +423,16 @@ static const float LitRayMost = 2.0;
 // With this, the next look is for draws alone, in a window around that hit as wide as the two transforms part: a share of the distance. Nothing found: as before.
 static const float PairGapLeast = 0.02, PairGapShare = 0.002;
 bool pair_gap_on() { return (P.stableShine & 4) != 0; }
+// SHEETS (AURORA_RT_SHEETS=1, off by default; shader define and rt_rules.hpp soft_alpha, GpuDraw bit 6): a sheet is a translucent draw with no
+// reflection layer whose alpha runs smoothly across it: Lightning's cloud layers, Drift Highway's waterfalls. The camera's ray (and the light pass's)
+// stopped on it where its texel's alpha reached 0.5 and lit it as a surface, and passed it below: the 0.5 line of a scrolling alpha cut the sheet
+// into sharp patches lit two ways (dark cloud blotches, light patches in the falls). With this the camera's ray passes a sheet as it passes a layer:
+// the light falls on the surface behind it, the change the rays make there is kept to the part the sheets leave showing (their alpha, texture and
+// vertex: sheetThrough), and the sheet itself stays as the game drew it, as rays off draws it. The sun passes it by its alpha too. A cut-out (a
+// grating, a mesh road) and anything with the game's reflection layer (glass, chrome) stop the ray as before.
+#ifndef SHEETS
+#define SHEETS 0
+#endif
 // AURORA_RT_LAYER_PASS=1 (bit 3 of stableShine): a blended draw that tests depth but writes none (dust and sand sheets, smoke: highlight bit 3) took a primary
 // ray where its texel's alpha reached 0.5 (whole cards where its class says solid), and the pixel then took no own light at all, the ground behind it included: Sand Ocean's blowing-sand sheets
 // showed as the raster's lighter patches, the shape of their alpha, on lit dunes. With this a primary ray passes such a layer as it passes additive draws: the
@@ -519,15 +529,17 @@ float sun_term(float3 pos, float3 N, float dist) {
   float ndl = saturate(dot(N, sun.pos));
   if (ndl <= 0 || dot(sun.colour, 1.xxx) <= 0) return 0;
   // Machines and many other bodies blend by texture alpha, so they aren't in the solid set: what light passes is told by its own alpha at the hit. Tuned: half, and four hits at most.
+  // SHEETS: a sheet lets the sun through by its alpha, a soft shadow, as it lets the camera through: its 0.5 line cast no hard shadow of patches
   float tmin = 0.02;
   const float3 org = pos + N * (0.03 + dist * 0.0005);
+  float sheetSun = 1;
   for (int i = 0; i < 4; ++i) {
     RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
     RayDesc ray; ray.Origin = org; ray.Direction = sun.pos; ray.TMin = tmin; ray.TMax = 100000;
     // AURORA_RT_LAYER_PASS: a layer is never the hit; all of them along the ray let the sun through by their alpha, a soft partial shadow, no card's square
     q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskRaySeen, ray);
     q.Proceed();
-    if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) return layer_pass_on() ? ndl * layer_through(org, sun.pos, 0.02, 100000, 2.0) : ndl;
+    if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) return sheetSun * (layer_pass_on() ? ndl * layer_through(org, sun.pos, 0.02, 100000, 2.0) : ndl);
     float t = q.CommittedRayT();
     if (q.CommittedInstanceID() >= WorldId) {
       WorldMesh m = world_mesh(q.CommittedInstanceID(), q.CommittedGeometryIndex());
@@ -540,6 +552,7 @@ float sun_term(float3 pos, float3 N, float dist) {
       // the draw's own class once it was drawn: a mesh the file calls solid can be drawn blended
       const uint wc = known ? Draws[wh.draw].cls : m.cls;
       if (wc == 0) return 0;
+      if (SHEETS && known && (Draws[wh.draw].highlight & 64) != 0) { sheetSun *= 1 - saturate(shade(wh, 2.0).a); continue; }
       if (wc == 1 && (known ? shade(wh, 2.0).a >= 0.5 : m.colour.a >= 0.5)) return 0;
       continue;
     }
@@ -547,9 +560,10 @@ float sun_term(float3 pos, float3 N, float dist) {
     Draw d = Draws[h.draw];
     tmin = t + 0.02;
     if (d.cls == 0) return 0;
+    if (SHEETS && (d.highlight & 64) != 0) { sheetSun *= 1 - saturate(shade(h, 2.0).a); continue; }
     if (d.cls == 1 && shade(h, 2.0).a >= 0.5) return 0;
   }
-  return layer_pass_on() ? ndl * layer_through(org, sun.pos, 0.02, 100000, 2.0) : ndl;
+  return sheetSun * (layer_pass_on() ? ndl * layer_through(org, sun.pos, 0.02, 100000, 2.0) : ndl);
 }
 // sun x N.L x shadow + sky x how much of the surroundings it sees + what it sees, as bounce. A factor on the picture: 1 is today's level. Floor and gains tuned.
 float3 lit_factor(float open, float3 bounce, float3 skySeen, float sunTerm) {
@@ -792,6 +806,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     float surfT = 100000;  // AURORA_RT_LAYER_PASS: where the pixel's surface is, for the layers in front of it
     const float3 lightBefore = light;
     uint traces = 0, whyGap = 0, whyWorld = 0, whyBack = 0, whyCard = 0;  // MAIN_PROBE 9, 10
+    float sheetThrough = 1;  // SHEETS: how much of the surface the sheets the ray passed leave showing
     for (int i = 0; i < PrimaryLooks; ++i) {
       RayQuery<CameraRay> q;
       const bool gapLook = gapAt >= 0;
@@ -824,6 +839,7 @@ void main(uint3 id : SV_DispatchThreadID) {
       float4 surf = 0;
       if (d.cls == 1 && d.strength <= 0) {
         surf = shade(h, 0);
+        if (SHEETS && (d.highlight & 64) != 0) { sheetThrough *= 1 - saturate(surf.a); tmin = t + 0.02; ++whyCard; continue; }
         if (surf.a < 0.5) { tmin = t + 0.02; ++whyCard; continue; }
       }
       hitDepth = t;
@@ -962,11 +978,14 @@ void main(uint3 id : SV_DispatchThreadID) {
       }
       break;
     }
-    const float shows = layer_pass_on() && (MAIN_PROBE == 0) ? layer_through(0.xxx, v, 0.01, surfT, 0) : 1;
+    const float layers = layer_pass_on() && (MAIN_PROBE == 0) ? layer_through(0.xxx, v, 0.01, surfT, 0) : 1;
+    // SHEETS: the sheets the ray passed cover the surface as the layers do; the part they cover stays as the game drew it, the layers' share of the
+    // sky included
+    const float shows = layers * sheetThrough;
     if (shows < 1) {
       // the part the layers cover: the open sky's light, a share of it, on the layers' own colour as the raster has it
       const float3 sky = P.lightRays > 0 ? lit_factor(1, 0.xxx, 0.xxx, 0) : 1.xxx;
-      light = lightBefore + (light - lightBefore) * shows + (1 - shows) * LayerSkyShare * (sky - 1);
+      light = lightBefore + (light - lightBefore) * shows + (1 - layers) * sheetThrough * LayerSkyShare * (sky - 1);
       term *= shows;
     }
     if (GLOW_WIDE && n == 0 && max(raster.r, max(raster.g, raster.b)) > GlowWideKnee) {
@@ -1029,7 +1048,7 @@ void light_pass(uint3 id : SV_DispatchThreadID) {
     }
     Draw d = Draws[h.draw];
     if (d.cls >= 2) { tmin = t + 0.02; continue; }
-    if (d.cls == 1 && d.strength <= 0 && shade(h, 0).a < 0.5) { tmin = t + 0.02; continue; }
+    if (d.cls == 1 && d.strength <= 0 && ((SHEETS && (d.highlight & 64) != 0) || shade(h, 0).a < 0.5)) { tmin = t + 0.02; continue; }  // SHEETS: as main
     float3 N = h.nrm;
     if (dot(N, v) > 0) N = -N;
     float3 w = float3(1 - bary.x - bary.y, bary.x, bary.y);

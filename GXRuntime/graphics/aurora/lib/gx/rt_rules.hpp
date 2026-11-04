@@ -173,6 +173,7 @@ struct GpuDraw {
   std::uint32_t highlight;                // bit 0: has a stage looked up by the normal, the game's own shine; bit 1: glows, gives light; bit 2: outside the depth, drawn over the world, takes no light; bit 3: a blended layer writing no depth;
                                           // bit 4: a card turned to the picture (faces_picture, AURORA_RT_HUD_SKIP): the camera's rays alone meet it, it takes no light and casts no shadow
                                           // bit 5 (AURORA_RT_GLOW_WIDE): an additive sheet wider than a source (wide_glow): no hot core, no flare where it lies over the picture
+                                          // bit 6 (AURORA_RT_SHEETS): a sheet, translucent with a soft alpha and no reflection layer (soft_alpha): the camera's rays pass it
                                           // bits 8-12 (AURORA_RT_LIGHT_OWN): 1 + the number in lights of the machine light this body draw is beside (own_light), 0 none
   std::uint32_t fogType;
   float fog[3];
@@ -214,6 +215,39 @@ inline bool wide_glow(const DrawRec& d, const Vertex* verts, const GpuDraw& g, f
     return false;
   return widest_card(d, verts) >= size;
 }
+// AURORA_RT_SHEETS: a sheet is a translucent draw (class 1) with no reflection layer whose alpha runs smoothly across it: a cloud layer, a waterfall.
+// Its alpha's 0.5 line, where the camera's ray used to stop on it or pass it, cut such a sheet into sharp patches lit two ways. A cut-out (a grating,
+// a mesh road, a fence, a machine's number) is solid or clear texel by texel: its 0.5 line is its own outline, and it stays as it was. Told from the
+// draw's own data, the same on every course: some stage reads a soft alpha, from a texture (TEXA, through the stage's swap table) with at least
+// SheetSoftShare of its texels partly clear, or from the vertices' colour (RASA) running over at least SheetVertexSpread across the draw; and no
+// stage reads a cut-out's, a texture with at least SheetEdgeShare of its neighbouring texel pairs half the range apart (rt_capture.cpp s_texSoft,
+// s_texEdge). Measured: the cloud sheets of Loop Cross and Half Pipe and the falls of Drift Highway 0.87 to 1.00 partly clear, no such pairs; the
+// gratings and mesh roads 0.12 to 0.29 and 0.07 to 0.18; the machines' numbers 0.11 to 0.56 and 0.04. One texture is so for every draw that reads
+// it, so a fall's parts with a vertex fade and those without are told alike.
+constexpr float SheetSoftShare = 0.5f, SheetEdgeShare = 0.01f, SheetVertexSpread = 0.1f;
+inline bool soft_alpha(const DrawRec& d, const Vertex* verts, const float (*texSoft)[4], const float (*texEdge)[4], std::uint32_t texCount) {
+  const std::uint32_t stages = std::min<std::uint32_t>(d.stages, 16u);
+  bool soft = false;
+  for (std::uint32_t s = 0; s < stages; ++s) {
+    const StageRec& st = d.stage[s];
+    if (st.reflection != 0)
+      continue;
+    const auto reads = [&](std::uint32_t input) { return st.aa == input || st.ab == input || st.ac == input || st.ad == input; };
+    if (reads(4) && st.tex < texCount) {
+      const int ch = std::clamp(static_cast<int>(d.swap[st.swapTex & 3][3]), 0, 3);
+      if (texEdge[st.tex][ch] >= SheetEdgeShare)
+        return false;
+      soft = soft || texSoft[st.tex][ch] >= SheetSoftShare;
+    }
+    if (!soft && reads(5) && d.vertices > 0) {
+      float lo = 1.f, hi = 0.f;
+      for (std::uint32_t v = 0; v < d.vertices; ++v)
+        lo = std::min(lo, verts[d.firstVertex + v].ras[3]), hi = std::max(hi, verts[d.firstVertex + v].ras[3]);
+      soft = hi - lo >= SheetVertexSpread;
+    }
+  }
+  return soft;
+}
 
 struct Tuning {
   float machineGain = 2.f, machineCap = 0.45f, sceneryCap = 0.25f;
@@ -231,6 +265,10 @@ struct Tuning {
   bool overlayApart = false;  // AURORA_RT_HUD_SKIP=1: cards turned to the picture are the game's overlay in the world (faces_picture), not surfaces
   bool lightOwn = false;      // AURORA_RT_LIGHT_OWN=1: a body draw beside a machine light carries that light's number (GpuDraw highlight bits 8-12)
   float glowWide = 0.f;       // AURORA_RT_GLOW_WIDE=1: an additive draw at least this wide across (world units, wide_glow) is a sheet of light, not a source: no hot core, no flare (bit 5)
+  // AURORA_RT_SHEETS=1: each texture's soft and edge shares, by channel (rt_capture.cpp s_texSoft, s_texEdge); null: off (soft_alpha, bit 6)
+  const float (*texSoft)[4] = nullptr;
+  const float (*texEdge)[4] = nullptr;
+  std::uint32_t texSoftCount = 0;
 };
 struct Frame {
   std::vector<float> prevPos;       // each of verts in the last frame's view space, with motion data on (rt_motion.hpp)
@@ -497,6 +535,8 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
       }
     }
     g.strength = strength;
+    if (t.texSoft != nullptr && g.cls == 1 && strength <= 0.f && soft_alpha(d, verts, t.texSoft, t.texEdge, t.texSoftCount))
+      g.highlight |= 64;
     if (!inView)
       continue;
     if (!out.main)

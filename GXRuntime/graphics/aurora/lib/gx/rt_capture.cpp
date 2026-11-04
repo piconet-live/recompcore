@@ -153,6 +153,11 @@ struct TexSnap {
 };
 constexpr u32 MostTexAvg = 8192;
 float s_texAvg[MostTexAvg][4];  // a texture's mean colour, for a draw's brightness; written before its index is known to anyone
+// AURORA_RT_SHEETS (rt_rules.hpp soft_alpha), channel by channel, written beside the mean and read only with the switch: soft, the share of texels
+// partly clear (16..239 of 255): a cloud or a waterfall has most of them so; edge, the share of neighbouring texel pairs (across and down) that
+// differ by half or more: a cut-out (a grating, a mesh road, a fence, a machine's number) has them along every outline, a soft alpha none
+float s_texSoft[MostTexAvg][4];
+float s_texEdge[MostTexAvg][4];
 using TexKey = std::tuple<const void*, u32, u32, u32, const void*>;
 std::mutex s_texLock;
 u32 add_texture(const TexSnap& snap) {
@@ -193,13 +198,26 @@ u32 add_texture(const TexSnap& snap) {
   Tex t{w, h, static_cast<u32>(obj.wrap_s()), static_cast<u32>(obj.wrap_t()), index, {}};
   t.rgba.assign(conv.data.data(), conv.data.data() + static_cast<size_t>(w) * h * 4u);
   if (index < MostTexAvg) {
-    u64 sum[4]{};
-    for (size_t i = 0; i < t.rgba.size(); i += 4)
-      for (int c = 0; c < 4; ++c)
-        sum[c] += t.rgba[i + c];
-    const double n = 255.0 * w * h;
-    for (int c = 0; c < 4; ++c)
+    u64 sum[4]{}, soft[4]{}, edge[4]{};
+    const u8* px = t.rgba.data();
+    for (u32 y = 0; y < h; ++y)
+      for (u32 x = 0; x < w; ++x) {
+        const u8* at = px + (static_cast<size_t>(y) * w + x) * 4u;
+        for (int c = 0; c < 4; ++c) {
+          sum[c] += at[c];
+          soft[c] += at[c] >= 16 && at[c] < 240 ? 1 : 0;
+          if (x + 1 < w)
+            edge[c] += std::abs(at[c] - at[4 + c]) >= 128 ? 1 : 0;
+          if (y + 1 < h)
+            edge[c] += std::abs(at[c] - at[static_cast<size_t>(w) * 4u + c]) >= 128 ? 1 : 0;
+        }
+      }
+    const double n = 255.0 * w * h, texels = static_cast<double>(w) * h, pairs = std::max(2.0 * texels - w - h, 1.0);
+    for (int c = 0; c < 4; ++c) {
       s_texAvg[index][c] = static_cast<float>(sum[c] / n);
+      s_texSoft[index][c] = static_cast<float>(static_cast<double>(soft[c]) / texels);
+      s_texEdge[index][c] = static_cast<float>(static_cast<double>(edge[c]) / pairs);
+    }
   }
   s_texs.push_back(std::move(t));
   s_texIndex[key] = index;
@@ -1252,6 +1270,17 @@ void run_rules(live::Job& j) {
     return size != nullptr && std::atof(size) > 0 ? static_cast<float>(std::atof(size)) : 4.f;
   }();
   tuning.glowWide = glowWide;
+  // AURORA_RT_SHEETS=1 (off by default): a translucent draw with no reflection layer whose alpha runs smoothly over it (cloud sheets, waterfalls) is
+  // a sheet (rt_rules.hpp soft_alpha, GpuDraw bit 6), and the camera's rays pass it (rt.hlsl SHEETS)
+  static const bool sheets = [] {
+    const char* v = std::getenv("AURORA_RT_SHEETS");
+    return v != nullptr && std::atof(v) != 0;
+  }();
+  if (sheets) {
+    tuning.texSoft = s_texSoft;
+    tuning.texEdge = s_texEdge;
+    tuning.texSoftCount = MostTexAvg;
+  }
   if (j.glow > 0.f) {
     tuning.texMeans = s_texAvg;
     tuning.texCount = MostTexAvg;
