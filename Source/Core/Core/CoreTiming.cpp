@@ -395,7 +395,18 @@ void CoreTimingManager::Advance()
   // It's important to do this after processing events otherwise any exceptions will be delayed
   // until the next slice:
   //        Pokemon Box refuses to boot if the first exception from the audio DMA is received late
+  const u32 fz_pc = ppc_state.pc;
   power_pc.CheckExternalExceptions();
+  if (FzgxProbe::StepCensus* const census = FzgxProbe::g_step_census)
+  {
+    ++census->advances;
+    if (ppc_state.pc != fz_pc)
+    {
+      ++census->delivered;
+      FzgxProbe::StepPc(census->taken, ppc_state.pc, ppc_state.spr[SPR_SRR0]);
+      FzgxProbe::StepHandler(ppc_state.spr[SPR_SRR0], ppc_state.gpr[1]);
+    }
+  }
 }
 
 TimePoint CoreTimingManager::CalculateTargetHostTimeInternal(s64 target_cycle)

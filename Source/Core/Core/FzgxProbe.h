@@ -102,4 +102,72 @@ struct PaceContext
 };
 void PaceCacheSize(unsigned long long entries, unsigned long long pooled, unsigned int invalidated);
 void PaceEvent(int kind, unsigned int address);         // 0 fallback JIT entered, 1 instruction interpreted, 2 chunk checked
+
+// The step census (the deep-rollback probe: piconet-runner port/moderngekko/src/lanes_census.cpp). While the runner
+// points g_step_census at its record (a step run again, on the game's thread), the run loop counts what it does for
+// the guest beside the native code: exceptions the generated code raises, exceptions and interrupts the emulator
+// delivers, entries of the fallback JIT and the interpreter, CoreTiming's slices, idle loops skipped, and native
+// dispatches on another OS thread than the one the census began on. Null (always, unless the runner's key asks):
+// one test of a pointer at each of those places.
+struct StepCensus
+{
+  struct Pc
+  {
+    unsigned int pc = 0, from = 0;  // the vector or entry, and SRR0 (where it came from) at the first one
+    unsigned long long count = 0;
+  };
+  static constexpr int PCS = 32;
+  unsigned long long native_exceptions = 0;  // raised by generated code (by vector: `raised`)
+  unsigned long long delivered = 0;          // delivered by the emulator after a native burst or in a slice (`taken`)
+  unsigned long long jit_entries = 0, jit_tsc = 0;  // the fallback JIT entered (by pc: `jit`), and the time in it
+  unsigned long long interpreted = 0;        // instructions stepped by the interpreter (forced fallback ranges)
+  unsigned long long advances = 0;           // CoreTiming::Advance calls: its events (GPU, VI, audio, alarms) ran
+  unsigned long long idles = 0;              // idle loops skipped (the emulator's clock jumped)
+  unsigned long long other_thread = 0;       // native dispatches while the OS's current thread (0x800000E4) differs
+  unsigned int thread = 0;                   // that word when the census began (the runner sets it)
+  unsigned int first_other_pc = 0;
+  unsigned long long lost = 0;               // entries past a table's room
+  // A handler runs: from an exception's delivery or raise until the code it interrupted runs again (a native
+  // dispatch at its SRR0 with its stack pointer). What the hooks see meanwhile is the handler's, not the step's.
+  bool in_handler = false;
+  unsigned int handler_pc = 0, handler_sp = 0;
+  unsigned long long handlers = 0, handler_dispatches = 0;
+  unsigned long long jit_outside = 0;        // fallback JIT entries outside a handler at no vector (`jit_step`)
+  Pc raised[PCS], taken[PCS], jit[PCS], jit_step[PCS];
+};
+extern StepCensus* g_step_census;
+inline void StepHandler(unsigned int interrupted_pc, unsigned int stack_pointer)
+{
+  StepCensus* const c = g_step_census;
+  if (c->in_handler)
+    return;
+  c->in_handler = true;
+  c->handler_pc = interrupted_pc;
+  c->handler_sp = stack_pointer;
+  ++c->handlers;
+}
+inline void StepDispatch(unsigned int address, unsigned int stack_pointer)
+{
+  StepCensus* const c = g_step_census;
+  if (!c->in_handler)
+    return;
+  ++c->handler_dispatches;
+  if (address == c->handler_pc && stack_pointer == c->handler_sp)
+    c->in_handler = false;
+}
+inline void StepPc(StepCensus::Pc* table, unsigned int pc, unsigned int from)
+{
+  for (int i = 0; i < StepCensus::PCS; ++i)
+  {
+    if (table[i].count != 0 && table[i].pc != pc)
+      continue;
+    if (table[i].count++ == 0)
+    {
+      table[i].pc = pc;
+      table[i].from = from;
+    }
+    return;
+  }
+  ++g_step_census->lost;
+}
 }  // namespace FzgxProbe
