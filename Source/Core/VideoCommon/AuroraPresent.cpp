@@ -193,11 +193,13 @@ bool Load(const std::string& path)
   if (!s_module)
   {
     const std::wstring wide = UTF8ToWString(path);
-    // AURORA_DXC_FIRST=1: the shader compiler is loaded first and never freed, so it initialises before Dawn and
-    // detaches after it. Dawn would load it last, and at process exit a DXC object it still held was released after
-    // dxcompiler.dll had detached: DXC's own assert, a breakpoint at dxcompiler.dll+0x10750f. Dawn's load finds this one.
+    // The shader compiler is loaded first and never freed, so it initialises before Dawn and detaches after it
+    // (Windows detaches in reverse order of initialisation). Dawn would load it last, and at process exit a DXC object
+    // it still held was released after dxcompiler.dll had detached: DXC's own assert in DxcSwapThreadMalloc, a
+    // breakpoint at dxcompiler.dll+0x10750f, and WerFault at every Aurora run's end. Dawn's load finds this one.
+    // AURORA_DXC_FIRST=0 leaves it to Dawn (the old order, for a comparison run only).
     const char* const dxc_first = std::getenv("AURORA_DXC_FIRST");
-    if (dxc_first && dxc_first[0] == '1')
+    if (!(dxc_first && dxc_first[0] == '0'))
     {
       const size_t slash = wide.find_last_of(L"\\/");
       const std::wstring dxc = (slash == std::wstring::npos ? std::wstring() : wide.substr(0, slash + 1)) + L"dxcompiler.dll";
