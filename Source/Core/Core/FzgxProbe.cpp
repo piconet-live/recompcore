@@ -77,6 +77,7 @@ unsigned long long g_ext[32] = {};
 unsigned long long g_task_emu_tsc = 0;
 bool g_task_active = false;
 int g_census_task = -1;
+StepCensus* g_step_census = nullptr;
 bool g_census_on = false;  // FZGX_CENSUS: ReadSettings()
 unsigned long long g_census[3][12] = {};
 unsigned long long g_census_read_tsc[3] = {};

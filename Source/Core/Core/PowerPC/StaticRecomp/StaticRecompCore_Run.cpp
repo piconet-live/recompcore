@@ -176,6 +176,14 @@ void StaticRecompCore::Run()
           m_module->dispatch(&m_guest, linked_dispatch_address);
           ++FzgxProbe::g_dispatches;
           FzgxProbe::CensusDispatch(m_guest.pc);
+          if (FzgxProbe::StepCensus* const census = FzgxProbe::g_step_census)
+          {
+            const u8* t = m_guest.ram + 0xE4;  // OSCurrentThread
+            if ((static_cast<u32>(t[0]) << 24 | static_cast<u32>(t[1]) << 16 | static_cast<u32>(t[2]) << 8 | t[3]) !=
+                    census->thread &&
+                census->other_thread++ == 0)
+              census->first_other_pc = linked_dispatch_address;
+          }
           if (m_has_rel_modules)
             m_guest.pc = TranslateRelAddress(m_guest.pc);
           ++m_native_dispatches;
@@ -213,6 +221,8 @@ void StaticRecompCore::Run()
                                      m_guest.pc == runtime_dispatch_address &&
                                      IsBusyWaitLoop(runtime_dispatch_address);
           FzgxProbe::g_idles += configured_idle || detected_idle;
+          if (FzgxProbe::g_step_census && (configured_idle || detected_idle))
+            ++FzgxProbe::g_step_census->idles;
           if (configured_idle || detected_idle)
           {
             m_system.GetCoreTiming().Idle();
@@ -236,6 +246,11 @@ void StaticRecompCore::Run()
             m_guest.program_exception = 0;
             ++m_native_exceptions;
             FzgxProbe::Census(10);
+            if (FzgxProbe::g_step_census)
+            {
+              ++FzgxProbe::g_step_census->native_exceptions;
+              FzgxProbe::StepPc(FzgxProbe::g_step_census->raised, m_guest.pc, m_guest.srr0);
+            }
           }
           if ((ppc.Exceptions & SYNC_EXCEPTION_MASK) != 0)
             break;  // Hook-raised synchronous exception: deliver via Dolphin below.
@@ -246,11 +261,17 @@ void StaticRecompCore::Run()
                  !(m_guest.host_call && IsHostCallAddress(m_guest.pc)) && ppc.downcount > 0 &&
                  *state_ptr == CPU::State::Running);
         SyncOut();
+        const u32 fz_pc = ppc.pc;
         if ((ppc.Exceptions & SYNC_EXCEPTION_MASK) != 0)
           power_pc.CheckExceptions();
         else if ((ppc.Exceptions & EXCEPTION_EXTERNAL_INT) != 0 && ppc.msr.EE &&
                  after_mtmsr(ppc.pc))
           power_pc.CheckExternalExceptions();
+        if (FzgxProbe::g_step_census && ppc.pc != fz_pc)
+        {
+          ++FzgxProbe::g_step_census->delivered;
+          FzgxProbe::StepPc(FzgxProbe::g_step_census->taken, ppc.pc, ppc.spr[SPR_SRR0]);
+        }
       }
       else
       {
@@ -285,13 +306,22 @@ void StaticRecompCore::Run()
         {
           ppc.downcount -= interpreter.SingleStepInner();
           ++m_fallback_steps;
+          if (FzgxProbe::g_step_census)
+            ++FzgxProbe::g_step_census->interpreted;
         }
         else if (m_fallback_jit)
         {
           const u64 fz_t0 = __rdtsc();
           FzgxProbe::PaceEvent(0, ppc.pc);
+          if (FzgxProbe::g_step_census)
+          {
+            ++FzgxProbe::g_step_census->jit_entries;
+            FzgxProbe::StepPc(FzgxProbe::g_step_census->jit, ppc.pc, ppc.spr[SPR_SRR0]);
+          }
           m_fallback_jit->Run();
           FzgxProbe::g_jit_tsc += __rdtsc() - fz_t0;
+          if (FzgxProbe::g_step_census)
+            FzgxProbe::g_step_census->jit_tsc += __rdtsc() - fz_t0;
         }
         else
         {
@@ -299,6 +329,8 @@ void StaticRecompCore::Run()
           {
             ppc.downcount -= interpreter.SingleStepInner();
             ++m_fallback_steps;
+            if (FzgxProbe::g_step_census)
+              ++FzgxProbe::g_step_census->interpreted;
           } while (!(m_module_active && DispatchableAt(ppc.pc)) &&
                    !IsHostCallAddress(ppc.pc) && ppc.downcount > 0 &&
                    *state_ptr == CPU::State::Running);
