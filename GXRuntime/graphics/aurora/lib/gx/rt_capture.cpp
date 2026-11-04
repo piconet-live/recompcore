@@ -1236,6 +1236,22 @@ void run_rules(live::Job& j) {
     return v != nullptr && std::atof(v) != 0;
   }();
   tuning.overlayApart = overlayApart;
+  // AURORA_RT_LIGHT_OWN=1 (off by default): each body draw beside a machine light is marked as that light's own (rt_rules.hpp, rt.hlsl LIGHT_OWN)
+  static const bool lightOwn = [] {
+    const char* v = std::getenv("AURORA_RT_LIGHT_OWN");
+    return v != nullptr && std::atof(v) != 0;
+  }();
+  tuning.lightOwn = lightOwn;
+  // AURORA_RT_GLOW_WIDE=1 (off by default): an additive draw at least AURORA_RT_GLOW_WIDE_SIZE across (world units, 4 by default) gives no hot core
+  // and no flare (rt_rules.hpp wide_glow, rt.hlsl GLOW_WIDE)
+  static const float glowWide = [] {
+    const char* v = std::getenv("AURORA_RT_GLOW_WIDE");
+    if (v == nullptr || std::atof(v) == 0)
+      return 0.f;
+    const char* size = std::getenv("AURORA_RT_GLOW_WIDE_SIZE");
+    return size != nullptr && std::atof(size) > 0 ? static_cast<float>(std::atof(size)) : 4.f;
+  }();
+  tuning.glowWide = glowWide;
   if (j.glow > 0.f) {
     tuning.texMeans = s_texAvg;
     tuning.texCount = MostTexAvg;
@@ -2013,6 +2029,17 @@ static void send_rays() noexcept {
 
 static u32 s_zNow = 0, s_zLast = 0;
 static bool s_beforeTaken = false;
+// AURORA_RT_BEFORE_LATEST=1 (off by default, with AURORA_RT_BEFORE_BLENDS=1): the moment before the last blended draws from this frame's own order,
+// not from the last frame's count alone. The count of depth-writing draws changes from frame to frame as the camera moves (the intro's flyover): a frame
+// with fewer than the last never took the picture and lit the raster with its blends, one with more took it too early, and the two alternated (the far
+// ground's flicker). Now the picture is taken at the first blended draw once the count passes most of the last frame's (BeforeShare), and again at each
+// blended draw that follows a depth-writing one after that, so the last one taken is before the frame's last blended draws. A frame takes it a few times
+// at most (s_beforeTakes, AURORA_RT_BEFORE_LOG=1 prints how many a frame took, every 600 frames).
+static bool s_zSinceBefore = false;
+static u32 s_beforeTakes = 0;
+static u64 s_beforeFrames = 0, s_beforeTakesSum = 0, s_beforeMissed = 0;
+static u32 s_beforeMost = 0;
+constexpr float BeforeShare = 0.85f;
 void before_draw() noexcept {
 #if defined(AURORA_RT_LIVE)
   // AURORA_RT_LIGHTFACTS: where the frame's orthographic draws fall against the scene
@@ -2030,10 +2057,22 @@ void before_draw() noexcept {
     ++s_viewDraws;
     // AURORA_RT_BEFORE_BLENDS=1: the frame's last blended draws come after its last depth-writing draw; last frame's count of those says when
     static const bool beforeOn = live::before_on();
+    static const bool latest = [] {
+      const char* v = std::getenv("AURORA_RT_BEFORE_LATEST");
+      return v != nullptr && v[0] == '1';
+    }();
     if (beforeOn && g_capturing) {
-      if (g_gxState.depthUpdate)
+      if (g_gxState.depthUpdate) {
         ++s_zNow;
-      else if (!s_beforeTaken && s_zLast > 0 && s_zNow >= s_zLast) {
+        s_zSinceBefore = true;
+      } else if (latest) {
+        if (s_zLast > 0 && s_zSinceBefore && static_cast<float>(s_zNow) >= static_cast<float>(s_zLast) * BeforeShare) {
+          s_beforeTaken = true;
+          s_zSinceBefore = false;
+          ++s_beforeTakes;
+          live::snapshot_before();
+        }
+      } else if (!s_beforeTaken && s_zLast > 0 && s_zNow >= s_zLast) {
         s_beforeTaken = true;
         live::snapshot_before();
       }
@@ -2046,7 +2085,7 @@ void before_draw() noexcept {
 void efb_cleared() noexcept {
   if (!g_hook || s_rayed)
     return;
-  s_zNow = 0, s_beforeTaken = false;
+  s_zNow = 0, s_beforeTaken = false, s_zSinceBefore = false, s_beforeTakes = 0;
 #if defined(AURORA_RT_LIVE)
   forget_draws();
 #endif
@@ -2079,7 +2118,18 @@ void frame_end() noexcept {
     }
     if (s_seenPerspective)
       send_rays();
-    s_zLast = s_zNow, s_zNow = 0, s_beforeTaken = false;
+    {
+      static const bool beforeLog = std::getenv("AURORA_RT_BEFORE_LOG") != nullptr;
+      if (beforeLog && s_zNow > 0) {
+        ++s_beforeFrames, s_beforeTakesSum += s_beforeTakes, s_beforeMost = std::max(s_beforeMost, s_beforeTakes);
+        s_beforeMissed += s_beforeTaken ? 0 : 1;
+        if (s_beforeFrames % 600 == 0)
+          std::fprintf(stderr, "[rt] before blends: %llu frames, pictures taken %.2f a frame (most %u), frames with none %llu; depth-writing draws this frame %u, last %u\n",
+                       static_cast<unsigned long long>(s_beforeFrames), static_cast<double>(s_beforeTakesSum) / s_beforeFrames, s_beforeMost,
+                       static_cast<unsigned long long>(s_beforeMissed), s_zNow, s_zLast);
+      }
+    }
+    s_zLast = s_zNow, s_zNow = 0, s_beforeTaken = false, s_zSinceBefore = false, s_beforeTakes = 0;
     s_rayed = false;
     s_seenPerspective = false;
     forget_draws();
