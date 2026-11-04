@@ -516,7 +516,7 @@ struct ShaderConfig {
   u8 logicOutput : 2 = 0; // a logic op's colour: 1 = all ones (GX_LO_INV, GX_LO_SET), 2 = inverted (GX_LO_INVCOPY)
   u8 softCard : 2 = 0;    // AURORA_RT_SOFT_CARDS (soft_cards.hpp): the fade near the depth behind scales 1 = the alpha, 2 = the colour
   u8 pad1 : 1 = 0;
-  u8 pad2 = 0;
+  u8 cardRange = 0;       // AURORA_RT_CARDS (gx.cpp card_range): the draw's output in the game's own range, 1 = its alpha, 2 = its alpha and colour (a blended card)
   std::array<AttrConfig, MaxVtxAttr> attrs;
   std::array<TevSwap, MaxTevSwap> tevSwapTable;
   std::array<TevStage, MaxTevStages> tevStages;
