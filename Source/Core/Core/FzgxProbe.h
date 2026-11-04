@@ -127,9 +127,34 @@ struct StepCensus
   unsigned int thread = 0;                   // that word when the census began (the runner sets it)
   unsigned int first_other_pc = 0;
   unsigned long long lost = 0;               // entries past a table's room
-  Pc raised[PCS], taken[PCS], jit[PCS];
+  // A handler runs: from an exception's delivery or raise until the code it interrupted runs again (a native
+  // dispatch at its SRR0 with its stack pointer). What the hooks see meanwhile is the handler's, not the step's.
+  bool in_handler = false;
+  unsigned int handler_pc = 0, handler_sp = 0;
+  unsigned long long handlers = 0, handler_dispatches = 0;
+  unsigned long long jit_outside = 0;        // fallback JIT entries outside a handler at no vector (`jit_step`)
+  Pc raised[PCS], taken[PCS], jit[PCS], jit_step[PCS];
 };
 extern StepCensus* g_step_census;
+inline void StepHandler(unsigned int interrupted_pc, unsigned int stack_pointer)
+{
+  StepCensus* const c = g_step_census;
+  if (c->in_handler)
+    return;
+  c->in_handler = true;
+  c->handler_pc = interrupted_pc;
+  c->handler_sp = stack_pointer;
+  ++c->handlers;
+}
+inline void StepDispatch(unsigned int address, unsigned int stack_pointer)
+{
+  StepCensus* const c = g_step_census;
+  if (!c->in_handler)
+    return;
+  ++c->handler_dispatches;
+  if (address == c->handler_pc && stack_pointer == c->handler_sp)
+    c->in_handler = false;
+}
 inline void StepPc(StepCensus::Pc* table, unsigned int pc, unsigned int from)
 {
   for (int i = 0; i < StepCensus::PCS; ++i)

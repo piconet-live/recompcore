@@ -172,6 +172,8 @@ void StaticRecompCore::Run()
           FzgxProbe::g_trace_r1 = m_guest.gpr[1];
           FzgxProbe::g_trace_r3 = m_guest.gpr[3];
           FzgxProbe::OnNativeDispatch(linked_dispatch_address, m_guest.lr);
+          if (FzgxProbe::g_step_census)
+            FzgxProbe::StepDispatch(linked_dispatch_address, m_guest.gpr[1]);  // (before: the code resumed is the step's)
           BeginDispatchBudget(m_wait_streak != 0);
           m_module->dispatch(&m_guest, linked_dispatch_address);
           ++FzgxProbe::g_dispatches;
@@ -250,6 +252,7 @@ void StaticRecompCore::Run()
             {
               ++FzgxProbe::g_step_census->native_exceptions;
               FzgxProbe::StepPc(FzgxProbe::g_step_census->raised, m_guest.pc, m_guest.srr0);
+              FzgxProbe::StepHandler(m_guest.srr0, m_guest.gpr[1]);
             }
           }
           if ((ppc.Exceptions & SYNC_EXCEPTION_MASK) != 0)
@@ -271,6 +274,7 @@ void StaticRecompCore::Run()
         {
           ++FzgxProbe::g_step_census->delivered;
           FzgxProbe::StepPc(FzgxProbe::g_step_census->taken, ppc.pc, ppc.spr[SPR_SRR0]);
+          FzgxProbe::StepHandler(ppc.spr[SPR_SRR0], ppc.gpr[1]);
         }
       }
       else
@@ -317,6 +321,11 @@ void StaticRecompCore::Run()
           {
             ++FzgxProbe::g_step_census->jit_entries;
             FzgxProbe::StepPc(FzgxProbe::g_step_census->jit, ppc.pc, ppc.spr[SPR_SRR0]);
+            if (!FzgxProbe::g_step_census->in_handler && ppc.pc >= 0x2000u)
+            {
+              ++FzgxProbe::g_step_census->jit_outside;
+              FzgxProbe::StepPc(FzgxProbe::g_step_census->jit_step, ppc.pc, ppc.spr[SPR_LR]);
+            }
           }
           m_fallback_jit->Run();
           FzgxProbe::g_jit_tsc += __rdtsc() - fz_t0;

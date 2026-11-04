@@ -404,6 +404,7 @@ void CoreTimingManager::Advance()
     {
       ++census->delivered;
       FzgxProbe::StepPc(census->taken, ppc_state.pc, ppc_state.spr[SPR_SRR0]);
+      FzgxProbe::StepHandler(ppc_state.spr[SPR_SRR0], ppc_state.gpr[1]);
     }
   }
 }
