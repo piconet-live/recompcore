@@ -93,7 +93,7 @@ void StaticRecompCore::Run()
     if (lookup_index < 0 || lookup_index >= static_cast<int>(m_chunk_lookup_table.size()))
       return false;
     const int chunk = m_chunk_lookup_table[lookup_index];
-    return chunk >= 0 && m_chunk_state[chunk] == CHUNK_VERIFIED;
+    return chunk >= 0 && ChunkState(chunk) == CHUNK_VERIFIED;
   };
 
   const std::string initial_game_id = SConfig::GetInstance().GetGameID();

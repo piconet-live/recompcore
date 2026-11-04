@@ -23,12 +23,16 @@ namespace { struct FzTimer { u64 t = __rdtsc(); ~FzTimer() { FzgxProbe::g_interp
 
 namespace
 {
+// The thread that must not reach these hooks (StaticRecompCore::SetForeignThread): its function, called first.
+thread_local StaticRecompCore::ForeignThreadHit t_foreign_thread = nullptr;
 inline StaticRecompCore* core_of(CPUState* cpu) { return static_cast<StaticRecompCore*>(cpu->external_user_data); }
 constexpr u32 LOCKED_CACHE_BASE = 0xE0000000u;
 }
 
 bool StaticRecompCore::HookHostCall(CPUState* cpu, u32 address)
 {
+  if (const ForeignThreadHit hit = t_foreign_thread)
+    hit("HookHostCall");
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
   return core->m_module_source.host_call &&
          core->m_module_source.host_call(cpu, address, core->m_module_source.host_call_user);
@@ -36,6 +40,8 @@ bool StaticRecompCore::HookHostCall(CPUState* cpu, u32 address)
 
 u64 StaticRecompCore::HookExternalRead(CPUState* cpu, u32 ea, u8 size)
 {
+  if (const ForeignThreadHit hit = t_foreign_thread)
+    hit("HookExternalRead");
   ++FzgxProbe::g_ext[ea >> 28];
   // Spike fast path: the locked L1 cache (0xE0000000, GX's scratchpad) straight from Dolphin's backing store.
   if ((ea >> 28) == 0xEu)
@@ -97,6 +103,8 @@ u64 StaticRecompCore::HookExternalRead(CPUState* cpu, u32 ea, u8 size)
 
 void StaticRecompCore::HookExternalWrite(CPUState* cpu, u32 ea, u64 value, u8 size)
 {
+  if (const ForeignThreadHit hit = t_foreign_thread)
+    hit("HookExternalWrite");
   struct WriteTimer
   {
     u64 t = FzgxProbe::g_census_on ? __rdtsc() : 0;
@@ -205,6 +213,8 @@ void StaticRecompCore::HookExternalWrite(CPUState* cpu, u32 ea, u64 value, u8 si
 
 void StaticRecompCore::HookGatherPipeFlush(CPUState* cpu)
 {
+  if (const ForeignThreadHit hit = t_foreign_thread)
+    hit("HookGatherPipeFlush");
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
   ++FzgxProbe::g_gather_flushes;
   core->FlushDispatchCharge();
@@ -233,6 +243,8 @@ void StaticRecompCore::PublishGatherPipe(bool say)
 
 u32 StaticRecompCore::HookExternalRead32(CPUState* cpu, u32 ea, u8 rid)
 {
+  if (const ForeignThreadHit hit = t_foreign_thread)
+    hit("HookExternalRead32");
   // eciwx external-control read. EAR-enable and alignment were checked by the
   // generated helper; Dolphin's interpreter services the access as a plain
   // MMU read (the rid is carried in EAR only).
@@ -253,6 +265,8 @@ u32 StaticRecompCore::HookExternalRead32(CPUState* cpu, u32 ea, u8 rid)
 
 void StaticRecompCore::HookExternalWrite32(CPUState* cpu, u32 ea, u32 value, u8 rid)
 {
+  if (const ForeignThreadHit hit = t_foreign_thread)
+    hit("HookExternalWrite32");
   // ecowx external-control write; see HookExternalRead32.
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
   ea = core->TranslateRelAddress(ea);
@@ -270,6 +284,8 @@ void StaticRecompCore::HookExternalWrite32(CPUState* cpu, u32 ea, u32 value, u8 
 
 void* StaticRecompCore::HookExternalPointer(CPUState* cpu, u32 ea, u32 size)
 {
+  if (const ForeignThreadHit hit = t_foreign_thread)
+    hit("HookExternalPointer");
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
   auto& memory = core->m_system.GetMemory();
   if (ea >= LOCKED_CACHE_BASE && size != 0 &&
@@ -287,6 +303,8 @@ void* StaticRecompCore::HookExternalPointer(CPUState* cpu, u32 ea, u32 size)
 
 u32 StaticRecompCore::HookSPRRead(CPUState* cpu, u16 spr, u32 cia)
 {
+  if (const ForeignThreadHit hit = t_foreign_thread)
+    hit("HookSPRRead");
   FzgxProbe::Census(8);
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
   auto& ppc = core->m_system.GetPPCState();
@@ -326,6 +344,8 @@ u32 StaticRecompCore::HookSPRRead(CPUState* cpu, u16 spr, u32 cia)
 
 void StaticRecompCore::HookSPRWrite(CPUState* cpu, u16 spr, u32 value, u32 cia)
 {
+  if (const ForeignThreadHit hit = t_foreign_thread)
+    hit("HookSPRWrite");
   FzgxProbe::Census(9);
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
   auto& system = core->m_system;
@@ -436,6 +456,8 @@ void StaticRecompCore::HookSPRWrite(CPUState* cpu, u16 spr, u32 value, u32 cia)
 
 void StaticRecompCore::HookCacheControl(CPUState* cpu, u8 operation, u32 ea, u32 cia)
 {
+  if (const ForeignThreadHit hit = t_foreign_thread)
+    hit("HookCacheControl");
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
   ea = core->TranslateRelAddress(ea);
   core->PropagateGuestMSR();
@@ -473,6 +495,8 @@ void StaticRecompCore::HookCacheControl(CPUState* cpu, u8 operation, u32 ea, u32
 
 void StaticRecompCore::HookInstructionFallback(CPUState* cpu, u32 raw, u32 cia)
 {
+  if (const ForeignThreadHit hit = t_foreign_thread)
+    hit("HookInstructionFallback");
   FzgxProbe::Census(7);
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
   cia = core->TranslateRelAddress(cia);
@@ -539,4 +563,14 @@ void StaticRecompCore::HookInstructionFallback(CPUState* cpu, u32 raw, u32 cia)
   ppc.npc = cia + 4;
   ppc.downcount -= system.GetInterpreter().SingleStepInner();
   core->SyncIn();
+}
+
+void StaticRecompCore::SetForeignThread(ForeignThreadHit hit)
+{
+  t_foreign_thread = hit;
+}
+
+StaticRecompCore::ForeignThreadHit StaticRecompCore::ForeignThread()
+{
+  return t_foreign_thread;
 }

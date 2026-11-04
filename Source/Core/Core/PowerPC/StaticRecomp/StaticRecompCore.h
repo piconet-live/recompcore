@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -57,6 +58,16 @@ public:
   // A second CPU context that runs the module (the fzgx runner's deep-rollback worker) hands the module a pipe of its
   // own for a job; this hands back the one PublishGatherPipe gave it (or none), saying nothing.
   void RestoreGatherPipe() { PublishGatherPipe(false); }
+  // The code tables' generation: bumped whenever a chunk's state or the module's entry and indirect-call tables change
+  // (a verify, a retire, a clear). A second CPU context that runs the module on another thread (the fzgx runner's
+  // deep-rollback worker) reads the chunk states while this thread writes them (relaxed atomics, ChunkState), takes
+  // the generation at its job's start, and gives the job up when it has moved by the job's end.
+  u64 CodeGeneration() const { return m_code_generation.load(std::memory_order_acquire); }
+  // A thread that must not reach this core's hooks (the worker's thread) names a function they call first, with the
+  // hook's name; nullptr on every other thread. The hooks stay as they are on the game's thread.
+  using ForeignThreadHit = void (*)(const char* hook);
+  static void SetForeignThread(ForeignThreadHit hit);
+  static ForeignThreadHit ForeignThread();
   bool ShouldYieldAt(u32 address);
 
   // True when `address` is the head of a guest busy-wait loop, so the
@@ -219,7 +230,17 @@ private:
   bool m_hook_flush = true;  // FZGX_NO_HOOK_FLUSH=1 turns FlushDispatchCharge off (for bisecting)
 
   // D4 guard state: parallel to m_module->chunk_ranges.
-  std::vector<u8> m_chunk_state;
+  std::vector<u8> m_chunk_state;  // read on other threads too: only through ChunkState and SetChunkState
+  std::atomic<u64> m_code_generation{0};
+  u8 ChunkState(std::size_t index) const
+  {
+    return std::atomic_ref<u8>(const_cast<u8&>(m_chunk_state[index])).load(std::memory_order_relaxed);
+  }
+  void SetChunkState(std::size_t index, u8 state)
+  {
+    std::atomic_ref<u8>(m_chunk_state[index]).store(state, std::memory_order_relaxed);
+    m_code_generation.fetch_add(1, std::memory_order_release);
+  }
   mutable std::vector<u8> m_chunk_host_call_state;
   std::vector<StaticRecompRange> m_forced_fallback_ranges;
   struct ActiveRelSection
