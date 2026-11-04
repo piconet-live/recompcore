@@ -172,6 +172,7 @@ struct GpuDraw {
   float strength;                         // reflection strength; machines boosted, scenery capped
   std::uint32_t highlight;                // bit 0: has a stage looked up by the normal, the game's own shine; bit 1: glows, gives light; bit 2: outside the depth, drawn over the world, takes no light; bit 3: a blended layer writing no depth;
                                           // bit 4: a card turned to the picture (faces_picture, AURORA_RT_HUD_SKIP): the camera's rays alone meet it, it takes no light and casts no shadow
+                                          // bit 5 (AURORA_RT_GLOW_WIDE): an additive sheet wider than a source (wide_glow): no hot core, no flare where it lies over the picture
                                           // bits 8-12 (AURORA_RT_LIGHT_OWN): 1 + the number in lights of the machine light this body draw is beside (own_light), 0 none
   std::uint32_t fogType;
   float fog[3];
@@ -179,6 +180,41 @@ struct GpuDraw {
   float regs[4][4];
   std::uint32_t swap[4];  // one table a word, a byte a channel
 };
+// AURORA_RT_GLOW_WIDE: the glow (hot core, flare) is the character of small sources: a flame, a spark, a glow card. An additive draw with a card as
+// wide as no such source is (a card: two triangles in a row, or a lone last one; its area over its length, so a long thin streak stays a source: at
+// least size across, in world units) is a sheet of light (the pits' refill, a lit pad, a strip along the road): where it passes white it does so only
+// over a bright surface, and takes no glow. Card by card, not the whole draw: a machine's flame is one draw of up to 13 small cards over each other,
+// whose summed area over the draw's length reads as wide (measured 13.7 on Drift Highway's boost) though no card is.
+// Measured on Drift Highway: flame cards 0.3-2.4 across, the boost's speed streaks 50 long and thin; the pit's cards 4-8. Lines stay sources.
+inline float card_width(const Vertex* verts, std::uint32_t first, std::uint32_t count) {
+  float area = 0.f, mn[3] = {1e30f, 1e30f, 1e30f}, mx[3] = {-1e30f, -1e30f, -1e30f};
+  for (std::uint32_t v = 0; v + 2 < count; v += 3) {
+    const float* p0 = verts[first + v].pos;
+    const float* p1 = verts[first + v + 1].pos;
+    const float* p2 = verts[first + v + 2].pos;
+    const float e1[3] = {p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]}, e2[3] = {p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]};
+    const float cr[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+    area += 0.5f * std::sqrt(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]);
+  }
+  for (std::uint32_t v = 0; v < count; ++v)
+    for (int a = 0; a < 3; ++a)
+      mn[a] = std::min(mn[a], verts[first + v].pos[a]), mx[a] = std::max(mx[a], verts[first + v].pos[a]);
+  const float extent = std::max({mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]});
+  return extent > 0.f ? area / extent : 0.f;
+}
+inline float widest_card(const DrawRec& d, const Vertex* verts) {
+  float widest = 0.f;
+  for (std::uint32_t v = 0; v + 2 < d.vertices; v += 6)
+    widest = std::max(widest, card_width(verts, d.firstVertex + v, std::min<std::uint32_t>(6, d.vertices - v)));
+  return widest;
+}
+inline bool wide_glow(const DrawRec& d, const Vertex* verts, const GpuDraw& g, float extent, float size) {
+  constexpr std::uint32_t Lines = 0xA8, LineStrip = 0xB0;
+  if (g.cls != 2 || extent < size || d.prim == Lines || d.prim == LineStrip)
+    return false;
+  return widest_card(d, verts) >= size;
+}
+
 struct Tuning {
   float machineGain = 2.f, machineCap = 0.45f, sceneryCap = 0.25f;
   std::uint32_t maxLights = 16;
@@ -194,6 +230,7 @@ struct Tuning {
   float largestFloor = 0.f;
   bool overlayApart = false;  // AURORA_RT_HUD_SKIP=1: cards turned to the picture are the game's overlay in the world (faces_picture), not surfaces
   bool lightOwn = false;      // AURORA_RT_LIGHT_OWN=1: a body draw beside a machine light carries that light's number (GpuDraw highlight bits 8-12)
+  float glowWide = 0.f;       // AURORA_RT_GLOW_WIDE=1: an additive draw at least this wide across (world units, wide_glow) is a sheet of light, not a source: no hot core, no flare (bit 5)
 };
 struct Frame {
   std::vector<float> prevPos;       // each of verts in the last frame's view space, with motion data on (rt_motion.hpp)
@@ -472,6 +509,8 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
       }
     extent[i] = std::max({mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]});
     largest = std::max(largest, extent[i]);
+    if (t.glowWide > 0.f && wide_glow(d, verts, g, extent[i], t.glowWide))
+      g.highlight |= 32;
   }
   out.largest = largest;
   const auto sky = [&](std::uint32_t i) { return out.is_sky(i); };

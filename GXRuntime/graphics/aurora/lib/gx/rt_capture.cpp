@@ -1242,6 +1242,16 @@ void run_rules(live::Job& j) {
     return v != nullptr && std::atof(v) != 0;
   }();
   tuning.lightOwn = lightOwn;
+  // AURORA_RT_GLOW_WIDE=1 (off by default): an additive draw at least AURORA_RT_GLOW_WIDE_SIZE across (world units, 4 by default) gives no hot core
+  // and no flare (rt_rules.hpp wide_glow, rt.hlsl GLOW_WIDE)
+  static const float glowWide = [] {
+    const char* v = std::getenv("AURORA_RT_GLOW_WIDE");
+    if (v == nullptr || std::atof(v) == 0)
+      return 0.f;
+    const char* size = std::getenv("AURORA_RT_GLOW_WIDE_SIZE");
+    return size != nullptr && std::atof(size) > 0 ? static_cast<float>(std::atof(size)) : 4.f;
+  }();
+  tuning.glowWide = glowWide;
   if (j.glow > 0.f) {
     tuning.texMeans = s_texAvg;
     tuning.texCount = MostTexAvg;

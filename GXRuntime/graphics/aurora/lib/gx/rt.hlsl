@@ -687,6 +687,33 @@ static const float DepthAgree = 0.05, DepthSlack = 0.03;
 // light pixels weighted by distance and normal). A quarter of the work; the glow light is smooth across a surface, its shadow's edge softer.
 // Kept in WriteOpen (u12), which neither light_pass nor main uses otherwise. GLOW_HALF=2 (AURORA_RT_GLOW_HALF=2): the engine lights too, both with
 // their gains in the one texture, on the surfaces that take both (a glowing surface, which takes engine light only, keeps it at full size).
+#ifndef GLOW_WIDE
+#define GLOW_WIDE 0
+#define GLOW_WIDE_SHOW 0
+#endif
+// AURORA_RT_GLOW_WIDE=1 (off by default; with the glow): a wide additive draw (rt_rules.hpp wide_glow: highlight bit 5) gives no hot core and no flare.
+// The glow is the character of small sources (a flame, a spark); a wide sheet of light over a bright floor (the pits' refill, a lit pad) only passes
+// white because it lies over a bright surface. main marks each pixel that sees such a draw in front of its surface, and only where the raster is over
+// white (nothing else could glow), and only over a bright surface that is not white itself: with AURORA_RT_BEFORE_BLENDS, where the picture before
+// the last blended draws has a channel at least GlowWideUnder (the pits' red floor) and one below GlowWideSource. Over a dark surface the white is
+// the sheet's own; over a white one (a lamp at the root of its beam) the surface is the source: both keep their glow.
+// The term's alpha, its hit distance, goes negative (term_depth, term_wide); compose and the glow's source leave it out.
+static const float GlowWideKnee = 0.98;  // only where the raster is about over white: the hot core and the flare take nothing below
+static const float GlowWideUnder = 0.35;  // the brightest channel of the surface under the sheet (Before), below which the sheet's white is its own
+static const float GlowWideSource = 0.8;  // the darkest channel of the surface under the sheet, from which on the surface is white itself, a source
+float term_depth(float a) { return a < 0 ? -a - 1 : a; }
+bool term_wide(float a) { return a < 0; }
+bool wide_cover(float3 v, float tmax) {
+  RayQuery<RAY_FLAG_CULL_OPAQUE> q;
+  RayDesc r; r.Origin = 0; r.Direction = v; r.TMin = 0.01; r.TMax = tmax;
+  q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskSee, r);
+  bool found = false;
+  while (q.Proceed()) {
+    if (q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE || q.CandidateInstanceID() >= WorldDrawn) continue;
+    if ((Draws[Verts[(q.CandidateInstanceID() + q.CandidatePrimitiveIndex()) * 3].draw].highlight & 32) != 0) { found = true; q.Abort(); }
+  }
+  return found;
+}
 #ifndef GLOW_HALF
 #define GLOW_HALF 0
 #endif
@@ -716,6 +743,7 @@ void main(uint3 id : SV_DispatchThreadID) {
   float3 light = 0;
   float3 dbg = 0;
   float hitDepth = 0;
+  bool wideHere = false;  // GLOW_WIDE
   uint seed = id.x * 1973u + id.y * 9277u + P.frame * 26699u + 1u;
   for (uint n = 0; n < P.spp; ++n) {
     float2 px = id.xy + (P.spp > 1 ? float2(rnd(seed), rnd(seed)) : 0.5.xx);
@@ -941,12 +969,17 @@ void main(uint3 id : SV_DispatchThreadID) {
       light = lightBefore + (light - lightBefore) * shows + (1 - shows) * LayerSkyShare * (sky - 1);
       term *= shows;
     }
+    if (GLOW_WIDE && n == 0 && max(raster.r, max(raster.g, raster.b)) > GlowWideKnee) {
+      const float3 under = Before[id.xy].rgb;
+      if ((P.stableShine & 2) == 0 || (max(under.r, max(under.g, under.b)) >= GlowWideUnder && min(under.r, min(under.g, under.b)) < GlowWideSource))
+        wideHere = wide_cover(v, hitDepth > 0 ? hitDepth : 100000);
+    }
     if (MAIN_PROBE == 10) { Out[id.xy] = float4(whyWorld > 0 ? 1 : 0, whyBack > 0 ? 1 : 0, whyCard > 0 ? 1 : 0, 1); return; }
     if (MAIN_PROBE == 9) { Out[id.xy] = float4(traces <= 1 ? 0.xxx : traces == 2 ? float3(1, 0, 0) : traces == 3 ? float3(0, 1, 0) : float3(0, 0, 1), 1); return; }
     sum += term;
   }
   // own light falls on the surface: on what lies under the last blended effects, not on them. They are drawn over as they are.
-  if (P.mode == 8) { Out[id.xy] = float4(sum + ((P.stableShine & 2) != 0 ? Before[id.xy].rgb : raster) * light, hitDepth); return; }
+  if (P.mode == 8) { Out[id.xy] = float4(sum + ((P.stableShine & 2) != 0 ? Before[id.xy].rgb : raster) * light, wideHere ? -hitDepth - 1 : hitDepth); return; }
   if (P.mode >= 6) { Out[id.xy] = float4(dbg, 1); return; }
   if (P.mode >= 2) { Out[id.xy] = float4(dbg / P.spp, 1); return; }
   float3 refl = sum / P.spp;
@@ -1171,7 +1204,8 @@ void compose(uint3 id : SV_DispatchThreadID) {
   }
   float3 sum = term_of(Term, c);
   float weight = 1;
-  float3 shown = glow_core(Raster[c].rgb) + sum / weight + glow_flare(c);
+  float3 shown = (term_wide(Term[c].a) ? Raster[c].rgb : glow_core(Raster[c].rgb)) + sum / weight + glow_flare(c);
+  if (GLOW_WIDE_SHOW > 0.5 && term_wide(Term[c].a)) shown = lerp(shown, float3(1, 0, 1), 0.6);
   if (FLARE_SHOW > 0.5) shown = glow_flare(c);  // AURORA_RT_FLARE_SHOW=1: the glow alone
 #if KEEP_RANGE
   Final[c] = float4(max(shown, 0), 1);
@@ -1196,7 +1230,7 @@ float3 term_of(Texture2D<float4> from, int2 c) {
   static const int2 off[8] = {int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1), int2(1, 1), int2(-1, 1), int2(1, -1), int2(-1, -1)};
   for (int i = 0; i < 8; ++i) {
     float4 o = from[c + off[i]];
-    float w = (i < 4 ? 0.6 : 0.35) * saturate(1 - abs(o.a - mid.a) / max(mid.a * 0.02, 0.02));
+    float w = (i < 4 ? 0.6 : 0.35) * saturate(1 - abs(term_depth(o.a) - term_depth(mid.a)) / max(term_depth(mid.a) * 0.02, 0.02));
     sum += o.rgb * w;
     weight += w;
   }
@@ -1224,8 +1258,14 @@ void flare_src(uint3 id : SV_DispatchThreadID) {
   uint w, h; Raster.GetDimensions(w, h);
   int2 b = int2(id.xy) * 4, most = int2(w, h) - 1;
   float3 sum = 0;
+  uint tw = w, th = h;
+  if (GLOW_WIDE) Term.GetDimensions(tw, th);
   for (int y = 0; y < 4; ++y)
-    for (int x = 0; x < 4; ++x) sum += over_white(Raster[min(b + int2(x, y), most)].rgb);
+    for (int x = 0; x < 4; ++x) {
+      const int2 at = min(b + int2(x, y), most);
+      if (GLOW_WIDE && term_wide(Term[min(at * int2(tw, th) / int2(w, h), int2(tw, th) - 1)].a)) continue;
+      sum += over_white(Raster[at].rgb);
+    }
   Dest[id.xy] = float4(sum / 16, 1);
 }
 
@@ -1312,7 +1352,7 @@ void between_warp(uint3 id : SV_DispatchThreadID) {
   float2 s = x;
   int2 most = int2(BW.size) - 1;
   for (uint n = 0; n < BW.iterations; ++n) {
-    float t = ReadA[clamp(int2(s), 0, most)].a;
+    float t = term_depth(ReadA[clamp(int2(s), 0, most)].a);
     float2 efb = BW.rectXY + s / BW.size * BW.rectWH;
     float2 ndc = float2((efb.x - BW.vpXY.x) / BW.vpWH.x * 2 - 1, 1 - (efb.y - BW.vpXY.y) / BW.vpWH.y * 2);
     float3 v = normalize(float3((ndc + BW.pOffset) / BW.pScale, -1));
@@ -1346,7 +1386,8 @@ void between_hdr(uint3 id : SV_DispatchThreadID) {
 [numthreads(8, 8, 1)]
 void between_compose(uint3 id : SV_DispatchThreadID) {
   int2 c = id.xy;
-  float3 shown = glow_core(Raster[c].rgb) + term_of(ReadB, c) + glow_flare(c);
+  float3 shown = (term_wide(ReadB[c].a) ? Raster[c].rgb : glow_core(Raster[c].rgb)) + term_of(ReadB, c) + glow_flare(c);
+  if (GLOW_WIDE_SHOW > 0.5 && term_wide(ReadB[c].a)) shown = lerp(shown, float3(1, 0, 1), 0.6);
   if (FLARE_SHOW > 0.5) shown = glow_flare(c);  // AURORA_RT_FLARE_SHOW=1: the glow alone
 #if KEEP_RANGE
   Final[c] = float4(max(shown, 0), 1);

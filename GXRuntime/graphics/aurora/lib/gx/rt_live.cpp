@@ -465,7 +465,9 @@ const std::vector<std::wstring>& shader_defines() {
                                          // phase 2: the glow light once per light pixel, read up in main (needs AURORA_RT_HALF and the denoiser); 2: the engine lights too
                                          {"AURORA_RT_GLOW_HALF", L"GLOW_HALF", 0.f},
                                          // a machine light's shadow ray passes the machine's own body, and a shadow fades in instead of starting at a step
-                                         {"AURORA_RT_LIGHT_OWN", L"LIGHT_OWN", 0.f}};
+                                         {"AURORA_RT_LIGHT_OWN", L"LIGHT_OWN", 0.f},
+                                         // a wide additive sheet gives no hot core and no flare (rt_rules.hpp wide_glow); _SHOW 1: those pixels shown magenta
+                                         {"AURORA_RT_GLOW_WIDE", L"GLOW_WIDE", 0.f}, {"AURORA_RT_GLOW_WIDE_SHOW", L"GLOW_WIDE_SHOW", 0.f}};
     for (const auto& n : numbers) {
       const char* v = std::getenv(n.env);
       const float f = v != nullptr && v[0] != '\0' ? static_cast<float>(std::atof(v)) : n.otherwise;
