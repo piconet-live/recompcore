@@ -1665,6 +1665,11 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
         UseReversedZ ? "0.0" : "1.0", config.softCard == 1 ? "prev.a *= soft_fade;" : "prev = vec4f(prev.rgb * soft_fade, prev.a);");
   }
 
+  if (config.cardRange != 0) {
+    // AURORA_RT_CARDS (gx.cpp card_range): what reaches the blender in the game's own range, the alpha always, a blended card's colour too
+    fragmentFn += config.cardRange == 2 ? "\n    prev = clamp(prev, vec4f(0.0), vec4f(1.0));"sv : "\n    prev.a = clamp(prev.a, 0.0, 1.0);"sv;
+  }
+
   if (dstAlphaMode == DstAlphaMode::Replace) {
     // GX destination alpha is set via the blend constant
     fragmentFn += "\n    prev.a = 1.0;";

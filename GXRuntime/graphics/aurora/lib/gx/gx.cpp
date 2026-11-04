@@ -482,6 +482,32 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
   return g_device.CreateRenderPipeline(&descriptor);
 }
 
+// AURORA_RT_CARDS=1 (off by default; with AURORA_LOOK_RAW=1, the float picture with no stage clamps): the game's effect cards (lava haze, fire,
+// clouds, sparks, smoke) look soft only because they fade to clear by their alpha. GX hands the blender a colour and an alpha in 0..1 (the TEV's
+// output is clamped to 8 bits, whatever its stages did); the raw picture kept both unclamped, so a card whose stages scale its alpha or colour
+// up (x2, x4, a bias) blended with an alpha above 1 and a colour above white across its whole body: its fade was squeezed into the outermost
+// texels, and the glow then turned that body white, a hard square. With this every draw's alpha leaves the shader in 0..1, as the blender has
+// it, and a blended draw's colour too: a card's body is at most white, and its light adds above white only as the game's own blending stacks it
+// (cards over cards, over a bright surface), scaled by its alpha. Opaque draws keep their range (a lava floor, a lamp still glows). From the
+// draw's own blend state alone: any course, any card.
+static bool cards_on() noexcept {
+  static const bool on = [] {
+    const char* v = std::getenv("AURORA_RT_CARDS");
+    return v != nullptr && v[0] != '0' && v[0] != '\0' && webgpu::raw_picture();
+  }();
+  return on;
+}
+static u8 card_range() noexcept {
+  static const int level = [] {
+    const char* v = std::getenv("AURORA_RT_CARDS");
+    return v != nullptr ? std::atoi(v) : 0;
+  }();
+  const auto& s = g_gxState;
+  const bool blended = s.blendMode == GX_BM_BLEND && !(s.blendFacSrc == GX_BL_ONE && s.blendFacDst == GX_BL_ZERO);
+  // AURORA_RT_CARDS=2 (a check): the alpha alone
+  return blended && level != 2 ? 2 : 1;
+}
+
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept {
   ZoneScoped;
 
@@ -632,6 +658,7 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
       .colorUpdate = g_gxState.colorUpdate,
   };
   if (soft::on()) UNLIKELY { config.shaderConfig.softCard = soft::kind(primitive); }
+  if (cards_on()) UNLIKELY { config.shaderConfig.cardRange = card_range(); }
 }
 
 GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {
