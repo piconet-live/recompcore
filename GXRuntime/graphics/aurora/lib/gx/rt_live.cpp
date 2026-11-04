@@ -25,6 +25,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
+#include <filesystem>
 #include <memory>
 #include <future>
 #include <mutex>
@@ -32,6 +34,7 @@
 #include <thread>
 #include <vector>
 
+#include "../internal.hpp"
 #include "../webgpu/gpu.hpp"
 #include "../webgpu/hdr.hpp"
 #include "fifo.hpp"
@@ -473,18 +476,101 @@ const std::vector<std::wstring>& shader_defines() {
   return defines;
 }
 
+// AURORA_RT_SHADER_CACHE=1 (off by default): each entry's compiled shader kept in the user folder (Aurora's userPath, rt-shaders\) under a
+// name that is the hash of all that makes it: the shader's text, the defines (every number from the env), the entry, the arguments and the
+// compiler's own file. The first start compiles and writes; every later start with the same set reads them back in milliseconds instead of
+// compiling for seconds, so the rays are ready before the first frame of a race. A file that is not whole (its own length and hash at its
+// head disagree) is compiled again. Nothing the game reads.
+bool shader_cache_on() {
+  static const bool on = env_one("AURORA_RT_SHADER_CACHE");
+  return on;
+}
+u64 fnv(u64 h, const void* p, size_t n) {
+  const auto* b = static_cast<const u8*>(p);
+  for (size_t i = 0; i < n; ++i)
+    h = (h ^ b[i]) * 1099511628211ull;
+  return h;
+}
+std::wstring shader_cache_path(const wchar_t* entry, const std::vector<LPCWSTR>& args, const void* src, size_t srcSize) {
+  if (aurora::g_config.userPath == nullptr)
+    return {};
+  static const u64 compilerStamp = [] {
+    u64 h = 14695981039346656037ull;
+    wchar_t path[MAX_PATH];
+    WIN32_FILE_ATTRIBUTE_DATA a{};
+    if (HMODULE m = GetModuleHandleW(L"dxcompiler.dll"); m != nullptr && GetModuleFileNameW(m, path, MAX_PATH) != 0 &&
+                                                         GetFileAttributesExW(path, GetFileExInfoStandard, &a))
+      h = fnv(fnv(fnv(h, &a.nFileSizeLow, 4), &a.nFileSizeHigh, 4), &a.ftLastWriteTime, sizeof a.ftLastWriteTime);
+    return h;
+  }();
+  u64 h = fnv(compilerStamp, "rt-shader-cache-1", 17);
+  h = fnv(h, src, srcSize);
+  h = fnv(h, entry, std::wcslen(entry) * sizeof(wchar_t));
+  for (LPCWSTR a : args)
+    h = fnv(h, a, (std::wcslen(a) + 1) * sizeof(wchar_t));
+  std::error_code ec;
+  const std::filesystem::path dir = std::filesystem::u8path(aurora::g_config.userPath) / "rt-shaders";
+  std::filesystem::create_directories(dir, ec);
+  wchar_t name[40];
+  std::swprintf(name, 40, L"%016llx.dxil", static_cast<unsigned long long>(h));
+  return (dir / name).wstring();
+}
+ComPtr<IDxcBlob> shader_cache_read(const DxcCreateInstanceProc create, const std::wstring& path) {
+  FILE* f = _wfopen(path.c_str(), L"rb");
+  if (f == nullptr)
+    return nullptr;
+  std::vector<u8> data;
+  u8 buf[65536];
+  for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;)
+    data.insert(data.end(), buf, buf + n);
+  std::fclose(f);
+  u64 head[2]{};
+  if (data.size() < sizeof head)
+    return nullptr;
+  std::memcpy(head, data.data(), sizeof head);
+  const size_t size = data.size() - sizeof head;
+  if (head[0] != size || head[1] != fnv(14695981039346656037ull, data.data() + sizeof head, size))
+    return nullptr;
+  ComPtr<IDxcUtils> utils;
+  ComPtr<IDxcBlobEncoding> blob;
+  if (FAILED(create(CLSID_DxcUtils, IID_PPV_ARGS(&utils))) || FAILED(utils->CreateBlob(data.data() + sizeof head, static_cast<UINT32>(size), DXC_CP_ACP, &blob)))
+    return nullptr;
+  return blob;
+}
+void shader_cache_write(const std::wstring& path, IDxcBlob* blob) {
+  const std::wstring part = path + L".part";
+  FILE* f = _wfopen(part.c_str(), L"wb");
+  if (f == nullptr)
+    return;
+  const size_t size = blob->GetBufferSize();
+  const u64 head[2] = {size, fnv(14695981039346656037ull, blob->GetBufferPointer(), size)};
+  const bool whole = std::fwrite(head, sizeof head, 1, f) == 1 && std::fwrite(blob->GetBufferPointer(), 1, size, f) == size;
+  if (std::fclose(f) != 0 || !whole || !MoveFileExW(part.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
+    _wremove(part.c_str());
+}
+std::atomic<u32> s_cacheRead{0}, s_cacheWritten{0};
+
 ComPtr<IDxcBlob> compile(const DxcCreateInstanceProc create, const wchar_t* entry) {
   // a compiler for each entry: they run side by side, and one compiler is not for two threads. Below the game's threads.
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-  ComPtr<IDxcCompiler3> comp;
-  if (FAILED(create(CLSID_DxcCompiler, IID_PPV_ARGS(&comp))))
-    return nullptr;
   DxcBuffer src{kShader, sizeof kShader, DXC_CP_UTF8};
   if (!s_shaderFile.empty())
     src.Ptr = s_shaderFile.data(), src.Size = s_shaderFile.size();
   std::vector<LPCWSTR> args{L"-T", L"cs_6_5", L"-E", entry, L"-O3", L"-HV", L"2021"};
   for (const auto& d : shader_defines())
     args.push_back(L"-D"), args.push_back(d.c_str());
+  std::wstring cached;
+  if (shader_cache_on()) {
+    cached = shader_cache_path(entry, args, src.Ptr, src.Size);
+    if (!cached.empty())
+      if (auto b = shader_cache_read(create, cached)) {
+        ++s_cacheRead;
+        return b;
+      }
+  }
+  ComPtr<IDxcCompiler3> comp;
+  if (FAILED(create(CLSID_DxcCompiler, IID_PPV_ARGS(&comp))))
+    return nullptr;
   ComPtr<IDxcResult> res;
   if (FAILED(comp->Compile(&src, args.data(), static_cast<UINT32>(args.size()), nullptr, IID_PPV_ARGS(&res))))
     return nullptr;
@@ -498,6 +584,10 @@ ComPtr<IDxcBlob> compile(const DxcCreateInstanceProc create, const wchar_t* entr
     return nullptr;
   ComPtr<IDxcBlob> out;
   res->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&out), nullptr);
+  if (out && !cached.empty()) {
+    shader_cache_write(cached, out.Get());
+    ++s_cacheWritten;
+  }
   return out;
 }
 
@@ -668,8 +758,9 @@ void init_device() {
       std::fprintf(g.timeLog, "kind,copy,build_ms,light_ms,denoise_ms,reflect_ms,compose_ms,tris,lights,uploads,upload_ms,blas_ms,tlas_ms,temporal_ms,atrous_ms,flare_ms,all_ms\n");
     }
   }
-  std::fprintf(stderr, "[rt] live pass ready on Dawn's device, %.0f ms, beside the game\n",
-               std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+  std::fprintf(stderr, "[rt] live pass ready on Dawn's device, %.0f ms, beside the game; shader cache %s: %u read, %u compiled and written\n",
+               std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), shader_cache_on() ? "on" : "off",
+               s_cacheRead.load(), s_cacheWritten.load());
   g.ready = true;
 }
 
