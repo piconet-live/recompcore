@@ -66,7 +66,8 @@ public:
   // ChunkState), takes the generation at its job's start, and gives the job up when it has moved by the job's end.
   u64 CodeGeneration() const { return m_code_generation.Value(); }
   // A thread that must not reach this core's hooks (the worker's thread) names a function they call first, with the
-  // hook's name; nullptr on every other thread. The hooks stay as they are on the game's thread.
+  // hook's name (which stops that thread's context), and the hook then does nothing: a host call counts as handled, a
+  // read gives 0, the pointer hook none. nullptr on every other thread. The hooks stay as they are on the game's thread.
   using ForeignThreadHit = void (*)(const char* hook);
   static void SetForeignThread(ForeignThreadHit hit);
   static ForeignThreadHit ForeignThread();
