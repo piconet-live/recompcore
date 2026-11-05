@@ -97,9 +97,9 @@ void StaticRecompCore::RefreshRelSections()
   {
     if (m_chunk_rel_sections[i] < 0)
       continue;
-    if (m_chunk_state[i] == CHUNK_FAILED && m_failed_chunks != 0)
+    if (ChunkState(i) == CHUNK_FAILED && m_failed_chunks != 0)
       --m_failed_chunks;
-    m_chunk_state[i] = CHUNK_UNVERIFIED;
+    SetChunkState(i, CHUNK_UNVERIFIED);
     PublishChunkState(i);
     m_busy_wait_cache.clear();
     m_effective_chunk_hashes[i] = m_module->chunk_hashes[i];
@@ -239,7 +239,7 @@ bool StaticRecompCore::FastDispatchableAt(u32 address)
   if (IsForcedFallbackAddress(address))
     return false;
   const int index = ChunkIndexOf(address);
-  return index >= 0 && m_chunk_state[index] == CHUNK_VERIFIED;
+  return index >= 0 && ChunkState(index) == CHUNK_VERIFIED;
 }
 
 bool StaticRecompCore::DispatchableAt(u32 address)
@@ -249,9 +249,9 @@ bool StaticRecompCore::DispatchableAt(u32 address)
   const int index = ChunkIndexOf(address);
   if (index < 0)
     return false;
-  if (m_chunk_state[index] == CHUNK_UNVERIFIED)
+  if (ChunkState(index) == CHUNK_UNVERIFIED)
     VerifyChunk(static_cast<u32>(index));
-  return m_chunk_state[index] == CHUNK_VERIFIED;
+  return ChunkState(index) == CHUNK_VERIFIED;
 }
 
 bool StaticRecompCore::IsForcedFallbackAddress(u32 address) const
@@ -300,6 +300,9 @@ bool StaticRecompCore::ChunkContainsHostCall(u32 index) const
 
 void StaticRecompCore::PublishChunkState(u32 index)
 {
+  using Generation = StaticRecomp::CodeGeneration;
+  if (index == ~0u)
+    m_code_generation.ClearAll(Generation::ENTRY | Generation::CALLABLE);  // (the module's entry bytes, whole)
   if (!m_set_native_valid || !m_module)
     return;
   if (index == ~0u)
@@ -313,11 +316,14 @@ void StaticRecompCore::PublishChunkState(u32 index)
   // Bit 1: the chunk may also be called through the indirect-call table. That is narrower: not with relocatable
   // RELs (the table is in linked addresses), not when a forced-fallback range or a host-call address lies in it.
   const auto& chunk = m_module->chunk_ranges[index];
-  const bool verified = m_chunk_state[index] == CHUNK_VERIFIED;
+  const bool verified = ChunkState(index) == CHUNK_VERIFIED;
   bool callable = verified && !m_has_rel_modules;
   for (const StaticRecompRange& range : m_forced_fallback_ranges)
     callable = callable && !(range.start < chunk.end && chunk.start < range.end);
   callable = callable && !(m_guest.host_call && ChunkContainsHostCall(index));
+  // (the generation moves if a bit is taken away, before the bytes change: a job running then gives up)
+  m_code_generation.Set(index, Generation::ENTRY | Generation::CALLABLE,
+                        (verified ? Generation::ENTRY : 0) | (callable ? Generation::CALLABLE : 0));
   m_set_native_valid(chunk.start, chunk.end, (verified ? 1 : 0) | (callable ? 2 : 0));
 }
 
@@ -338,13 +344,13 @@ void StaticRecompCore::VerifyChunk(u32 index)
   // this module, and nothing else could run it. It counts as verified.
   if (InHostWindow(runtime_start, runtime_start + length))
   {
-    m_chunk_state[index] = CHUNK_VERIFIED;
+    SetChunkState(index, CHUNK_VERIFIED);
     return;
   }
 
   if (runtime_start < 0x80000000u || offset >= ram_size || length > ram_size - offset)
   {
-    m_chunk_state[index] = CHUNK_FAILED;
+    SetChunkState(index, CHUNK_FAILED);
     ++m_failed_chunks;
     ERROR_LOG_FMT(POWERPC, "StaticRecomp: chunk [0x{:08X},0x{:08X}) outside guest RAM",
                   chunk.start, chunk.end);
@@ -365,11 +371,11 @@ void StaticRecompCore::VerifyChunk(u32 index)
 
   if (hash == m_effective_chunk_hashes[index])
   {
-    m_chunk_state[index] = CHUNK_VERIFIED;
+    SetChunkState(index, CHUNK_VERIFIED);
   }
   else
   {
-    m_chunk_state[index] = CHUNK_FAILED;
+    SetChunkState(index, CHUNK_FAILED);
     ++m_failed_chunks;
     std::fprintf(stderr,
                  "[staticrecomp] SMC: chunk [0x%08X,0x%08X) hash mismatch; interpreter until "
@@ -449,11 +455,11 @@ void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
     if (chunk.start > last)
       break;
 
-    if (m_chunk_state[i] != CHUNK_UNVERIFIED)
+    if (ChunkState(i) != CHUNK_UNVERIFIED)
     {
-      if (m_chunk_state[i] == CHUNK_FAILED)
+      if (ChunkState(i) == CHUNK_FAILED)
         --m_failed_chunks;
-      m_chunk_state[i] = CHUNK_UNVERIFIED;
+      SetChunkState(i, CHUNK_UNVERIFIED);
       PublishChunkState(i);
       ++m_reverify_events;
     }

@@ -354,6 +354,7 @@ void StaticRecompCore::LoadModule()
   m_module_active = (desc != nullptr);
   m_has_rel_modules = desc->num_rel_modules != 0;
   m_chunk_state.assign(desc->num_chunk_ranges, CHUNK_UNVERIFIED);
+  m_code_generation.Reset(desc->num_chunk_ranges);
   m_set_native_valid = m_library.IsOpen() ?
                            reinterpret_cast<SetNativeValidFn>(
                                m_library.GetSymbolAddress("staticrecomp_set_native_valid")) :
@@ -463,7 +464,8 @@ void StaticRecompCore::ClearCache()
 
   if (!m_module)
     return;
-  std::fill(m_chunk_state.begin(), m_chunk_state.end(), u8{CHUNK_UNVERIFIED});
+  for (std::size_t i = 0; i < m_chunk_state.size(); ++i)
+    SetChunkState(i, CHUNK_UNVERIFIED);
   PublishChunkState(~0u);
   m_failed_chunks = 0;
   ++m_reverify_events;
