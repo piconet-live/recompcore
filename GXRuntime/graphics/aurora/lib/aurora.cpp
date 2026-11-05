@@ -40,6 +40,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 
 // Frame timing for offline tools (dolgx_replay --timing): the steady-clock time the render worker submitted the
 // last frame, and the time the GPU reported that submission done (queue OnSubmittedWorkDone).
@@ -234,18 +235,36 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
 }
 
 void shutdown() noexcept {
+  // Each part's time goes to the log in one line: a stop that takes long says where (2026-11-04: 9-11 s after a long practice).
+  using Clock = std::chrono::steady_clock;
+  auto at = Clock::now();
+  const auto lap = [&at] {
+    const auto now = Clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(now - at).count();
+    at = now;
+    return ms;
+  };
+  double stream = 0, worker = 0, overlays = 0, drawing = 0, device = 0;
 #ifdef AURORA_ENABLE_GX
   gx::fifo::shutdown();
+  stream = lap();
   gfx::render_worker::synchronize();
+  worker = lap();
 #ifdef AURORA_ENABLE_RMLUI
   rmlui::shutdown();
 #endif
   imgui::shutdown();
+  overlays = lap();
   gfx::shutdown();
+  drawing = lap();
   webgpu::shutdown();
+  device = lap();
 #endif
   gamepad::shutdown();
   window::shutdown();
+  const double window_ms = lap();
+  std::fprintf(stderr, "[aurora] shutdown: %.0f ms: stream %.0f, render worker %.0f, overlays %.0f, drawing %.0f, device %.0f, window %.0f\n",
+               stream + worker + overlays + drawing + device + window_ms, stream, worker, overlays, drawing, device, window_ms);
 }
 
 const AuroraEvent* update() noexcept {

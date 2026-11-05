@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cstdio>
 #include "gpu.hpp"
 
@@ -40,6 +41,7 @@ void force_device_loss_for_test() noexcept {  // aurora_present.cpp, AURORA_TEST
 static Module Log("aurora::gpu");
 
 wgpu::Device g_device;
+std::atomic_bool g_processEnding = false;
 wgpu::Queue g_queue;
 wgpu::Surface g_surface;
 wgpu::BackendType g_backendType;
@@ -1200,7 +1202,9 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
 
 void shutdown() {
   g_initialized = false;
+  const auto t0 = std::chrono::steady_clock::now();
   gfx::gpu_synchronize();
+  const auto t1 = std::chrono::steady_clock::now();
   gpu_prof::shutdown();
   hdr::shutdown();
   g_CopyBindGroupLayout = {};
@@ -1219,12 +1223,24 @@ void shutdown() {
   g_stencilOnlyView = {};
   g_normalBuffer = {};
   g_graphicsConfig.normalBuffer = false;
-  g_queue = {};
   g_surface = {};
+  if (g_processEnding.load(std::memory_order_relaxed)) {
+    // (g_processEnding: left to the process's end, with what still holds them, the pipelines among them)
+    static_cast<void>(g_queue.MoveToCHandle());
+    static_cast<void>(g_device.MoveToCHandle());
+    static_cast<void>(g_adapter.MoveToCHandle());
+    static_cast<void>(g_instance.MoveToCHandle());
+  }
+  g_queue = {};
   g_device = {};
   g_adapter = {};
   g_instance = {};
+  const auto t2 = std::chrono::steady_clock::now();
   cache_shutdown();
+  const auto t3 = std::chrono::steady_clock::now();
+  const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
+  std::fprintf(stderr, "[aurora] shutdown of the device: GPU idle %.0f ms, objects %s %.0f ms, its cache closed %.0f ms\n",
+               ms(t1 - t0), g_processEnding.load(std::memory_order_relaxed) ? "released, the device left to the process's end" : "and device released", ms(t2 - t1), ms(t3 - t2));
 }
 
 void release_surface() noexcept {

@@ -7,6 +7,7 @@
 #include "gx/rt_capture.hpp"
 #include "gx/redraw.hpp"
 #include "gfx/render_worker.hpp"
+#include "webgpu/gpu.hpp"
 #include "../../graphics/aurora/lib/thread.hpp"
 #include "gxruntime/aurora_present.h"
 
@@ -1835,6 +1836,12 @@ void aurora_present_stats(AuroraPresentStats* out) {
 }
 
 void aurora_present_stop(void) {
+  // The runner's process ends right after this: Aurora's pipelines and device are left to its end, not released one by
+  // one (9-11 s of a frozen window after a long session). AURORA_STOP_RELEASE_ALL=1 releases all, as before (a comparison run).
+  {
+    const char* v = std::getenv("AURORA_STOP_RELEASE_ALL");
+    aurora::webgpu::g_processEnding.store(!(v && v[0] == '1'), std::memory_order_relaxed);
+  }
   model_pipelines_stop();
   pace::g_quit.store(true, std::memory_order_relaxed);
   if (s == nullptr)

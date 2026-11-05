@@ -6,6 +6,7 @@
 #include "wgpu.hpp"
 
 #include <array>
+#include <atomic>
 #include <functional>
 #include <cstdint>
 
@@ -92,6 +93,13 @@ Viewport calculate_present_viewport(uint32_t surface_width, uint32_t surface_hei
 const TextureWithSampler& resample_present_source(const wgpu::CommandEncoder& encoder, const Viewport& viewport);
 void draw_clear(const wgpu::RenderPassEncoder& pass, bool clearColor, bool clearAlpha, bool clearDepth,
                 const Vec4<float>& clearColorValue, float clearDepthValue);
+
+// Set by an embedding program whose process ends right after aurora_shutdown (Piconet's runner, at a game's stop): the
+// compiled pipelines and the device are left to the process's end instead of being released one by one. Released, the
+// tens of thousands of pipelines compiled ahead in a long session cost 9-11 s of a frozen window at the stop (82,000
+// after a 13-minute practice, 2026-11-04); left, Windows takes them back with the process. Nothing of them is released
+// later either (no static destructor holds them), so no DXC object outlives dxcompiler.dll (the exit crash, 32af2fe).
+extern std::atomic_bool g_processEnding;
 
 size_t load_from_cache(void const* key, size_t keySize, void* value, size_t valueSize, void* userdata);
 void store_to_cache(void const* key, size_t keySize, void const* value, size_t valueSize, void* userdata);
