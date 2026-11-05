@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-# rtrun.py NAME COURSE MACHINE SECONDS SHOT [KEY=VAL ...]: writes a lone-race launch file (AI drives seat 0, 29 CPUs, modern HUD, true widescreen) from the owner's template
+# rtrun.py NAME COURSE MACHINE SECONDS SHOT [KEY=VAL ...]: writes a lone-race launch file (AI drives seat 0, 29 CPUs, the game's HUD, true widescreen) from the owner's template
 import json,sys
 n,c,m,shot=sys.argv[1],int(sys.argv[2]),int(sys.argv[3]),sys.argv[4]
 H='D:\\FZero\\aurora-rt\\'
-t=open('/mnt/d/FZero/aurora-mi19/port/owner-mi19.template.json').read().replace('COURSE',str(c)).replace('HUDMETER','blade').replace('COLOURBLIND','off')
+t=open('/mnt/d/FZero/aurora-mi19/port/owner-mi19.template.json').read().replace('COURSE',str(c)).replace('COLOURBLIND','off')
 d=json.loads(t)
+for k in ('modernHud','hudMeter','hudLayout'): d.pop(k,None)  # the modern HUD is gone (2026-11-04): a runner refuses its keys; the template still has them
 d['about']='RT still: lone race, the AI drives'
 d['match']['match']['setup']['seats'][0]['machine']=m
 d['match']['match']['setup']['seats'][0].pop('color',None)
