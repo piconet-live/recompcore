@@ -1280,6 +1280,7 @@ void initialize_pipeline_cache() {
 }
 
 void shutdown_pipeline_cache() {
+  const auto t0 = std::chrono::steady_clock::now();
   if (g_hasPipelineThread) {
     g_pipelineThreadEnd = true;
     g_pipelineQueueCv.notify_all();
@@ -1296,7 +1297,15 @@ void shutdown_pipeline_cache() {
   g_pipelineCacheBroken = false;
   g_pipelinesPerFrame = 0;
   g_gpuCachePrunePending = false;
+  const auto t1 = std::chrono::steady_clock::now();
+  const size_t pipelines = g_pipelines.size();
+  const bool left = webgpu::g_processEnding.load(std::memory_order_relaxed);
+  if (left) {
+    // left to the process's end (webgpu::g_processEnding): moved where no destructor reaches them, never freed
+    static_cast<void>(new decltype(g_pipelines)(std::move(g_pipelines)));
+  }
   g_pipelines.clear();
+  const auto t2 = std::chrono::steady_clock::now();
   g_knownPipelines.clear();
   g_pipelineLayoutKey.reset();
   g_pipelineQueue.clear();
@@ -1305,6 +1314,9 @@ void shutdown_pipeline_cache() {
 
   queuedPipelines = 0;
   createdPipelines = 0;
+  const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
+  std::fprintf(stderr, "[pipelines] shutdown: compile threads and cache writer stopped %.0f ms, %zu pipelines %s %.0f ms, the rest %.0f ms\n",
+               ms(t1 - t0), pipelines, left ? "left to the process's end" : "released", ms(t2 - t1), ms(std::chrono::steady_clock::now() - t2));
 }
 
 void begin_pipeline_frame() {
