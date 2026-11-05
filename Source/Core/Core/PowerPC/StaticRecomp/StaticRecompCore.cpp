@@ -354,7 +354,7 @@ void StaticRecompCore::LoadModule()
   m_module_active = (desc != nullptr);
   m_has_rel_modules = desc->num_rel_modules != 0;
   m_chunk_state.assign(desc->num_chunk_ranges, CHUNK_UNVERIFIED);
-  m_code_generation.fetch_add(1, std::memory_order_release);
+  m_code_generation.Reset(desc->num_chunk_ranges);
   m_set_native_valid = m_library.IsOpen() ?
                            reinterpret_cast<SetNativeValidFn>(
                                m_library.GetSymbolAddress("staticrecomp_set_native_valid")) :

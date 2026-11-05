@@ -300,7 +300,9 @@ bool StaticRecompCore::ChunkContainsHostCall(u32 index) const
 
 void StaticRecompCore::PublishChunkState(u32 index)
 {
-  m_code_generation.fetch_add(1, std::memory_order_release);  // (the module's entry and indirect-call tables change)
+  using Generation = StaticRecomp::CodeGeneration;
+  if (index == ~0u)
+    m_code_generation.ClearAll(Generation::ENTRY | Generation::CALLABLE);  // (the module's entry bytes, whole)
   if (!m_set_native_valid || !m_module)
     return;
   if (index == ~0u)
@@ -319,6 +321,9 @@ void StaticRecompCore::PublishChunkState(u32 index)
   for (const StaticRecompRange& range : m_forced_fallback_ranges)
     callable = callable && !(range.start < chunk.end && chunk.start < range.end);
   callable = callable && !(m_guest.host_call && ChunkContainsHostCall(index));
+  // (the generation moves if a bit is taken away, before the bytes change: a job running then gives up)
+  m_code_generation.Set(index, Generation::ENTRY | Generation::CALLABLE,
+                        (verified ? Generation::ENTRY : 0) | (callable ? Generation::CALLABLE : 0));
   m_set_native_valid(chunk.start, chunk.end, (verified ? 1 : 0) | (callable ? 2 : 0));
 }
 
