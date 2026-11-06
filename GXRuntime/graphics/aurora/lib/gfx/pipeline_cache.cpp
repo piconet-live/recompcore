@@ -1090,6 +1090,9 @@ static void report_skipped_draws() {
 
 // How many compile threads may work on the background queue at once; a draw's pipeline can always take any thread
 static std::atomic_uint g_backgroundLimit{UINT_MAX};
+static bool g_buildMode = false;  // set_build_mode: the pipeline build (aurora_present_build_start)
+
+void set_build_mode(bool on) { g_buildMode = on; }
 static unsigned g_backgroundWorking = 0;  // under g_pipelineMutex
 
 void set_background_compile_threads(unsigned count) {
@@ -1147,11 +1150,14 @@ static void pipeline_worker() {
     auto result = pending.create();
     const auto compileEnd = std::chrono::steady_clock::now();
     const auto pipelineCount = result.pipeline_count();
-    std::fprintf(stderr, "[pipelines] compiled %s: %.1f ms, %.1f ms after it was queued, at %.0f ms%s\n",
-                 wanted ? "for a draw" : "ahead",
-                 std::chrono::duration<double, std::milli>(compileEnd - compileStart).count(),
-                 std::chrono::duration<double, std::milli>(compileEnd - pending.queuedAt).count(), ms_since_start(),
-                 result.main ? "" : ", FAILED");
+    if (!g_buildMode || !result.main)
+      std::fprintf(stderr, "[pipelines] compiled %s: %.1f ms, %.1f ms after it was queued, at %.0f ms%s\n",
+                   wanted ? "for a draw" : "ahead",
+                   std::chrono::duration<double, std::milli>(compileEnd - compileStart).count(),
+                   std::chrono::duration<double, std::milli>(compileEnd - pending.queuedAt).count(), ms_since_start(),
+                   result.main ? "" : ", FAILED");
+    if (g_buildMode)
+      result = {};  // (the build wants Dawn's cache only: the key stays, so it is not compiled again)
     {
       std::lock_guard lock{g_pipelineMutex};
       g_pipelines.try_emplace(pending.hash, std::move(result));
@@ -1376,7 +1382,13 @@ void initialize_pipeline_cache() {
   const size_t loadedCount = load_pipeline_cache();
   rebuild_pipeline_cache();
   std::fprintf(stderr, "[pipelines] cache: %zu known at start, compiled ahead in the background\n", loadedCount);
-  if (!g_pipelineCacheBroken && loadedCount > 0) {
+  // Dawn's cache is pruned to what this session used, unless the pipeline build made it (its mark) or this is the build
+  std::error_code markError;
+  const bool built = std::filesystem::exists(io::fs_path_from_string(g_config.cachePath) / PipelinesBuiltMark, markError);
+  if (built || g_buildMode) {
+    std::fprintf(stderr, "[pipelines] Dawn's cache is not pruned (%s)\n", g_buildMode ? "the pipeline build" : "the pipeline build made it");
+  }
+  if (!g_pipelineCacheBroken && loadedCount > 0 && !built && !g_buildMode) {
     g_gpuCachePrunePending = true;
   }
 

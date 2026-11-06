@@ -358,6 +358,11 @@ bool create_window(AuroraBackend backend) {
     flags |= SDL_WINDOW_FULLSCREEN;
   }
 #endif
+  // The pipeline build (aurora_present_build_start) sets this hint: its window is only the device's surface, never shown,
+  // and even shown by mistake it could take no focus and have no taskbar button (WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW)
+  if (SDL_GetHintBoolean("AURORA_WINDOW_NEVER_ACTIVE", false)) {
+    flags |= SDL_WINDOW_NOT_FOCUSABLE | SDL_WINDOW_UTILITY;
+  }
   auto width = static_cast<Sint32>(g_config.windowWidth);
   auto height = static_cast<Sint32>(g_config.windowHeight);
   if (width == 0 || height == 0) {

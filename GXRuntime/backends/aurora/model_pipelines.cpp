@@ -109,6 +109,12 @@ uint64_t s_meshes = 0, s_meshes_left_out = 0, s_configs = 0, s_ghost_forms = 0;
 FILE* s_dump = nullptr;
 // Aurora's look (gx/look_keys.hpp), read when Aurora is up: every form is planned as a draw in this look keys it
 aurora::gx::look::Look s_look;
+// The pipeline build (model_pipelines_build_mode): every file handed over is taken as the disc walk's, on every compile thread
+bool s_build = false;
+uint64_t s_bytes_read = 0;  // of the files handed over, read so far (under s_lock)
+bool s_walk_read = false;   // the walk's end has been read (under s_lock)
+bool s_idle = false;        // the thread has nothing to read, ask or wait for (under s_lock)
+std::atomic<uint64_t> s_shader_count{0};
 
 uint32_t be32(const uint8_t* p) { return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3]; }
 uint16_t be16(const uint8_t* p) { return uint16_t(p[0] << 8 | p[1]); }
@@ -335,6 +341,7 @@ void plan(const PipelineConfig& base, uint8_t fog, int post, bool small) {
   std::memcpy(shader.data(), &c.shaderConfig, sizeof(c.shaderConfig));
   shader.back() = c.dstAlpha == UINT32_MAX;
   const bool first = s_shaders.insert(std::move(shader)).second;
+  if (first) s_shader_count.fetch_add(1, std::memory_order_relaxed);
   const Tier tier = !s_from_disc && ghost_kind(c, post, small) && s_course_fogs.count(fog) != 0 ? Ghost
                     : post != 0 ? (small && c.dstAlpha != UINT32_MAX ? PostSmall : Rest)
                     : first && c.dstAlpha != UINT32_MAX ? (s_from_disc ? DiscFirst : First)
@@ -552,7 +559,7 @@ void run() {
   const auto t0 = Clock::now();
   static const unsigned behind = [] {
     const char* v = std::getenv("AURORA_PIPELINE_BEHIND");
-    return v != nullptr && std::atoi(v) > 0 ? unsigned(std::atoi(v)) : 3u;
+    return s_build ? UINT_MAX : v != nullptr && std::atoi(v) > 0 ? unsigned(std::atoi(v)) : 3u;
   }();
   constexpr size_t Short = 32;  // the compile queue counts as short: later work never stands in front of a file being read
   bool told = true, told_first = true, walk_told = false, ghosts_told = true, told_racing = false;
@@ -567,6 +574,7 @@ void run() {
         aurora::gfx::set_background_compile_threads(UINT_MAX);
         f = std::move(s_files.front());
         s_files.pop_front();
+        s_bytes_read += f.bytes.size();
         have = true;
       } else {
         if (s_ghost_forms != ghosts_since) ghosts_told = false;
@@ -605,6 +613,8 @@ void run() {
           f = std::move(s_disc_files.front());
           s_disc_files.pop_front();
           s_disc_bytes -= f.bytes.size();
+          s_bytes_read += f.bytes.size();
+          if (f.path.empty()) s_walk_read = true;
           g.unlock();
           s_wake.notify_all();  // (the disc walk waits for room)
           if (f.path.empty()) {  // (the walk's end)
@@ -640,7 +650,9 @@ void run() {
                          std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
             if (s_dump) std::fflush(s_dump);
           }
+          s_idle = true;
           s_wake.wait(g, [] { return s_quit || !s_files.empty() || !s_disc_files.empty(); });
+          s_idle = false;
           continue;
         }
       }
@@ -661,7 +673,7 @@ extern "C" void aurora_present_model_file(const char* path, const uint8_t* bytes
   if (off) return;
   // The runner walks the disc whenever rays are on; only a test that asks for it now takes it
   static const bool walk = std::getenv("AURORA_WHOLE_DISC") != nullptr && std::getenv("AURORA_WHOLE_DISC")[0] == '1';
-  if (later && !walk) return;
+  if (later && !walk && !s_build) return;
   File f;
   f.path = path;
   f.bytes.assign(bytes, bytes + size);
@@ -692,6 +704,21 @@ void model_pipelines_aurora_up() {
     s_aurora_up = true;
   }
   s_wake.notify_all();
+}
+
+void model_pipelines_build_mode() {
+  std::lock_guard g{s_lock};
+  s_build = true;
+}
+
+ModelPipelinesBuild model_pipelines_build_state() {
+  std::lock_guard g{s_lock};
+  ModelPipelinesBuild b;
+  b.bytes_read = s_bytes_read;
+  b.shaders = s_shader_count.load(std::memory_order_relaxed);
+  b.walk_read = s_walk_read;
+  b.planned_all = s_walk_read && s_idle && s_files.empty() && s_disc_files.empty();
+  return b;
 }
 
 void model_pipelines_stop() {

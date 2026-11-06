@@ -12,6 +12,8 @@
 // differs from a planned form in one field only names that field); the axes the recorded model keys use; and for each
 // RUNNER_LOG, the keys first used in the frames whose draws were skipped ([pipelines] frame N ... skipped), with whether (a),
 // (b) without that log's own folder, or both would have held them; and the compile times of its "compiled" lines.
+// --build 1: the disc as the pipeline build reads it (aurora_present_build_start: every file as the disc walk's, one form of
+// every shader), and how many recorded keys and missed keys have their shader compiled by it (or are the seed's keys).
 // Nothing here writes anywhere but --out.
 #include "../model_pipelines.cpp"
 
@@ -150,6 +152,8 @@ struct Planned {
 aurora::gx::look::Look g_look;
 
 // (a): every file under dir through the planner, as files the game reads
+bool g_build = false;  // --build 1
+
 Planned plan_disc(const fs::path& dir, bool keep) {
   Planned out;
   std::vector<fs::path> files;
@@ -162,7 +166,9 @@ Planned plan_disc(const fs::path& dir, bool keep) {
     f.path = fs::relative(p, dir).generic_string();
     std::ifstream in(p, std::ios::binary);
     f.bytes.assign(std::istreambuf_iterator<char>(in), {});
+    s_from_disc = g_build;
     read_file(f);
+    s_from_disc = false;
     ++read;
     for (int t = 0; t < Tiers; ++t) {
       for (const Form& form : s_tiers[t]) {
@@ -427,6 +433,7 @@ int main(int argc, char** argv) {
     else if (k == "--out") out_dir = v;
     else if (k == "--seed-out") seed_out = v;
     else if (k == "--explain") explain = std::atoi(v.c_str());
+    else if (k == "--build") g_build = v == "1";
     else if (k == "--look") g_look = v == "rt" ? aurora::gx::look::Look{false, true, true, true, 1} : aurora::gx::look::Look{};
     else if (k == "--log" && v.find('=') != std::string::npos) logs.emplace_back(v.substr(0, v.find('=')), v.substr(v.find('=') + 1));
   }
@@ -500,6 +507,12 @@ int main(int argc, char** argv) {
                 a.shader_only_keys.size());
   }
   std::printf("    of them in (a): %llu\n", (unsigned long long)by_class[0]);
+  {
+    uint64_t shader_held = 0;
+    for (const auto& [k, r] : rows) shader_held += a.shaders.count(shader_of(r.config)) != 0;
+    std::printf("    their shader module among (a)'s: %llu of %zu%s\n", (unsigned long long)shader_held, rows.size(),
+                g_build ? " (the pipeline build compiles (a)'s shaders: a key of one of them costs a draw about 1 ms, no shader compile)" : "");
+  }
   for (int f = 0; f < Fields; ++f)
     if (by_class[1 + f]) std::printf("    not in (a), one field off, %s: %llu\n", k_field_names[f], (unsigned long long)by_class[1 + f]);
   std::printf("    not in (a), a model's stages with other pass state: %llu\n", (unsigned long long)by_class[Fields + 1]);
@@ -538,7 +551,7 @@ int main(int argc, char** argv) {
       for (int i : r.dbs)
         if (earlier[i]) { others.insert(k); break; }
     std::printf("    (b) before it: %zu dbs written earlier, %zu keys\n", n_earlier, others.size());
-    uint64_t frames = 0, skipped = 0, found = 0, in_a = 0, in_b = 0, in_ab = 0, near_a = 0, fixed = 0;
+    uint64_t frames = 0, skipped = 0, found = 0, in_a = 0, in_b = 0, in_ab = 0, near_a = 0, fixed = 0, shader_or_b = 0;
     std::map<int, uint64_t> neither;
     std::unordered_set<uint64_t> seen;
     struct Cluster { uint32_t first, last, frames = 0, draws = 0, keys = 0, ia = 0, ib = 0, either = 0; };
@@ -559,6 +572,7 @@ int main(int argc, char** argv) {
         in_a += ia;
         in_b += ib;
         in_ab += ia || ib;
+        shader_or_b += ib || a.shaders.count(shader_of(r.config)) != 0;
         ++cl.keys; cl.ia += ia; cl.ib += ib; cl.either += ia || ib;
         const int cls = classify(a, r.config);
         near_a += cls >= 1 && cls <= Fields;
@@ -576,6 +590,7 @@ int main(int argc, char** argv) {
                 "either %llu\n",
                 (unsigned long long)frames, (unsigned long long)skipped, (unsigned long long)found, (unsigned long long)in_a,
                 (unsigned long long)in_b, (unsigned long long)in_ab);
+    std::printf("    of those keys, their shader among (a)'s or the key in (b) before it: %llu\n", (unsigned long long)shader_or_b);
     for (const auto& cl : clusters)
       std::printf("      frames %u-%u: %u frames, %u draws skipped; %u keys first used there: (a) %u, (b) %u, either %u\n", cl.first, cl.last, cl.frames,
                   cl.draws, cl.keys, cl.ia, cl.ib, cl.either);
