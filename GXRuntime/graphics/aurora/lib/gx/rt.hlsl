@@ -12,7 +12,7 @@ struct Draw {
   uint stages, firstStage;
   uint cls;       // 0 solid, 1 translucent, 2 additive, 3 ignored
   float strength; // the draw's own reflection strength
-  uint highlight; // bit 0 the game's own shine, 1 glows, 2 outside the depth (takes no light), 3 a blended layer writing no depth, 4 a card turned to the picture (primary rays alone); 8-12 LIGHT_OWN: 1 + the machine light whose body it is
+  uint highlight; // bit 0 the game's own shine, 1 glows, 2 outside the depth (takes no light), 3 a blended layer writing no depth, 4 a card turned to the picture (primary rays alone); 8-12: 1 + the machine whose draw it is (the game's draw marks), 0 none; 13: that mark is a body's
   uint fogType;
   float3 fog;
   float3 fogColour;
@@ -48,8 +48,8 @@ struct Params {
   float skyGain, lightReach, bounce, visFloor;
   uint stableShine;  // bit 0 stable shine, bit 1 Before holds a picture, bit 2 AURORA_RT_PAIR_GAP, bit 3 AURORA_RT_LAYER_PASS, bit 4 AURORA_RT_SCENE_STEADY
 };
-struct Light { float3 pos; float3 colour; float reach; };
-struct GlowLight { float3 pos; float area; float3 colour; float radius; };
+struct Light { float3 pos; float3 colour; float reach; uint owner; };  // owner: 1 + the machine whose draws it came from, 0 none (rt_rules.hpp)
+struct GlowLight { float3 pos; float area; float3 colour; float radius; uint owner; };
 // The acceleration structure's instances: solid surfaces, the sky's shells, and what light passes through (see-through, glows)
 static const uint MaskSolid = 1, MaskSky = 2, MaskSee = 4, MaskSeen = MaskSolid | MaskSee;
 // The whole static track (AURORA_RT_SCENE=1): only rays leaving a surface see it, and only what the game didn't draw this frame is in it, so an object is never there twice.
@@ -275,7 +275,11 @@ float3 sky_along(float3 dir, float lod) {
   }
   return sum;
 }
-float3 trace_reflection(float3 org, float3 dir, float maxLodScale) {
+// A body's machine: 1 + the racer when the draw is in CarDisp's span by the game's marks (Draw.highlight bit 13, bits 8-12), 0 otherwise.
+// Not a burner's: draws found in a burner's span that are no flame are other deferred draws the mark reached (the road's)
+uint body_machine(Draw d) { return (d.highlight & (1u << 13)) != 0 ? (d.highlight >> 8) & 31 : 0; }
+// own: the reflecting surface's body_machine
+float3 trace_reflection(float3 org, float3 dir, float maxLodScale, uint own) {
   float3 sum = 0;
   float through = 1;
   float tmin = 0.05;
@@ -314,8 +318,9 @@ float3 trace_reflection(float3 org, float3 dir, float maxLodScale) {
     float lod = clamp(log2(max(t, 1.0) * maxLodScale), 0.0, 8.0);
     float4 c = shade(h, lod);
     c.rgb = fogged(d, h.pos, c.rgb);
-    // a glow right beside the surface is the machine's own flame, a camera-facing sprite: seen from its own bodywork it is a flat sheet
-    if (d.cls == 2) { if (t > 8) sum += through * c.rgb * saturate(c.a); continue; }
+    // the machine's own flame (the game's marks: a glow of the reflecting surface's own machine), a camera-facing sprite: seen from its own
+    // bodywork it is a flat sheet. Any other glow shows, however near
+    if (d.cls == 2) { if (own == 0 || ((d.highlight >> 8) & 31) != own) sum += through * c.rgb * saturate(c.a); continue; }
     if (d.cls == 1) {
       float a = saturate(c.a);
       sum += through * c.rgb * a;
@@ -329,15 +334,14 @@ float3 trace_reflection(float3 org, float3 dir, float maxLodScale) {
   return sum;
 }
 float lum(float3 c) { return dot(c, float3(0.3, 0.59, 0.11)); }
-// LIGHT_OWN (AURORA_RT_LIGHT_OWN=1, off by default): a machine light comes from the machine's flames, in or at its nozzles, so the machine's
-// own body lay between it and most of what it lights. The shadow ray met that body ahead of and beside the machine, every frame, and the test
-// itself starts only where the light gives 0.02: past that line the light was whole, inside it a quarter. So a round dark disc with an edge,
-// about 10 units across, sat on the road around every machine while it raced, larger with a boost's bigger flames (rt_rules.hpp own_light).
-// With this the ray takes the nearest hit, and a hit on the light's own body (bits 8-12 of its draw: rt_rules.hpp own_light) is no shadow:
-// nothing nearer stood in between. Any other hit fades the light in over the next 0.02 instead of a step.
-#ifndef LIGHT_OWN
-#define LIGHT_OWN 0
-#endif
+// A light's own body: a machine's light comes from its flames, in or at its nozzles, or from its own glowing parts, so the machine's own body
+// lay between it and most of what it lights. A shadow ray that met it darkened a disc on the road around every machine, and a glow of its own
+// a patch of road beside it on the start grid. The game marks each draw with its machine (the draw marks: Draw.highlight bits 8-12, and the
+// light's owner from its draws): the ray takes the nearest hit, and a hit on the light's own machine is no shadow, nothing nearer stood in
+// between. Any other hit fades the light in over the next 0.02 instead of a step.
+uint hit_machine(uint instance, uint primitive) {
+  return instance < WorldId ? (Draws[Verts[(instance + primitive) * 3].draw].highlight >> 8) & 31 : 0;
+}
 // Engine lights: plain omni, distance falloff, no direction. Multiplies what the pixel already shows, so it needs no material.
 float3 engine_light(float3 pos, float3 N) {
   float3 sum = 0;
@@ -352,22 +356,15 @@ float3 engine_light(float3 pos, float3 N) {
     float fall = 1 / (1 + dd / (r * r * 0.25));
     fall *= saturate(1 - dist / (3 * r));
     float vis = 1;
-    if (LIGHT_OWN && P.lightShadow != 0 && fall * wrap > 0.02) {
+    if (P.lightShadow != 0 && fall * wrap > 0.02) {
       RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
       RayDesc ray; ray.Origin = pos + N * 0.03; ray.Direction = L; ray.TMin = 0.02; ray.TMax = max(dist - 0.6, 0.03);
       q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskRaySolid, ray);
       q.Proceed();
       if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
-        const bool own = q.CommittedInstanceID() < WorldId &&
-                         ((Draws[Verts[(q.CommittedInstanceID() + q.CommittedPrimitiveIndex()) * 3].draw].highlight >> 8) & 31) == i + 1;
+        const bool own = Lights[i].owner != 0 && hit_machine(q.CommittedInstanceID(), q.CommittedPrimitiveIndex()) == Lights[i].owner;
         if (!own) vis = lerp(1.0, 0.25, saturate((fall * wrap - 0.02) / 0.02));
       }
-    } else if (P.lightShadow != 0 && fall * wrap > 0.02) {
-      RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
-      RayDesc ray; ray.Origin = pos + N * 0.03; ray.Direction = L; ray.TMin = 0.02; ray.TMax = max(dist - 0.6, 0.03);
-      q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskRaySolid, ray);
-      q.Proceed();
-      if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) vis = 0.25;
     }
     sum += Lights[i].colour * fall * wrap * vis;
   }
@@ -393,6 +390,7 @@ static const float GlowTol = GLOW_TOL / 255;  // (in display steps: GLOW_TOL, sh
 float3 glow_light(float3 pos, float3 N, float tol = 0) {
   float3 sum = 0, topLight = 0, topDir = 0;
   float top = 0, topMax = 0;
+  uint topOwner = 0;
   const float least = tol * (1.0 / 64);
   for (uint i = 0; i < P.glowCount; ++i) {
     GlowLight g = Glows[i];
@@ -404,11 +402,18 @@ float3 glow_light(float3 pos, float3 N, float tol = 0) {
     float3 c = g.colour * cosv * g.area / (3.14159 * dd + g.area);
     float w = dot(c, float3(0.3, 0.59, 0.11));
     sum += c;
-    if (w > top) { top = w; topLight = c; topDir = d; topMax = sqrt(dd) - g.radius; }
+    if (w > top) { top = w; topLight = c; topDir = d; topMax = sqrt(dd) - g.radius; topOwner = g.owner; }
   }
   if (top < 0.005 || topMax < 0.2 || GLOW_NO_RAY || (GLOW_FAST && tol > 0 && 0.85 * max(topLight.r, max(topLight.g, topLight.b)) < tol)) return sum;
-  RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
   RayDesc ray; ray.Origin = pos + N * 0.03; ray.Direction = normalize(topDir); ray.TMin = 0.02; ray.TMax = topMax;
+  if (topOwner != 0) {
+    // a machine's glow: its own body is no shadow (hit_machine)
+    RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
+    q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskRaySolid, ray);
+    q.Proceed();
+    return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT && hit_machine(q.CommittedInstanceID(), q.CommittedPrimitiveIndex()) != topOwner ? sum - topLight * 0.85 : sum;
+  }
+  RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
   q.TraceRayInline(Scene, RAY_FLAG_NONE, MaskRaySolid, ray);
   q.Proceed();
   return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? sum - topLight * 0.85 : sum;
@@ -930,7 +935,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             seen = s.a > 0.01 ? s.rgb / s.a : raster;
           } else {
           float3 R = matte_dir(v, N, layer, id.xy);
-          seen = trace_reflection(h.pos + N * 0.03, R, 8.0 / max(P.size.y, 1) * 512.0 / 4.0);
+          seen = trace_reflection(h.pos + N * 0.03, R, 8.0 / max(P.size.y, 1) * 512.0 / 4.0, body_machine(d));
           seen = min(seen, 2.0);
           }
           // with light from rays the surface under the reflection is the one lit by them, or a shaded face goes dark and takes the reflection's colour
@@ -966,7 +971,7 @@ void main(uint3 id : SV_DispatchThreadID) {
           R = normalize(R + j * rough);
           if (dot(R, N) < 0) R = reflect(v, N);
         }
-        float3 seen = trace_reflection(h.pos + N * 0.03, R, 8.0 / max(P.size.y, 1) * 512.0 / 4.0);
+        float3 seen = trace_reflection(h.pos + N * 0.03, R, 8.0 / max(P.size.y, 1) * 512.0 / 4.0, body_machine(d));
         // on road a broad dim surface tints without showing anything: only what stands out of it counts (the neon)
         if (k <= 0) seen *= smoothstep(0.04, 0.5, max(seen.r, max(seen.g, seen.b)));
         // dim only the surface itself, never a flame or glow the raster drew over it
@@ -1089,7 +1094,7 @@ void light_pass(uint3 id : SV_DispatchThreadID) {
       float f0 = 0.04 + MatMetal * layer;
       float fr = (f0 + max(gloss - f0, 0) * pow(1 - cosv, 5)) * shine;
       if (fr > MatReflLeast && !(MATTE_HALF && layer <= 0 && ((id.x + id.y) & 1) != 0))
-        WriteRefl[id.xy] = float4(min(trace_reflection(h.pos + N * 0.03, matte_dir(v, N, layer, id.xy), 8.0 / max(P.size.y, 1) * 512.0 / 4.0 * DP.litScale), 2.0), 1);
+        WriteRefl[id.xy] = float4(min(trace_reflection(h.pos + N * 0.03, matte_dir(v, N, layer, id.xy), 8.0 / max(P.size.y, 1) * 512.0 / 4.0 * DP.litScale, body_machine(d)), 2.0), 1);
     }
     Guide[id.xy] = float4(oct_of(N), -h.pos.z, sunV);
     break;

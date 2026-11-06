@@ -43,8 +43,13 @@ struct DrawRec {
   std::uint64_t stateKey;     // what the draw's translation reads besides its bytes, as far as its own stages read it: stream's state_key
   float nrmMtx[9];            // its one normal matrix, when it has one
   std::uint32_t fading;       // its alpha is one material alpha below full, by the draw's own channel state: a whole list fading, however its bytes read
+  std::uint32_t tag;          // the game's draw mark (aurora_present.h): bits 0-7 1 + the machine, 0 none; bits 8-15 the kind
   StageRec stage[16];
 };
+// A draw's mark, as the game's draw sites gave it (aurora_present.h AURORA_TAG_*)
+constexpr std::uint32_t TagBody = 1, TagBurner = 2;
+inline std::uint32_t tag_machine(std::uint32_t tag) { return tag & 0xFFu; }  // 1 + the machine, 0 none
+inline std::uint32_t tag_kind(std::uint32_t tag) { return (tag >> 8) & 0xFFu; }
 // A draw's lighting as the stream set it, kept beside the draw (AURORA_RT_LIGHTFACTS only)
 struct LightNote {
   std::uint32_t enabled, vtxColour, ambVtx, matVtx, mask, diffFn, readsRas, readsReg;

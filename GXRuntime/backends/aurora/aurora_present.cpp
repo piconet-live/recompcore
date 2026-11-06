@@ -1817,6 +1817,10 @@ void run() {
                  c.frames ? double(c.byVertex) / c.frames : 0.0, c.pictures ? double(c.moved) / c.pictures : 0.0,
                  c.pictures ? double(c.written) / c.pictures : 0.0, c.frames ? double(c.unreadable) / c.frames : 0.0,
                  c.frames ? double(c.over) / c.frames : 0.0);
+    // the game's marks (aurora_present.h) against the classes: a machine's body draws, and how many the class moved with that machine
+    std::fprintf(stderr, "[aurora-present] redraw marks: body draws marked %.1f a frame; their class: that machine %llu, another %llu, none %llu\n",
+                 c.frames ? double(c.tagged) / c.frames : 0.0, (unsigned long long)c.tagSame, (unsigned long long)c.tagOther,
+                 (unsigned long long)c.tagNone);
   }
   aurora::gfx::timewarp::stop();
   dol_aurora_shutdown();

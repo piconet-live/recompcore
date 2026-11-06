@@ -75,6 +75,7 @@ struct ListGroup {
 struct KeepCount {
   std::uint32_t copy = 0, additive = 0, sky = 0, glow = 0, overWorld = 0, coords = 0, classDiffers = 0, sizeDiffers = 0, material = 0, moved = 0, ofMesh = 0, moving = 0;
   std::uint64_t auditFails = 0, auditNormal = 0, auditColour = 0, auditCoords = 0, stateMoved = 0;
+  std::uint64_t marked = 0;  // a placement's draw that came with a machine's mark (Draw.highlight bits 8-12), the mark cleared
 };
 struct KeyHit {
   std::uint32_t model;  // in placementsOf

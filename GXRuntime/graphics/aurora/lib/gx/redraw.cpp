@@ -54,6 +54,7 @@ std::vector<u8> s_scratch;
 std::vector<bool> s_dirty;  // a segment written moved in a picture of the held frame: written again (moved or not) in each after
 std::string s_tablePath;
 u32 s_testTexture = 0;
+std::atomic<u64> s_tagged{0}, s_tagSame{0}, s_tagOther{0};
 std::atomic<u64> s_pictures{0}, s_world{0}, s_machine{0}, s_whole{0}, s_icon{0}, s_flat{0}, s_offscreen{0}, s_splits{0}, s_frames{0},
     s_bytes{0}, s_byVertex{0}, s_unreadable{0}, s_moved{0}, s_over{0}, s_written{0};
 
@@ -289,6 +290,7 @@ void classify(const Request& q, bool advance) {
   if (!advance)
     taken.swap(s_flatNow);
   u64 world = 0, machine = 0, whole = 0, icon = 0, flat = 0, offscreen = 0, byVertex = 0, unreadable = 0, overs = 0;
+  u64 tagged = 0, tagSame = 0, tagOther = 0;
   for (std::size_t k = 0; k < s_held.notes.size(); ++k) {
     const Note& d = s_held.notes[k];
     int c = World;
@@ -341,6 +343,11 @@ void classify(const Request& q, bool advance) {
     }
     world += c == World || c == ByVertex;
     s_class[k] = c;
+    if (const u32 m = d.tag & 0xFFu; m != 0 && (d.tag >> 8) == 1) {  // (the marks' check, a body's: rt_format.hpp tag_machine, TagBody)
+      ++tagged;
+      tagSame += c == static_cast<int>(m - 1);
+      tagOther += c >= 0 && c < static_cast<int>(MostMachines) && c != static_cast<int>(m - 1);
+    }
   }
   s_blocks.clear();
   for (std::size_t k = 0; k < s_held.notes.size(); ++k)
@@ -353,6 +360,7 @@ void classify(const Request& q, bool advance) {
   if (advance) {  // (the counts once a frame)
     s_world += world, s_machine += machine, s_whole += whole, s_icon += icon, s_flat += flat, s_offscreen += offscreen;
     s_byVertex += byVertex, s_unreadable += unreadable, s_over += overs;
+    s_tagged += tagged, s_tagSame += tagSame, s_tagOther += tagOther;
     ++s_frames;
   }
 }
@@ -561,6 +569,7 @@ void note_draw(u16 vtxCount, const u8* vertices, u32 positionAt, u32 stride, u32
     n.perspective = g_gxState.projType == GX_PERSPECTIVE;
     n.vertexMatrices = vertexMatrices;
     n.texture = texture;
+    n.tag = g_drawTag;
     n.firstPosition = static_cast<u32>(s_building.positions.size() / 3);
     s_building.notes.push_back(n);
   }
@@ -707,6 +716,7 @@ Counts counts() noexcept {
   c.flat = s_flat.load(), c.offscreen = s_offscreen.load(), c.splits = s_splits.load(), c.frames = s_frames.load();
   c.uniformBytes = s_bytes.load(), c.byVertex = s_byVertex.load(), c.unreadable = s_unreadable.load(), c.moved = s_moved.load();
   c.over = s_over.load(), c.written = s_written.load();
+  c.tagged = s_tagged.load(), c.tagSame = s_tagSame.load(), c.tagOther = s_tagOther.load(), c.tagNone = c.tagged - c.tagSame - c.tagOther;
   return c;
 }
 } // namespace aurora::gx::redraw

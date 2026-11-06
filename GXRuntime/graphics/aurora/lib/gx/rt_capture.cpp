@@ -45,7 +45,6 @@ bool g_live = false;
 bool g_hook = false;
 static float s_starFrom = 4.f;  // AURORA_RT_ENGINE_STAR_FROM: the star's size (world units) from which is_engine_star takes it; StarGrown by default
 static bool s_seenPerspective = false;
-bool g_noGameShadow = false;
 static bool s_motionOn = false;  // AURORA_RT_DENOISE=1: motion data from the draws (rt_motion.hpp)
 
 bool skip_draw() noexcept {
@@ -64,7 +63,7 @@ u64 s_atCopy = 0;
 u32 s_liveTextures = 0;
 bool s_rayed = false;
 double s_captureMs = 0;
-float s_road = 0.9f, s_light = 1.f, s_glow = 0.f, s_calm = 1.f, s_wet = 0.f, s_machineCap = 0.45f, s_sceneryCap = 0.25f, s_machineGain = 2.f;
+float s_road = 0.9f, s_light = 1.f, s_glow = 0.f, s_calm = 1.f, s_wet = 0.f, s_reflectCap = 0.25f;
 u32 s_liveFirstNew = 0;
 u64 s_copyNow = 0;
 std::vector<DrawRec> s_draws;
@@ -243,11 +242,7 @@ void start() noexcept {
     g_ambientWarmth = static_cast<float>(std::atof(v));
   if (const char* v = std::getenv("AURORA_RT_DENOISE"); v != nullptr && v[0] == '1')
     s_motionOn = true;
-  // with our own light: the rays' shadows stand in for the game's. AURORA_RT_GAME_SHADOW=1 keeps the game's
-  if (g_gameLightOff && std::getenv("AURORA_RT_LIGHTING") != nullptr) {
-    const char* v = std::getenv("AURORA_RT_GAME_SHADOW");
-    g_noGameShadow = v == nullptr || v[0] != '1';
-  }
+  // (the game's own machine shadow with rays on: the runner keeps the game from drawing it, port/core/src/game_shadow.h)
   // with our own light: the star the game puts on far machines' engines, to keep them readable, looks out of place. Off by default
   if (g_live && std::getenv("AURORA_RT_LIGHTING") != nullptr) {
     const char* v = std::getenv("AURORA_RT_NO_ENGINE_STAR");
@@ -272,18 +267,18 @@ void start() noexcept {
 #endif
   // AURORA_RT_LOOK=1, the overhaul look: reflections you can't miss. Each number can still be set by its own switch below. All tuned by eye.
   if (const char* v = std::getenv("AURORA_RT_LOOK"); v != nullptr && v[0] == '1') {
-    s_road = 1.4f, s_glow = 0.5f, s_calm = 0.3f, s_wet = 0.35f, s_machineCap = 0.9f, s_sceneryCap = 0.7f, s_machineGain = 3.f;
+    s_road = 1.4f, s_glow = 0.5f, s_calm = 0.3f, s_wet = 0.35f, s_reflectCap = 0.7f;
   }
   // AURORA_RT_LOOK=2, the material rule: the game's own reflection layers stay in the raster, the rays only add (rt.hlsl, MatGapLow and on). The picture stays the rays-off picture, better lit.
   if (const char* v = std::getenv("AURORA_RT_LOOK"); v != nullptr && v[0] == '2') {
     g_neutral = false;
-    s_road = 0.f, s_glow = 0.5f, s_wet = -1.f, s_machineCap = 1.f, s_sceneryCap = 1.f, s_machineGain = 1.f;
+    s_road = 0.f, s_glow = 0.5f, s_wet = -1.f, s_reflectCap = 1.f;
   }
   const auto setting = [](const char* name, float& to) {
     if (const char* v = std::getenv(name))
       to = static_cast<float>(std::atof(v));
   };
-  setting("AURORA_RT_BODY_CALM", s_calm), setting("AURORA_RT_WET", s_wet), setting("AURORA_RT_MACHINE_CAP", s_machineCap), setting("AURORA_RT_SCENERY_CAP", s_sceneryCap), setting("AURORA_RT_MACHINE_GAIN", s_machineGain);
+  setting("AURORA_RT_BODY_CALM", s_calm), setting("AURORA_RT_WET", s_wet), setting("AURORA_RT_REFLECT_CAP", s_reflectCap);
   if (const char* v = std::getenv("AURORA_RT_ROAD"))
     s_road = static_cast<float>(std::atof(v));
   if (const char* v = std::getenv("AURORA_RT_LIGHT"))
@@ -331,6 +326,7 @@ struct Packet {
   Mat3x4<float> texMtx[MaxUv], ptTexMtx[MaxUv];
   u32 currentPnMtx;
   u32 gameLit;  // bit c: the game asked for lights on colour channel c (kept apart from AURORA_RT_GAME_LIGHT=0, which turns them off in the state)
+  u32 tag;      // the game's draw mark (g_drawTag)
 };
 
 u32 triangle_vertices(GXPrimitive prim, u32 n) {
@@ -489,6 +485,7 @@ void translate(const Packet& st, DrawRec& d, Vertex* outVerts) noexcept {
   d.blendMode = st.blendMode, d.blendSrc = st.blendFacSrc, d.blendDst = st.blendFacDst;
   d.depthUpdate = st.depthUpdate, d.depthCompare = st.depthCompare, d.cull = st.cullMode, d.colorUpdate = st.colorUpdate;
   d.prim = prim, d.vtxCount = vtxCount;
+  d.tag = st.tag;
   d.fogType = st.fog.type, d.fog[0] = st.fog.a, d.fog[1] = st.fog.b, d.fog[2] = st.fog.c;
   for (int i = 0; i < 4; ++i)
     d.fogColour[i] = st.fog.color[i];
@@ -827,7 +824,7 @@ void log_facts(const live::Job& j, const Frame& f) {
   const Vertex* verts = j.verts.get() + j.baseVert;
   const LightNote* notes = j.notes.get() + j.baseDraw;
   const float px = f.main->proj[0], py = f.main->proj[5], ox = f.main->proj[2], oy = f.main->proj[6];
-  std::fprintf(s_facts, "F,%llu,%u,%zu\n", static_cast<unsigned long long>(j.copy), j.drawCount, f.machineLights.size());
+  std::fprintf(s_facts, "F,%llu,%u,%u\n", static_cast<unsigned long long>(j.copy), j.drawCount, f.machineLights);
   std::map<std::tuple<u32, int, int, int, int, int, int>, u32> seen;
   double nearN[3]{};
   for (u32 i = 0; i < j.drawCount; ++i) {
@@ -876,7 +873,7 @@ void log_facts(const live::Job& j, const Frame& f) {
     }
     const double len = std::max(std::sqrt(nx * nx + ny * ny + nz * nz), 1e-9);
     const double dn = static_cast<double>(d.vertices);
-    const bool machine = beside_engine_light(d, verts, f.machineLights);
+    const bool machine = tag_kind(d.tag) == TagBody;  // the game marked it as a machine body
     const float ext = std::max({mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]});
     u32 tex = 0;
     for (u32 s = 0; s < std::min<u32>(d.stages, 16u); ++s)
@@ -1213,7 +1210,12 @@ void run_rules(live::Job& j) {
     if (most != nullptr)
       tuning.maxGlows = static_cast<u32>(std::atoi(most));
   }
-  tuning.machineCap = s_machineCap, tuning.sceneryCap = s_sceneryCap, tuning.machineGain = s_machineGain;
+  tuning.reflectCap = s_reflectCap;
+  static const bool ownLightFull = [] {
+    const char* v = std::getenv("AURORA_RT_OWN_LIGHT_FULL");
+    return v != nullptr && std::atof(v) != 0;
+  }();
+  tuning.ownLightFull = ownLightFull;
   // AURORA_RT_HUD_SKIP=1 (off by default): cards turned to the picture, the game's overlay in the world (the place markers), are left out of every ray but the
   // camera's (rt_rules.hpp faces_picture). AURORA_RT_HUD_LOG=1: each such draw on stderr, a line each, every 30th copy, and the count of copies that had any
   static const bool overlayApart = [] {
@@ -1221,12 +1223,6 @@ void run_rules(live::Job& j) {
     return v != nullptr && std::atof(v) != 0;
   }();
   tuning.overlayApart = overlayApart;
-  // AURORA_RT_LIGHT_OWN=1 (off by default): each body draw beside a machine light is marked as that light's own (rt_rules.hpp, rt.hlsl LIGHT_OWN)
-  static const bool lightOwn = [] {
-    const char* v = std::getenv("AURORA_RT_LIGHT_OWN");
-    return v != nullptr && std::atof(v) != 0;
-  }();
-  tuning.lightOwn = lightOwn;
   // AURORA_RT_GLOW_WIDE=1 (off by default): an additive draw at least AURORA_RT_GLOW_WIDE_SIZE across (world units, 4 by default) gives no hot core
   // and no flare (rt_rules.hpp wide_glow, rt.hlsl GLOW_WIDE)
   static const float glowWide = [] {
@@ -1582,12 +1578,6 @@ static bool samples_copy() noexcept {
   }
   return false;
 }
-// The game's own machine shadow, from the draw alone: its blend takes the source by one minus the picture's alpha and the picture by its alpha, and it writes no depth. No rule by model or course. Rays stand in for it.
-// Not asked: whether its texture is a known picture copy. The game's shadow samples an address only sometimes known as one (the rule missed 15 in 16 draws on course 15).
-bool is_game_shadow() noexcept {
-  const auto& st = g_gxState;
-  return st.blendMode == GX_BM_BLEND && st.blendFacSrc == GX_BL_INVDSTALPHA && st.blendFacDst == GX_BL_DSTALPHA && !st.depthUpdate;
-}
 // A draw's corners in view space, read from its own bytes before it is drawn: where its middle is, how big it is, and how squarely
 // its first triangle lies in the view plane (1: square to the view's axis, as a sprite the game turns to the screen)
 struct DrawShape {
@@ -1754,9 +1744,9 @@ void note_draw(const u16 vtxCount, const GXPrimitive prim, const GXVtxFmt fmt, c
   if (st.depthUpdate && !samples_copy())
     return;
   const auto& m = st.pnMtx[st.currentPnMtx / 3];
-  std::fprintf(stderr, "[rt] draw copy %llu: proj %d blend %d src %d dst %d zwrite %d zcmp %d zfunc %d colour %d alpha %d copy %d stages %u gens %u verts %u cull %d rule %d tex %p at %.1f %.1f %.1f\n",
+  std::fprintf(stderr, "[rt] draw copy %llu: proj %d blend %d src %d dst %d zwrite %d zcmp %d zfunc %d colour %d alpha %d copy %d stages %u gens %u verts %u cull %d tex %p at %.1f %.1f %.1f\n",
                static_cast<unsigned long long>(s_copyNow), int(st.projType), int(st.blendMode), int(st.blendFacSrc), int(st.blendFacDst), int(st.depthUpdate), int(st.depthCompare), int(st.depthFunc),
-               int(st.colorUpdate), int(st.alphaUpdate), int(samples_copy()), st.numTevStages, st.numTexGens, vtxCount, int(st.cullMode), int(is_game_shadow()), st.numTevStages > 0 && st.tevStages[0].texMapId < MaxTextures ? st.textures[st.tevStages[0].texMapId].texObj.data : nullptr, m.pos.m0.w(), m.pos.m1.w(), m.pos.m2.w());
+               int(st.colorUpdate), int(st.alphaUpdate), int(samples_copy()), st.numTevStages, st.numTexGens, vtxCount, int(st.cullMode), st.numTevStages > 0 && st.tevStages[0].texMapId < MaxTextures ? st.textures[st.tevStages[0].texMapId].texObj.data : nullptr, m.pos.m0.w(), m.pos.m1.w(), m.pos.m2.w());
 }
 static std::uint64_t s_stateKeyNow = 0;  // this draw's, while it's captured: on the stream's thread
 static bool s_keyLater = false;  // AURORA_RT_CAPTURE_ASYNC=1: this draw's state key is for its packet's translation to work out
@@ -1821,6 +1811,7 @@ static void make_packet(u8* room, const size_t size, const u32 stages, const u32
                              : (st.colorChannelConfig[GX_COLOR0].lightingEnabled ? 1u : 0u) | (st.colorChannelConfig[GX_COLOR1].lightingEnabled ? 2u : 0u);
   p.stateKey = s_stateKeyNow;
   p.keyLater = s_keyLater ? 1u : 0u;
+  p.tag = g_drawTag;
   std::memcpy(room + at, vertices, rawBytes);
 }
 

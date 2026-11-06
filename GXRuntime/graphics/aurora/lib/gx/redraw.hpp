@@ -40,6 +40,7 @@ struct Note {
   std::array<float, 12> mtx{};
   std::array<float, 16> proj{};  // the GX projection, row-major (clip = proj * view position)
   bool perspective = false, vertexMatrices = false;
+  u32 tag = 0;  // the game's draw mark of its first draw (g_drawTag; rt_format.hpp tag_machine, tag_kind)
 };
 // A run of a view-space draw's vertices in the frame's vertex buffer: what a picture between moves vertex by vertex
 struct Segment {
@@ -71,6 +72,8 @@ void test_uncorrected(u32 texture) noexcept;
 struct Counts {
   u64 pictures = 0, world = 0, machine = 0, whole = 0, icon = 0, flat = 0, offscreen = 0, splits = 0, frames = 0, uniformBytes = 0;
   u64 byVertex = 0, unreadable = 0, moved = 0, over = 0, written = 0;
+  // the game's marks against the classes: draws marked a machine's body, of which the class moved with that machine, with another, or with none
+  u64 tagged = 0, tagSame = 0, tagOther = 0, tagNone = 0;
 };
 Counts counts() noexcept;
 // AURORA_REDRAW_BUNDLES: whether the pictures' GX draws come from render bundles; a test turns it over for one picture

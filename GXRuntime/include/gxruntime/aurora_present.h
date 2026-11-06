@@ -150,6 +150,11 @@ typedef struct AuroraRedrawRequest {
   AuroraRedrawPicture picture[AURORA_REDRAW_MOST];
 } AuroraRedrawRequest;
 AURORA_PRESENT_API void aurora_present_redraw(const AuroraRedrawRequest* request);
+// The game's draw marks: the emulator's feed puts GX_AURORA_SET_DRAW_TAG commands (GXAurora.h) into the stream at the places the
+// game's own draw sites name (the runner's host calls): every draw after one carries its tag (the rays' DrawRec, the redraw's notes),
+// until the next. A tag: bits 0-7 1 + the machine (racer index), 0 none; bits 8-15 the kind.
+#define AURORA_TAG_BODY 1    /* CarDisp: the machine's body, pilot and parts */
+#define AURORA_TAG_BURNER 2  /* the burner's draw: the machine's engine flames */
 // The GPU thread, before aurora_present_frame: the read position its XFB copy was at.
 AURORA_PRESENT_API void aurora_present_frame_at(uint64_t position);
 // Any one thread: the newest picture finished since the last take (1), none (0), or -1 once Aurora has stopped for

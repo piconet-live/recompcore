@@ -96,6 +96,12 @@ struct RedrawRequest
 };
 void Redraw(const RedrawRequest* request);
 void NoteBetween(u64 position, float fraction);
+// The draw marks (the host's, at the game's own draw sites: the runner's port/image/sites_marks.py): from here on in the
+// command stream the game's draws are of the object `tag` names (aurora_present.h AURORA_TAG_*; 0 none). The emulated CPU's
+// thread, between two of the game's GX calls. The mark keeps the stream's byte position then (the bursts written to the GPU's
+// FIFO, FrameRedraw::WrittenPosition, and the gather pipe's bytes); the GPU thread puts an Aurora command there into the bytes Aurora is handed (OnCommandEnd).
+// The guest's FIFO, its memory and the emulated GPU never see it.
+void NoteMark(u32 tag);
 // The summary for the host's log (empty when it was never on).
 std::string Report();
 bool On();
