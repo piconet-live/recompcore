@@ -118,6 +118,11 @@ AURORA_PRESENT_API int aurora_present_start(const AuroraPresentConfig* config);
 // A model or course file the game is reading from the disc (its path, its whole bytes, copied here). Its materials' pipelines
 // compile on Aurora's compile threads. Any thread, at any time, before or after the start.
 AURORA_PRESENT_API void aurora_present_model_file(const char* path, const uint8_t* bytes, uint64_t size, int later);
+// Where the game stands (the host's word, on any change): `racing` 1 from the race's own phase (the countdown and the race) to its
+// end, 0 otherwise (menus, the load, the course intro, the results); `where` a short text for the log ("course 11, phase 0x29").
+// While racing Aurora compiles nothing ahead: every compile thread is a draw's, and what the load left waits for the race's end.
+// A pipeline a draw then misses is logged ("[pipelines] MISS IN A RACE", its key and `where`). Copied; any thread.
+AURORA_PRESENT_API void aurora_present_scene(int racing, const char* where);
 AURORA_PRESENT_API void aurora_present_write(const uint8_t* bytes, uint32_t size);
 // The GPU thread: the stream so far ends frame `copy` (its XFB copy, numbered from 1). Never blocks.
 // The copy about to be marked is a picture between two steps, shown `fraction` of a field after the true one before it.

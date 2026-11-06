@@ -32,6 +32,8 @@ void precompile_pipeline(const gx::PipelineConfig&, bool, bool) {}
 size_t pipelines_waiting() { return 0; }
 void set_background_compile_threads(unsigned) {}
 size_t pipelines_compiled() { return 0; }
+void set_scene(bool, const char*) {}
+bool racing() { return false; }
 }  // namespace aurora::gfx
 namespace aurora::gx::rt::scene {
 void add_course(const std::vector<std::uint8_t>&) {}

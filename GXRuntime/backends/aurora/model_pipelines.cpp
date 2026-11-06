@@ -555,7 +555,7 @@ void run() {
     return v != nullptr && std::atoi(v) > 0 ? unsigned(std::atoi(v)) : 3u;
   }();
   constexpr size_t Short = 32;  // the compile queue counts as short: later work never stands in front of a file being read
-  bool told = true, told_first = true, walk_told = false, ghosts_told = true;
+  bool told = true, told_first = true, walk_told = false, ghosts_told = true, told_racing = false;
   uint64_t ghosts_since = 0;
   for (;;) {
     File f;
@@ -576,6 +576,19 @@ void run() {
           std::fprintf(stderr, "[pipelines] Time Attack's ghosts: %llu forms asked, %.0f ms after the first file\n",
                        (unsigned long long)s_ghost_forms, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
         }
+        // In a race nothing more is asked or read from the disc walk: every compile thread is the race's (the files the game
+        // reads still go through above, their forms wait in the tiers until the race is over)
+        if (aurora::gfx::racing()) {
+          if (!told_racing) {
+            told_racing = true;
+            size_t left = 0;
+            for (const auto& t : s_tiers) left += t.size();
+            std::fprintf(stderr, "[pipelines] racing: %zu forms wait for the race's end\n", left);
+          }
+          s_wake.wait_for(g, std::chrono::milliseconds(100), [] { return s_quit || !s_files.empty(); });
+          continue;
+        }
+        told_racing = false;
         if (s_tiers[First].empty() && aurora::gfx::pipelines_waiting() == 0 && !told_first) {
           told_first = true;
           std::fprintf(stderr, "[pipelines] every shader so far made: %zu shaders, %.0f ms after the first file\n", s_shaders.size(),
@@ -665,6 +678,11 @@ extern "C" void aurora_present_model_file(const char* path, const uint8_t* bytes
     }
     if (!s_thread.joinable()) s_thread = std::thread(run);
   }
+  s_wake.notify_all();
+}
+
+extern "C" void aurora_present_scene(int racing, const char* where) {
+  aurora::gfx::set_scene(racing != 0, where);
   s_wake.notify_all();
 }
 

@@ -45,6 +45,13 @@ void precompile_pipeline(const gx::PipelineConfig& config, bool scene_target = t
 size_t pipelines_waiting();
 void set_background_compile_threads(unsigned count);
 size_t pipelines_compiled();
+// Where the game stands, from the host (aurora_present_scene): `racing` from the race's own phase to its end. While racing nothing
+// is compiled ahead (the background queue stands; a draw's own pipeline still compiles). `where` names the moment in the miss
+// log. Any thread.
+void set_scene(bool racing, const char* where);
+bool racing();
+// The pipelines still queued ahead of any draw (the background queue) and how many were ever queued there: a progress
+size_t pipelines_ahead_waiting();
 
 bool get_pipeline(PipelineRef ref, CompiledPipeline& pipeline);
 

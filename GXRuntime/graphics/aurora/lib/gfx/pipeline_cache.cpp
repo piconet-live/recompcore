@@ -105,6 +105,7 @@ static std::optional<uint64_t> g_pipelineLayoutKey;
 static std::deque<PendingPipeline> g_pipelineQueue;
 static std::deque<PendingPipeline> g_backgroundPipelineQueue;
 static absl::flat_hash_set<PipelineRef> g_pendingPipelines;
+static absl::flat_hash_set<PipelineRef> g_plannedAhead;  // every runtime key ever queued ahead of a draw (the miss log's "planned")
 static std::atomic_bool g_gpuCachePrunePending = false;
 
 static sqlite3* g_pipelineCacheDb = nullptr;
@@ -510,6 +511,7 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallbac
       };
       switch (priority) {
       case PipelinePriority::Background:
+        g_plannedAhead.insert(runtimeKey);
         g_backgroundPipelineQueue.emplace_back(std::move(pending));
         break;
       case PipelinePriority::Normal:
@@ -541,9 +543,17 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallbac
   return runtimeKey;
 }
 
+// For the miss log: a GX pipeline's key in the cache (pipeline_cache.db's hash) by its runtime key (with the target's layout)
+static absl::flat_hash_map<PipelineRef, HashType> g_cacheKeys;  // under g_pipelineMutex
+
 static PipelineRef resolve_pipeline(ShaderType type, const gx::PipelineConfig& config, const RenderTargetLayout& layout,
                                     PipelinePriority priority) {
-  const auto runtimeKey = xxh3_hash(layout.key, xxh3_hash(config, static_cast<HashType>(type)));
+  const auto cacheKey = xxh3_hash(config, static_cast<HashType>(type));
+  const auto runtimeKey = xxh3_hash(layout.key, cacheKey);
+  {
+    std::lock_guard lock{g_pipelineMutex};
+    g_cacheKeys.try_emplace(runtimeKey, cacheKey);
+  }
   return find_pipeline_impl(runtimeKey, [config, layout] { return create_pipeline(config, layout); }, priority);
 }
 
@@ -1025,8 +1035,44 @@ static double ms_since_start() {
   return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
+// The host's word on where the game stands (set_scene)
+static std::mutex g_sceneMutex;
+static std::string g_where = "before the host said";
+static std::atomic_bool g_racing{false};
+static absl::flat_hash_set<PipelineRef> g_missTold;  // under g_pipelineMutex
+
+void set_scene(bool racing, const char* where) {
+  {
+    std::lock_guard lock{g_sceneMutex};
+    g_where = where != nullptr ? where : "";
+  }
+  if (g_racing.exchange(racing) != racing) {
+    { std::lock_guard lock{g_pipelineMutex}; }  // (a worker between its test and its wait sees the change)
+    g_pipelineQueueCv.notify_all();
+    std::fprintf(stderr, "[pipelines] %s: %s\n", racing ? "racing, nothing compiled ahead" : "not racing, compiling ahead", where ? where : "");
+  }
+}
+
+bool racing() { return g_racing.load(std::memory_order_relaxed); }
+
 static void report_skipped_draws() {
   std::lock_guard lock{g_pipelineMutex};
+  // MISS: a pipeline a draw wanted that nothing had made ready, said once a key, with where the game stood: the keys the
+  // seed and the planner lack (and in a race, a draw left out of the picture)
+  for (const PipelineRef ref : g_frameSkippedPipelines) {
+    if (!g_missTold.insert(ref).second)
+      continue;
+    const auto key = g_cacheKeys.find(ref);
+    std::string where;
+    {
+      std::lock_guard lock{g_sceneMutex};
+      where = g_where;
+    }
+    std::fprintf(stderr, "[pipelines] MISS%s: key %016llx (target %016llx) at frame %u, %s, %s\n", g_racing ? " IN A RACE" : "",
+                 key != g_cacheKeys.end() ? static_cast<unsigned long long>(key->second) : 0ull, static_cast<unsigned long long>(ref),
+                 current_frame(), where.c_str(),
+                 g_plannedAhead.contains(ref) ? "planned ahead, not made in time" : "planned by nothing (the seed and the planner lack it)");
+  }
   if (g_frameSkippedDraws != 0) {
     g_totalSkippedDraws += g_frameSkippedDraws;
     ++g_framesWithSkips;
@@ -1070,13 +1116,16 @@ static void pipeline_worker() {
       if (g_hasPipelineThread) {
         g_pipelineQueueCv.wait(lock, [] {
           return !g_pipelineQueue.empty() || g_pipelineThreadEnd ||
-                 (!g_backgroundPipelineQueue.empty() && g_backgroundWorking < g_backgroundLimit);
+                 (!g_backgroundPipelineQueue.empty() && g_backgroundWorking < g_backgroundLimit && !g_racing.load(std::memory_order_relaxed));
         });
       } else if (g_pipelineQueue.empty() && g_backgroundPipelineQueue.empty()) {
         return;
       }
       if (g_pipelineThreadEnd) {
         break;
+      }
+      if (g_hasPipelineThread && g_pipelineQueue.empty() && g_racing.load(std::memory_order_relaxed)) {
+        continue;  // (the race began while this thread waited: the background queue stands)
       }
       wantedByDraw = !g_pipelineQueue.empty();
       auto& source = !g_pipelineQueue.empty() ? g_pipelineQueue : g_backgroundPipelineQueue;
@@ -1276,7 +1325,14 @@ void rebuild_pipeline_cache() {
     }
   }
   std::ranges::sort(known, {}, &KnownPipeline::firstFrameUsed);
+  // Only the keys of Aurora's look (gx/look_keys.hpp): the seed and a user's cache hold both looks', and the other's are never drawn
+  const auto look = gx::look::current();
+  size_t otherLook = 0;
   for (const auto& pipeline : known) {
+    if (const auto* gxConfig = std::get_if<gx::PipelineConfig>(&pipeline.config); gxConfig != nullptr && !gx::look::fits(*gxConfig, look)) {
+      ++otherLook;
+      continue;
+    }
     std::visit(
         [&](const auto& config) {
           resolve_pipeline(pipeline.type, config, scene, PipelinePriority::Background);
@@ -1286,6 +1342,14 @@ void rebuild_pipeline_cache() {
         },
         pipeline.config);
   }
+  if (otherLook != 0) {
+    std::fprintf(stderr, "[pipelines] cache: %zu known keys of the other look left out\n", otherLook);
+  }
+}
+
+size_t pipelines_ahead_waiting() {
+  std::lock_guard lock{g_pipelineMutex};
+  return g_backgroundPipelineQueue.size();
 }
 
 void initialize_pipeline_cache() {
@@ -1353,6 +1417,9 @@ void shutdown_pipeline_cache() {
   g_pipelineQueue.clear();
   g_backgroundPipelineQueue.clear();
   g_pendingPipelines.clear();
+  g_cacheKeys.clear();
+  g_missTold.clear();
+  g_plannedAhead.clear();
 
   queuedPipelines = 0;
   createdPipelines = 0;
