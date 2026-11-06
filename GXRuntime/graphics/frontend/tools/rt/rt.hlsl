@@ -42,7 +42,7 @@ struct Params {
   uint skyFirst;
   uint _pad;
 };
-struct Light { float3 pos; float3 colour; float reach; };
+struct Light { float3 pos; float3 colour; float reach; uint owner; };  // as rt_rules.hpp EngineLight (the buffer's stride)
 ConstantBuffer<Params> P : register(b0);
 RaytracingAccelerationStructure Scene : register(t0);
 StructuredBuffer<Vertex> Verts : register(t1);

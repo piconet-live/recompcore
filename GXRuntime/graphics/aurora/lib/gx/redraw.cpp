@@ -343,7 +343,7 @@ void classify(const Request& q, bool advance) {
     }
     world += c == World || c == ByVertex;
     s_class[k] = c;
-    if (const u32 m = d.tag & 0xFFu; m != 0 && (d.tag >> 8) == 1) {  // (the marks' check, a body's: rt_format.hpp tag_machine, TagBody)
+    if (const u32 m = d.tag & 0xFFu; m != 0 && ((d.tag >> 8) & 0xFFu) == 1) {  // (the marks' check, a body's: rt_format.hpp tag_machine, TagBody)
       ++tagged;
       tagSame += c == static_cast<int>(m - 1);
       tagOther += c >= 0 && c < static_cast<int>(MostMachines) && c != static_cast<int>(m - 1);
