@@ -64,7 +64,7 @@ u64 s_atCopy = 0;
 u32 s_liveTextures = 0;
 bool s_rayed = false;
 double s_captureMs = 0;
-float s_road = 0.9f, s_light = 1.f, s_glow = 0.f, s_calm = 1.f, s_wet = 0.f, s_machineCap = 0.45f, s_sceneryCap = 0.25f, s_machineGain = 2.f;
+float s_road = 0.9f, s_light = 1.f, s_glow = 0.f, s_calm = 1.f, s_wet = 0.f, s_reflectCap = 0.25f;
 u32 s_liveFirstNew = 0;
 u64 s_copyNow = 0;
 std::vector<DrawRec> s_draws;
@@ -272,18 +272,18 @@ void start() noexcept {
 #endif
   // AURORA_RT_LOOK=1, the overhaul look: reflections you can't miss. Each number can still be set by its own switch below. All tuned by eye.
   if (const char* v = std::getenv("AURORA_RT_LOOK"); v != nullptr && v[0] == '1') {
-    s_road = 1.4f, s_glow = 0.5f, s_calm = 0.3f, s_wet = 0.35f, s_machineCap = 0.9f, s_sceneryCap = 0.7f, s_machineGain = 3.f;
+    s_road = 1.4f, s_glow = 0.5f, s_calm = 0.3f, s_wet = 0.35f, s_reflectCap = 0.7f;
   }
   // AURORA_RT_LOOK=2, the material rule: the game's own reflection layers stay in the raster, the rays only add (rt.hlsl, MatGapLow and on). The picture stays the rays-off picture, better lit.
   if (const char* v = std::getenv("AURORA_RT_LOOK"); v != nullptr && v[0] == '2') {
     g_neutral = false;
-    s_road = 0.f, s_glow = 0.5f, s_wet = -1.f, s_machineCap = 1.f, s_sceneryCap = 1.f, s_machineGain = 1.f;
+    s_road = 0.f, s_glow = 0.5f, s_wet = -1.f, s_reflectCap = 1.f;
   }
   const auto setting = [](const char* name, float& to) {
     if (const char* v = std::getenv(name))
       to = static_cast<float>(std::atof(v));
   };
-  setting("AURORA_RT_BODY_CALM", s_calm), setting("AURORA_RT_WET", s_wet), setting("AURORA_RT_MACHINE_CAP", s_machineCap), setting("AURORA_RT_SCENERY_CAP", s_sceneryCap), setting("AURORA_RT_MACHINE_GAIN", s_machineGain);
+  setting("AURORA_RT_BODY_CALM", s_calm), setting("AURORA_RT_WET", s_wet), setting("AURORA_RT_REFLECT_CAP", s_reflectCap);
   if (const char* v = std::getenv("AURORA_RT_ROAD"))
     s_road = static_cast<float>(std::atof(v));
   if (const char* v = std::getenv("AURORA_RT_LIGHT"))
@@ -829,7 +829,7 @@ void log_facts(const live::Job& j, const Frame& f) {
   const Vertex* verts = j.verts.get() + j.baseVert;
   const LightNote* notes = j.notes.get() + j.baseDraw;
   const float px = f.main->proj[0], py = f.main->proj[5], ox = f.main->proj[2], oy = f.main->proj[6];
-  std::fprintf(s_facts, "F,%llu,%u,%zu\n", static_cast<unsigned long long>(j.copy), j.drawCount, f.machineLights.size());
+  std::fprintf(s_facts, "F,%llu,%u,%u\n", static_cast<unsigned long long>(j.copy), j.drawCount, f.machineLights);
   std::map<std::tuple<u32, int, int, int, int, int, int>, u32> seen;
   double nearN[3]{};
   for (u32 i = 0; i < j.drawCount; ++i) {
@@ -878,7 +878,7 @@ void log_facts(const live::Job& j, const Frame& f) {
     }
     const double len = std::max(std::sqrt(nx * nx + ny * ny + nz * nz), 1e-9);
     const double dn = static_cast<double>(d.vertices);
-    const bool machine = beside_engine_light(d, verts, f.machineLights);
+    const bool machine = tag_kind(d.tag) == TagBody;  // the game marked it as a machine body
     const float ext = std::max({mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]});
     u32 tex = 0;
     for (u32 s = 0; s < std::min<u32>(d.stages, 16u); ++s)
@@ -1215,7 +1215,7 @@ void run_rules(live::Job& j) {
     if (most != nullptr)
       tuning.maxGlows = static_cast<u32>(std::atoi(most));
   }
-  tuning.machineCap = s_machineCap, tuning.sceneryCap = s_sceneryCap, tuning.machineGain = s_machineGain;
+  tuning.reflectCap = s_reflectCap;
   // AURORA_RT_HUD_SKIP=1 (off by default): cards turned to the picture, the game's overlay in the world (the place markers), are left out of every ray but the
   // camera's (rt_rules.hpp faces_picture). AURORA_RT_HUD_LOG=1: each such draw on stderr, a line each, every 30th copy, and the count of copies that had any
   static const bool overlayApart = [] {
@@ -1223,12 +1223,6 @@ void run_rules(live::Job& j) {
     return v != nullptr && std::atof(v) != 0;
   }();
   tuning.overlayApart = overlayApart;
-  // AURORA_RT_LIGHT_OWN=1 (off by default): each body draw beside a machine light is marked as that light's own (rt_rules.hpp, rt.hlsl LIGHT_OWN)
-  static const bool lightOwn = [] {
-    const char* v = std::getenv("AURORA_RT_LIGHT_OWN");
-    return v != nullptr && std::atof(v) != 0;
-  }();
-  tuning.lightOwn = lightOwn;
   // AURORA_RT_GLOW_WIDE=1 (off by default): an additive draw at least AURORA_RT_GLOW_WIDE_SIZE across (world units, 4 by default) gives no hot core
   // and no flare (rt_rules.hpp wide_glow, rt.hlsl GLOW_WIDE)
   static const float glowWide = [] {

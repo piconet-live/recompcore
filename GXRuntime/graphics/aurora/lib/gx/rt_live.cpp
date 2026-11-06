@@ -222,6 +222,7 @@ struct State {
 
   double msTrace = 0, msGpu = 0, msComposeWait = 0, msBuild = 0, msRules = 0, msTranslate = 0;
   double picks = 0, merged = 0, glowsSeen = 0, glowPieces = 0, glowDraws = 0, glowTop = 0;
+  double machineDraws = 0, machineLights = 0, machineGlows = 0;  // the game's marks (rt_rules.hpp Frame)
   double msGpuMost = 0;
   u64 tris = 0, lightsSeen = 0, lightsMost = 0, reports = 0;
   FILE* timeLog = nullptr;
@@ -464,8 +465,6 @@ const std::vector<std::wstring>& shader_defines() {
                                          {"AURORA_RT_GLOW_FAST", L"GLOW_FAST", 0.f}, {"AURORA_RT_DEPTH_CAP", L"DEPTH_CAP", 0.f},
                                          // phase 2: the glow light once per light pixel, read up in main (needs AURORA_RT_HALF and the denoiser); 2: the engine lights too
                                          {"AURORA_RT_GLOW_HALF", L"GLOW_HALF", 0.f},
-                                         // a machine light's shadow ray passes the machine's own body, and a shadow fades in instead of starting at a step
-                                         {"AURORA_RT_LIGHT_OWN", L"LIGHT_OWN", 0.f},
                                          // a wide additive sheet gives no hot core and no flare (rt_rules.hpp wide_glow); _SHOW 1: those pixels shown magenta
                                          {"AURORA_RT_GLOW_WIDE", L"GLOW_WIDE", 0.f}, {"AURORA_RT_GLOW_WIDE_SHOW", L"GLOW_WIDE_SHOW", 0.f},
                                          // a translucent sheet with a soft alpha (cloud layers, waterfalls; rt_rules.hpp soft_alpha) is passed by the camera's rays
@@ -1804,6 +1803,7 @@ void run_rays(Job& job) {
   g.motionAgree += job.motion.agreeing, g.motionOwn += job.motion.matched;
   g.msRules += job.rulesMs;
   g.glowPieces += fr.glowPieces, g.glowDraws += fr.glowDraws, g.glowTop += fr.glowTopDraw;
+  g.machineDraws += fr.machineDraws, g.machineLights += fr.machineLights, g.machineGlows += job.glow > 0 ? fr.machineGlows : 0;
   g.picks += job.lightPicks, g.merged += job.mergedLights, g.glowsSeen += glowCount;
   g.msTranslate += job.translateUs.load() / 1000.0;
   g.tris += fr.verts.size() / 3;
@@ -1820,6 +1820,7 @@ void run_rays(Job& job) {
     std::fprintf(stderr, "[rt] per frame, %u frames at %ux%u: GPU build %.2f ms and rays+cleanup %.2f ms (all %.2f, worst %.2f); CPU in the stream %.2f ms, translation beside it %.2f ms, rules %.2f ms, worker %.2f ms; %.0f triangles, lights %.1f (most %llu), picks %.1f, merged %.1f, glows %.1f from %.0f pieces of %.1f draws, one draw held most %.1f\n",
                  g.count, g.w, g.h, (g.msGpu - g.msTrace - g.msLight - g.msDenoise) / gn, g.msTrace / gn, g.msGpu / gn, g.msGpuMost, g.msBuild / n, g.msTranslate / n, g.msRules / n, g.msComposeWait / n, double(g.tris) / n, double(g.lightsSeen) / n,
                  static_cast<unsigned long long>(g.lightsMost), g.picks / n, g.merged / n, g.glowsSeen / n, g.glowPieces / n, g.glowDraws / n, g.glowTop / n);
+    std::fprintf(stderr, "[rt] the game's marks: machine draws %.1f a frame in the main view, lights of a machine %.1f, glow lights of a machine %.1f\n", g.machineDraws / n, g.machineLights / n, g.machineGlows / n);
     world_report(n);
     if (g_noEngineStar)
       std::fprintf(stderr, "[rt] engine stars not drawn: %llu so far\n", static_cast<unsigned long long>(g_starsSkipped.load(std::memory_order_relaxed)));
@@ -1827,7 +1828,7 @@ void run_rays(Job& job) {
       std::fprintf(stderr, "[rt] slow true frames (rays over %.0f ms on the GPU): %llu so far, at most %u lines a minute; most %.2f ms\n", SlowTrueMs,
                    static_cast<unsigned long long>(g_slowTrue), SlowTrueLines, g_slowTrueMost);
     g.msLight = g.msDenoise = g.motionAgree = g.motionOwn = 0;
-    g.count = 0, g.gpuTimed = 0, g.msGpuMost = 0, g.msGpu = g.msTrace = g.msBuild = g.msRules = g.msTranslate = g.msComposeWait = 0, g.tris = 0, g.lightsSeen = 0, g.lightsMost = 0, g.picks = g.merged = g.glowsSeen = g.glowPieces = g.glowDraws = g.glowTop = 0;
+    g.count = 0, g.gpuTimed = 0, g.msGpuMost = 0, g.msGpu = g.msTrace = g.msBuild = g.msRules = g.msTranslate = g.msComposeWait = 0, g.tris = 0, g.lightsSeen = 0, g.lightsMost = 0, g.picks = g.merged = g.glowsSeen = g.glowPieces = g.glowDraws = g.glowTop = 0, g.machineDraws = g.machineLights = g.machineGlows = 0;
   }
 }
 

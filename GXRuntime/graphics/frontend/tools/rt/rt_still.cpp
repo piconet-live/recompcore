@@ -58,7 +58,7 @@ int main(int argc, char** argv) {
   std::vector<Tex> texs(nTex);
   for (auto& t : texs) { const u32* h = (const u32*)p; t.w = h[0]; t.h = h[1]; t.wrapS = h[2]; t.wrapT = h[3]; p += 16; t.rgba.assign(p, p + size_t(t.w) * t.h * 4); p += size_t(t.w) * t.h * 4; }
 
-  Tuning tune; tune.machineGain = gain; if (std::getenv("RT_SCENERY_CAP")) tune.sceneryCap = (float)atof(std::getenv("RT_SCENERY_CAP"));
+  Tuning tune; if (std::getenv("RT_REFLECT_CAP")) tune.reflectCap = (float)atof(std::getenv("RT_REFLECT_CAP"));
   Frame fr; build_frame(draws, nDraws, verts, tune, fr);
   auto& kept = fr.verts; auto& lights = fr.lights; const DrawRec* mainDraw = fr.main;
   if (!mainDraw) { std::fprintf(stderr, "no perspective view\n"); return 2; }

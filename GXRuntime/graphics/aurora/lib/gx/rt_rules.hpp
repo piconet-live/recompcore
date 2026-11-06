@@ -18,12 +18,16 @@ struct EngineLight {
   float pos[3];
   float colour[3];  // the draw's own colour, by its strength
   float reach;      // 1 for a machine's flame, less for a small dim one
+  std::uint32_t owner;  // 1 + the machine whose draws it came from (the game's draw marks: DrawRec::tag), 0 none (a course lamp, a mine's blast)
 };
 
 // The one rule for lights: anything additive, small and bright in the main view casts light. No labels: a flame, a spark or a
-// mine's blast are the same to it. Colour from the draw, strength its brightness by its size; draws within MergeR become one.
+// mine's blast are the same to it. Colour from the draw, strength its brightness by its size. Draws the game marked as one
+// machine's (its burner's flames, any glowing part of its body: the draw marks) become that machine's one light; any other
+// draws within MergeR of one another become one.
 struct LightPick {
   float pos[3], colour[3], weight, extent, bright;
+  std::uint32_t owner;  // EngineLight::owner
 };
 inline void light_picks(const DrawRec* draws, std::uint32_t count, bool (*in_view)(const DrawRec&), std::vector<LightPick>& out, float maxSize, float minBright) {
   out.clear();
@@ -33,7 +37,7 @@ inline void light_picks(const DrawRec* draws, std::uint32_t count, bool (*in_vie
       continue;
     out.push_back({{d.lightPos[0], d.lightPos[1], d.lightPos[2]},
                    {d.lightColour[0], d.lightColour[1], d.lightColour[2]},
-                   d.lightBright * std::max(d.lightExtent, 0.5f), d.lightExtent, d.lightBright});
+                   d.lightBright * std::max(d.lightExtent, 0.5f), d.lightExtent, d.lightBright, tag_machine(d.tag)});
   }
 }
 inline void merge_lights(std::vector<LightPick>& picks, float mergeR, std::vector<LightPick>& out) {
@@ -42,8 +46,10 @@ inline void merge_lights(std::vector<LightPick>& picks, float mergeR, std::vecto
   for (const LightPick& p : picks) {
     bool merged = false;
     for (LightPick& q : out) {
+      if (q.owner != p.owner)
+        continue;
       const float dx = q.pos[0] / q.weight - p.pos[0], dy = q.pos[1] / q.weight - p.pos[1], dz = q.pos[2] / q.weight - p.pos[2];
-      if (dx * dx + dy * dy + dz * dz < mergeR * mergeR) {
+      if (p.owner != 0 || dx * dx + dy * dy + dz * dz < mergeR * mergeR) {
         for (int a = 0; a < 3; ++a)
           q.pos[a] += p.pos[a] * p.weight, q.colour[a] += p.colour[a] * p.weight;
         q.weight += p.weight;
@@ -63,46 +69,10 @@ inline void merge_lights(std::vector<LightPick>& picks, float mergeR, std::vecto
       q.pos[a] /= q.weight, q.colour[a] /= q.weight;
 }
 
-// A machine: a draw right beside an engine light. Only machines earn the boosted reflection; nothing else is told apart.
-inline bool beside_engine_light(const DrawRec& d, const Vertex* verts, const std::vector<EngineLight>& lights, float reach = 5.f) {
-  if (d.vertices == 0)
-    return false;
-  float c[3]{};
-  for (std::uint32_t v = 0; v < d.vertices; ++v)
-    for (int a = 0; a < 3; ++a)
-      c[a] += verts[d.firstVertex + v].pos[a] / d.vertices;
-  for (const auto& l : lights)
-    if (std::hypot(c[0] - l.pos[0], c[1] - l.pos[1], c[2] - l.pos[2]) < reach)
-      return true;
-  return false;
-}
-
-// AURORA_RT_LIGHT_OWN: the machine light a draw is beside (beside_engine_light's rule, the nearest within its reach), as 1 + its number in
-// lights; 0: none. A machine's flames make its light; the light sits in or at its nozzles, so the machine's own body lies between it and
-// most of what it lights: its shadow ray met the body ahead of and beside the machine, every frame. That draw is the light's own body.
-inline std::uint32_t own_light(const DrawRec& d, const Vertex* verts, const std::vector<EngineLight>& lights, float machineLight, float reach = 5.f) {
-  if (d.vertices == 0)
-    return 0;
-  float c[3]{};
-  for (std::uint32_t v = 0; v < d.vertices; ++v)
-    for (int a = 0; a < 3; ++a)
-      c[a] += verts[d.firstVertex + v].pos[a] / d.vertices;
-  std::uint32_t best = 0;
-  float bestD = reach;
-  for (std::uint32_t i = 0; i < lights.size() && i < 31; ++i) {
-    const EngineLight& l = lights[i];
-    if (l.reach * l.reach < machineLight)
-      continue;
-    const float dd = std::hypot(c[0] - l.pos[0], c[1] - l.pos[1], c[2] - l.pos[2]);
-    if (dd < bestD)
-      bestD = dd, best = i + 1;
-  }
-  return best;
-}
-
 // A big glowing surface as light: a piece of it, its power as colour by area
 struct GlowLight {
   float pos[3], area, colour[3], radius;
+  std::uint32_t owner;  // EngineLight::owner: the machine whose draws the piece is of, 0 none
 };
 // What a draw's stages give on its textures' mean colours and its rasterised colour: the surface's colour on the whole, no pixels read.
 // Reflection layers left out, as the rays do.
@@ -169,12 +139,12 @@ inline void draw_colour(const DrawRec& d, const Vertex* verts, const float (*tex
 // What the rays read of a draw: small, the stages apart
 struct GpuDraw {
   std::uint32_t stages, firstStage, cls;  // cls: 0 solid, 1 translucent, 2 additive, 3 ignored
-  float strength;                         // reflection strength; machines boosted, scenery capped
+  float strength;                         // reflection strength, at most Tuning::reflectCap
   std::uint32_t highlight;                // bit 0: has a stage looked up by the normal, the game's own shine; bit 1: glows, gives light; bit 2: outside the depth, drawn over the world, takes no light; bit 3: a blended layer writing no depth;
                                           // bit 4: a card turned to the picture (faces_picture, AURORA_RT_HUD_SKIP): the camera's rays alone meet it, it takes no light and casts no shadow
                                           // bit 5 (AURORA_RT_GLOW_WIDE): an additive sheet wider than a source (wide_glow): no hot core, no flare where it lies over the picture
                                           // bit 6 (AURORA_RT_SHEETS): a sheet, translucent with a soft alpha and no reflection layer (soft_alpha): the camera's rays pass it
-                                          // bits 8-12 (AURORA_RT_LIGHT_OWN): 1 + the number in lights of the machine light this body draw is beside (own_light), 0 none
+                                          // bits 8-12: 1 + the machine whose draw it is, by the game's own mark (DrawRec::tag), 0 none: its lights' own body (rt.hlsl engine_light, glow_light)
   std::uint32_t fogType;
   float fog[3];
   float fogColour[3];
@@ -250,9 +220,9 @@ inline bool soft_alpha(const DrawRec& d, const Vertex* verts, const float (*texS
 }
 
 struct Tuning {
-  float machineGain = 2.f, machineCap = 0.45f, sceneryCap = 0.25f;
+  float reflectCap = 0.25f;  // the most reflection strength a draw takes (AURORA_RT_REFLECT_CAP; the look's)
   std::uint32_t maxLights = 16;
-  float lightMaxSize = 40.f, lightMinBright = 0.07f, lightMerge = 8.f, lightFull = 2.f, machineLight = 0.3f;
+  float lightMaxSize = 40.f, lightMinBright = 0.07f, lightMerge = 8.f, lightFull = 2.f;
   // Glowing surfaces: on when texMeans is given. The size where small lights end is where these begin.
   const float (*texMeans)[4] = nullptr;
   std::uint32_t texCount = 0, maxGlows = 64, glowPerDraw = 0;  // glowPerDraw: most lights one draw may hold, 0 no limit
@@ -263,7 +233,6 @@ struct Tuning {
   std::uint64_t extraVerts[4]{};
   float largestFloor = 0.f;
   bool overlayApart = false;  // AURORA_RT_HUD_SKIP=1: cards turned to the picture are the game's overlay in the world (faces_picture), not surfaces
-  bool lightOwn = false;      // AURORA_RT_LIGHT_OWN=1: a body draw beside a machine light carries that light's number (GpuDraw highlight bits 8-12)
   float glowWide = 0.f;       // AURORA_RT_GLOW_WIDE=1: an additive draw at least this wide across (world units, wide_glow) is a sheet of light, not a source: no hot core, no flare (bit 5)
   // AURORA_RT_SHEETS=1: each texture's soft and edge shares, by channel (rt_capture.cpp s_texSoft, s_texEdge); null: off (soft_alpha, bit 6)
   const float (*texSoft)[4] = nullptr;
@@ -280,12 +249,12 @@ struct Frame {
   std::vector<GpuDraw> draws;
   std::vector<StageRec> stages;
   std::vector<LightPick> picks, merged;
-  std::vector<EngineLight> machineLights;
   std::vector<EngineLight> lights;
   std::vector<GlowLight> glows;
   std::uint32_t glowDraws = 0, glowPieces = 0, glowTopDraw = 0;  // glowTopDraw: lights held by the draw holding most
   const DrawRec* main = nullptr;
-  std::uint32_t machineDraws = 0, reflective = 0;
+  std::uint32_t machineDraws = 0, reflective = 0;  // machineDraws: draws the game marked as a machine's (DrawRec::tag)
+  std::uint32_t machineLights = 0, machineGlows = 0;  // lights and glow lights of a machine (owner)
   std::vector<float> extent;  // each draw's size in the main view
   float largest = 0.f;
   bool is_sky(std::uint32_t i) const { return extent[i] > largest * 0.3f && draws[i].cls != 0 && draws[i].cls != 3; }
@@ -297,12 +266,12 @@ struct Frame {
 // the nearer it is; pieces near one another become one; those that matter most from the view are kept.
 template <class Sky>
 inline void build_glows(const DrawRec* draws, std::uint32_t count, const Vertex* verts, const Tuning& t, const std::vector<float>& extent, const Sky& sky, Frame& out) {
-  out.glows.clear(), out.glowDraws = out.glowPieces = 0;
+  out.glows.clear(), out.glowDraws = out.glowPieces = out.machineGlows = 0;
   if (t.texMeans == nullptr)
     return;
   struct Piece {
     float pos[3], area, colour[3], power;
-    std::uint32_t draw;
+    std::uint32_t draw, owner;
   };
   static thread_local std::vector<Piece> pieces;
   static thread_local std::vector<std::uint32_t> held;
@@ -343,7 +312,7 @@ inline void build_glows(const DrawRec* draws, std::uint32_t count, const Vertex*
           // a coarse grid of the triangle's barycentrics: fixed to it, so it travels with the world
           const float u = (a0 + 1.f / 3) / n, w = (a1 + 1.f / 3) / n;
           Piece q;
-          q.draw = i;
+          q.draw = i, q.owner = tag_machine(d.tag);
           for (int k = 0; k < 3; ++k)
             q.pos[k] = p0[k] + e1[k] * u + e2[k] * w, q.colour[k] = col[k];
           q.area = area * 2 / static_cast<float>(n * n);  // pairs of small triangles of the grid, near enough
@@ -363,6 +332,8 @@ inline void build_glows(const DrawRec* draws, std::uint32_t count, const Vertex*
     const float dd = p.pos[0] * p.pos[0] + p.pos[1] * p.pos[1] + p.pos[2] * p.pos[2];
     const float r2 = std::max(8.f * 8.f, dd * 0.09f);
     for (Piece& q : sums) {
+      if (q.owner != p.owner)
+        continue;
       const float x = q.pos[0] / q.area - p.pos[0], y = q.pos[1] / q.area - p.pos[1], z = q.pos[2] / q.area - p.pos[2];
       if (x * x + y * y + z * z < r2) {
         for (int k = 0; k < 3; ++k)
@@ -384,7 +355,8 @@ inline void build_glows(const DrawRec* draws, std::uint32_t count, const Vertex*
     GlowLight l;
     for (int k = 0; k < 3; ++k)
       l.pos[k] = q.pos[k] / q.area, l.colour[k] = q.colour[k] / q.area;
-    l.area = q.area, l.radius = std::sqrt(q.area / 3.14159f);
+    l.area = q.area, l.radius = std::sqrt(q.area / 3.14159f), l.owner = q.owner;
+    out.machineGlows += q.owner != 0 ? 1 : 0;
     out.glows.push_back(l);
   }
 }
@@ -417,7 +389,7 @@ inline bool faces_picture(const DrawRec& d, const Vertex* verts) {
 // The main view is the perspective projection with the most triangles. Sky: the largest see-through shells around the view,
 // by size against the largest in the frame, with no table of courses.
 inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex* verts, const Tuning& t, Frame& out) {
-  out.verts.clear(), out.prevPos.clear(), out.spans.clear(), out.draws.clear(), out.stages.clear(), out.main = nullptr, out.machineDraws = out.reflective = 0, out.seeFirstVertex = out.layerFirstVertex = out.skyFirstVertex = out.primaryFirstVertex = out.passFirstVertex = 0;
+  out.verts.clear(), out.prevPos.clear(), out.spans.clear(), out.draws.clear(), out.stages.clear(), out.main = nullptr, out.machineDraws = out.reflective = out.machineLights = 0, out.seeFirstVertex = out.layerFirstVertex = out.skyFirstVertex = out.primaryFirstVertex = out.passFirstVertex = 0;
   const auto key = [](const DrawRec& d) { return std::array<int, 2>{static_cast<int>(d.proj[0] * 1000), static_cast<int>(d.proj[5] * 1000)}; };
   std::array<int, 2> best{};
   {
@@ -465,13 +437,9 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
     const float k = q.weight / t.lightFull;
     const float strength = std::min(k, 1.5f);
     out.lights.push_back({{q.pos[0], q.pos[1], q.pos[2]}, {q.colour[0] * strength, q.colour[1] * strength, q.colour[2] * strength},
-                          std::clamp(std::sqrt(k), 0.25f, 1.25f)});
+                          std::clamp(std::sqrt(k), 0.25f, 1.25f), q.owner});
+    out.machineLights += q.owner != 0 ? 1 : 0;
   }
-  // only a strong light marks a machine: a spark against a wall does not turn the wall to chrome
-  out.machineLights.clear();
-  for (const EngineLight& l : out.lights)
-    if (l.reach * l.reach >= t.machineLight)
-      out.machineLights.push_back(l);
   out.draws.resize(count);
   out.extent.assign(count, 0.f);
   std::vector<float>& extent = out.extent;
@@ -523,16 +491,13 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
     // takes no light through it, and it takes none itself (bit 2); no other ray meets it: no shadow, no reflection, no light from it
     if (t.overlayApart && inView && g.cls < 2 && faces_picture(d, verts))
       g.highlight |= 16 | 4;
-    if (t.lightOwn && inView && g.cls < 2 && (g.highlight & 16) == 0)
-      g.highlight |= own_light(d, verts, out.lights, t.machineLight) << 8;
+    // the machine whose draw this is, by the game's own mark: every light of that machine passes it (rt.hlsl engine_light, glow_light)
+    if (g.cls < 2 && (g.highlight & 16) == 0)
+      g.highlight |= std::min(tag_machine(d.tag), 31u) << 8;
+    out.machineDraws += inView && tag_machine(d.tag) != 0 ? 1 : 0;
     if (strength > 0 && inView) {
       ++out.reflective;
-      if (beside_engine_light(d, verts, out.machineLights)) {
-        strength = std::max(strength, std::min(strength * t.machineGain, t.machineCap));
-        ++out.machineDraws;
-      } else {
-        strength = std::min(strength, t.sceneryCap);
-      }
+      strength = std::min(strength, t.reflectCap);
     }
     g.strength = strength;
     if (t.texSoft != nullptr && g.cls == 1 && strength <= 0.f && soft_alpha(d, verts, t.texSoft, t.texEdge, t.texSoftCount))
