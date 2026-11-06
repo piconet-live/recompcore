@@ -123,6 +123,10 @@ AURORA_PRESENT_API void aurora_present_model_file(const char* path, const uint8_
 // While racing Aurora compiles nothing ahead: every compile thread is a draw's, and what the load left waits for the race's end.
 // A pipeline a draw then misses is logged ("[pipelines] MISS IN A RACE", its key and `where`). Copied; any thread.
 AURORA_PRESENT_API void aurora_present_scene(int racing, const char* where);
+// The game's step now (the host's word, told on the game's thread once a frame): the frames marked from here on belong to it, for
+// the step-stamped event lines (a catch-up, a slow picture between, a true frame late on the GPU). Optional: a host without it
+// gets "step ?" in those lines. Any thread.
+AURORA_PRESENT_API void aurora_present_step(uint32_t step);
 AURORA_PRESENT_API void aurora_present_write(const uint8_t* bytes, uint32_t size);
 // The GPU thread: the stream so far ends frame `copy` (its XFB copy, numbered from 1). Never blocks.
 // The copy about to be marked is a picture between two steps, shown `fraction` of a field after the true one before it.

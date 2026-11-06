@@ -121,7 +121,7 @@ struct Slot {
   std::vector<ComPtr<ID3D12Resource>> keep;
   // what this slot's timings belong to, for the time log
   u64 copy = 0;
-  u32 tris = 0, lightCount = 0, uploads = 0;
+  u32 tris = 0, lightCount = 0, uploads = 0, glows = 0, step = 0xFFFFFFFFu;
   bool between = false;  // its timings are a picture between's
   ComPtr<ID3D12Resource> betweenConstants;
   void* betweenMap = nullptr;
@@ -1532,6 +1532,28 @@ void between_row(const u64* t6) {
   std::fprintf(g.timeLog, "b,%llu,0,%.3f,0,0,%.3f,0,0,0,0,0,0,0,0,%.3f,%.3f\n", static_cast<unsigned long long>(g.betweenCount), double(t6[1] - t6[0]) * k, double(t6[5] - t6[8]) * k, double(t6[8] - t6[4]) * k, double(t6[5] - t6[0]) * k);
 }
 
+// A true frame whose rays took more than SlowTrueMs on the GPU (at 240 a refresh is 4.17 ms: the rays and the frame's raster then
+// pass the room a field leaves beside its three pictures between), one line each, step-stamped, so that a player's log places it and
+// names the part that grew. At most SlowTrueLines lines; the rest counted for the stop's line. (The m39 hunt, glitch-2min.md.)
+constexpr double SlowTrueMs = 8.0;
+constexpr u32 SlowTrueLines = 100;
+u64 g_slowTrue = 0;
+double g_slowTrueMost = 0;
+void slow_true_row(const Slot& s, double all, double build, double light, double denoise, double reflect, double compose) {
+  if (all <= SlowTrueMs)
+    return;
+  g_slowTrueMost = std::max(g_slowTrueMost, all);
+  if (g_slowTrue++ >= SlowTrueLines)
+    return;
+  char step[16] = "?";
+  if (s.step != 0xFFFFFFFFu)
+    std::snprintf(step, sizeof step, "%u", s.step);
+  std::fprintf(stderr,
+               "[rt] slow true frame: step %s (copy %llu): rays %.2f ms on the GPU (build %.2f, light %.2f, smoothing %.2f, reflections %.2f, "
+               "compose %.2f); %u triangles, %u lights, %u glows, %u textures uploaded\n",
+               step, static_cast<unsigned long long>(s.copy), all, build, light, denoise, reflect, compose, s.tris, s.lightCount, s.glows, s.uploads);
+}
+
 // A slot's last timings, its work done: a picture between's (b row) or a true frame's (t row; before 2026-11-03 phase 9 a true frame's slot
 // taken next by a picture between lost its timing, so true frames' figures were those of frames with few pictures after them)
 void take_timing(Slot& s, u32 slot) {
@@ -1556,6 +1578,7 @@ void take_timing(Slot& s, u32 slot) {
     g.msLight += lightMs, g.msDenoise += denoiseMs;
     ++g.gpuTimed;
     gpu_slot_row("gpu_rays", t6, s.copy);
+    slow_true_row(s, all, build, lightMs, denoiseMs, reflectMs, composeMs);
     // AURORA_RT_TIMELOG=<file>: a line a frame, to find one slow frame by its copy and what it carried
     if (g.timeLog != nullptr)
       std::fprintf(g.timeLog, "t,%llu,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", static_cast<unsigned long long>(s.copy), build, lightMs, denoiseMs, reflectMs, composeMs, s.tris, s.lightCount, s.uploads,
@@ -1696,6 +1719,7 @@ void run_rays(Job& job) {
   s.keep.clear();
   s.between = false;
   s.copy = job.copy, s.tris = static_cast<u32>(job.frame.verts.size() / 3), s.lightCount = static_cast<u32>(job.frame.lights.size()), s.uploads = static_cast<u32>(job.textures.size());
+  s.step = step_of(job.copy), s.glows = 0;
   RT_HR(s.alloc->Reset());
   RT_HR(s.cl->Reset(s.alloc.Get(), nullptr));
   ID3D12GraphicsCommandList4* cl = s.cl.Get();
@@ -1735,6 +1759,7 @@ void run_rays(Job& job) {
     trace_part(s, job, base, glowCount);
     if (g.failed)
       return;
+    s.glows = glowCount;
   }
   D3D12_RESOURCE_BARRIER uav{};
   uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -1792,6 +1817,9 @@ void run_rays(Job& job) {
     world_report(n);
     if (g_noEngineStar)
       std::fprintf(stderr, "[rt] engine stars not drawn: %llu so far\n", static_cast<unsigned long long>(g_starsSkipped.load(std::memory_order_relaxed)));
+    if (g_slowTrue > SlowTrueLines)  // (each of the first ones has a line of its own)
+      std::fprintf(stderr, "[rt] slow true frames (rays over %.0f ms on the GPU): %llu so far, the first %u with a line each; most %.2f ms\n", SlowTrueMs,
+                   static_cast<unsigned long long>(g_slowTrue), SlowTrueLines, g_slowTrueMost);
     g.msLight = g.msDenoise = g.motionAgree = g.motionOwn = 0;
     g.count = 0, g.gpuTimed = 0, g.msGpuMost = 0, g.msGpu = g.msTrace = g.msBuild = g.msRules = g.msTranslate = g.msComposeWait = 0, g.tris = 0, g.lightsSeen = 0, g.lightsMost = 0, g.picks = g.merged = g.glowsSeen = g.glowPieces = g.glowDraws = g.glowTop = 0;
   }

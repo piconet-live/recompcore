@@ -131,6 +131,7 @@ struct Library
   void (*picture_shape)(float) = nullptr;
   void (*model_file)(const char*, const u8*, u64, int) = nullptr;
   void (*scene)(int, const char*) = nullptr;
+  void (*step)(u32) = nullptr;  // optional: older libraries have none
 };
 
 Settings s_settings;
@@ -234,6 +235,7 @@ bool Load(const std::string& path)
   Bind(&s_lib.frame_at, "aurora_present_frame_at");
   Bind(&s_lib.redraw, "aurora_present_redraw");
   Bind(&s_lib.scene, "aurora_present_scene");
+  Bind(&s_lib.step, "aurora_present_step");
   return true;
 #else
   s_load_problem = "Aurora is only loaded on Windows so far";
@@ -375,6 +377,12 @@ void Scene(bool racing, const std::string& where)
 {
   if (s_on.load(std::memory_order_relaxed) && s_lib.scene != nullptr)
     s_lib.scene(racing ? 1 : 0, where.c_str());
+}
+
+void Step(u32 step)
+{
+  if (s_on.load(std::memory_order_relaxed) && s_lib.step != nullptr)
+    s_lib.step(step);
 }
 
 void Configure(const Settings& settings)

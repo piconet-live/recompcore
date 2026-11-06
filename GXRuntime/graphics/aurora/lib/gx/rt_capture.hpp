@@ -43,4 +43,8 @@ void capture_sum_rows() noexcept;  // AURORA_STAGELOG: the stream thread's captu
 void frame_end() noexcept;
 // The host's display copy about to be drawn. AURORA_RT_CAPTURE_COPY=<copy>: capture exactly that frame, the one its test picture shows
 void begin_copy(std::uint64_t copy) noexcept;
+// The game's step a display copy belongs to (the host's aurora_present_step, told on the game's thread), for the step-stamped event
+// lines (a slow true frame of the rays', a catch-up, a slow picture between): kept for the last 512 copies. 0xFFFFFFFF: not known.
+void copy_step(std::uint64_t copy, std::uint32_t step) noexcept;
+std::uint32_t step_of(std::uint64_t copy) noexcept;
 } // namespace aurora::gx::rt

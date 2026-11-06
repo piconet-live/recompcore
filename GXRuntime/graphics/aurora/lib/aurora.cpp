@@ -56,6 +56,12 @@ extern "C" uint64_t aurora_timing_last_gpu_done_ns() { return g_timingGpuDoneNs.
 // a true frame's (not a picture between's) GPU done after its submit, smoothed (AURORA_PRESENT_OVERLAP times pictures from it)
 static std::atomic<uint64_t> g_timingTrueLagNs{0};
 extern "C" uint64_t aurora_timing_true_gpu_lag_ns() { return g_timingTrueLagNs.load(std::memory_order_acquire); }
+// AURORA_PACE_EVEN (aurora_present.cpp pace): the true frames submitted and done, counted alike, and how much longer than the usual lag
+// (the smoothed one before it) the last one done took: a true frame late on the GPU, whose pictures between are timed from when it is done
+static std::atomic<uint64_t> g_timingTrueSubmitSeq{0}, g_timingTrueDoneSeq{0}, g_timingTrueExcessNs{0};
+extern "C" uint64_t aurora_timing_true_submit_seq() { return g_timingTrueSubmitSeq.load(std::memory_order_acquire); }
+extern "C" uint64_t aurora_timing_true_done_seq() { return g_timingTrueDoneSeq.load(std::memory_order_acquire); }
+extern "C" uint64_t aurora_timing_true_excess_ns() { return g_timingTrueExcessNs.load(std::memory_order_acquire); }
 
 namespace aurora {
 AuroraConfig g_config;
@@ -484,11 +490,14 @@ void end_frame() noexcept {
       const uint64_t submitNs = timing_now_ns();
       g_timingSubmitNs.store(submitNs, std::memory_order_release);
       if (gfx::g_overlap && !gfx::g_drawingBetween) {
+        const uint64_t seq = g_timingTrueSubmitSeq.fetch_add(1, std::memory_order_acq_rel) + 1;
         g_queue.OnSubmittedWorkDone(wgpu::CallbackMode::AllowSpontaneous,
-                                    [submitNs](wgpu::QueueWorkDoneStatus, wgpu::StringView) {
+                                    [submitNs, seq](wgpu::QueueWorkDoneStatus, wgpu::StringView) {
                                       const uint64_t done = timing_now_ns();
                                       g_timingGpuDoneNs.store(done, std::memory_order_release);
                                       const uint64_t lag = done > submitNs ? done - submitNs : 0, was = g_timingTrueLagNs.load();
+                                      g_timingTrueExcessNs.store(was != 0 && lag > was ? lag - was : 0, std::memory_order_relaxed);
+                                      g_timingTrueDoneSeq.store(seq, std::memory_order_release);
                                       g_timingTrueLagNs.store(was == 0 ? lag : was + (static_cast<int64_t>(lag) - static_cast<int64_t>(was)) / 8,
                                                               std::memory_order_release);
                                       if (gfx::stagelog::on())
