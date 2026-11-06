@@ -25,6 +25,16 @@
 // when ray tracing is on or a test asks), each only while the compile queue is short.
 // Nothing here reads or writes the guest: the bytes are the disc's, copied on the disc thread. Effects and the HUD are not models,
 // so they stay as they were: their pipelines compile at their first draw.
+//
+// Time Attack's ghosts (AURORA_MODEL_GHOSTS=1: the runner's, for a race whose mode draws machines as ghosts, seat.look = ghost).
+// The runner's ghost task draws such a machine after the scene as Time Attack's fn_1_EE530 does: the tint first (fn_1_5621C,
+// so the post stage fn_80077654, K2), with the course's fog and no destination alpha, twice: a depth pass at the file's
+// blend, then the visible pass at the blend fn_80074A60(4, 1) forces (fn_80075C78 takes it over the file's): SRCALPHA, ONE.
+// The file's blend form is among the forms above, but in Rest (a post stage, no destination alpha), which drains through the
+// race; the additive one is not. With the switch both forms of every model in the 16-bit vertex form (machines are) at the
+// course's fog, depth written, go in tier Ghost right after First, so they are made during the load, not when the ghosts
+// appear at GO (build j's Ghost race, course 11: 31 shaders, 62 pipelines first wanted at GO, the machines left out of the
+// picture and the pictures at half rate for 1.7 s while they compiled; seen in the pipeline cache's rows of that frame).
 #include "gxruntime/aurora_present.h"
 
 #include "gfx/pipeline_cache.hpp"
@@ -68,10 +78,11 @@ std::mutex s_lock;
 std::condition_variable s_wake;
 std::deque<File> s_files, s_disc_files;
 uint64_t s_disc_bytes = 0;
-// Tier: First a new shader, plain form, the scene's target. Same: more pipelines of known shaders. PostSmall: post stages of
-// models in the 16-bit vertex form (machines are; only an order, a guess that costs nothing if wrong). Rest: all else.
-// DiscFirst: a new shader from the disc walk, not from a file the game reads.
-enum Tier { First, Same, PostSmall, DiscFirst, Rest, Tiers };
+// Tier: First a new shader, plain form, the scene's target. Ghost: Time Attack's ghost passes (above), only with the switch.
+// Same: more pipelines of known shaders. PostSmall: post stages of models in the 16-bit vertex form (machines are; only an
+// order, a guess that costs nothing if wrong). Rest: all else. DiscFirst: a new shader from the disc walk, not from a file the
+// game reads.
+enum Tier { First, Ghost, Same, PostSmall, DiscFirst, Rest, Tiers };
 std::set<std::vector<uint8_t>> s_walk_shaders;  // fog left at none
 bool s_from_disc = false;  // the file being read comes from the disc walk
 const char* s_reading = "";  // the path of the file being read
@@ -92,7 +103,8 @@ struct Base {
 std::vector<Base> s_bases;
 std::set<std::vector<uint8_t>> s_seen;
 std::set<uint8_t> s_fogs{0};
-uint64_t s_meshes = 0, s_meshes_left_out = 0, s_configs = 0;
+std::set<uint8_t> s_course_fogs;  // the fog types of the course files read (a ghost is drawn with the course's)
+uint64_t s_meshes = 0, s_meshes_left_out = 0, s_configs = 0, s_ghost_forms = 0;
 FILE* s_dump = nullptr;
 
 uint32_t be32(const uint8_t* p) { return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3]; }
@@ -295,6 +307,20 @@ void ask(const Form& f) {
   if (s_dump) std::fwrite(&f.config, sizeof(f.config), 1, s_dump);
 }
 
+bool ghosts() {
+  static const bool on = [] {
+    const char* v = std::getenv("AURORA_MODEL_GHOSTS");
+    return v != nullptr && v[0] == '1';
+  }();
+  return on;
+}
+
+// A form of Time Attack's ghost passes (above): a machine's model with the tint's post stage alone, no destination alpha, depth
+// written, the file's blend or the visible pass's
+bool ghost_kind(const PipelineConfig& c, int post, bool small) {
+  return ghosts() && small && post == 1 && c.dstAlpha == UINT32_MAX && c.depthUpdate;
+}
+
 // A form with this fog goes in its tier: its first of a shader (destination alpha off or on makes a different one) for the
 // scene's target at the front, the other target's copy last
 void plan(const PipelineConfig& base, uint8_t fog, int post, bool small) {
@@ -304,11 +330,13 @@ void plan(const PipelineConfig& base, uint8_t fog, int post, bool small) {
   std::memcpy(shader.data(), &c.shaderConfig, sizeof(c.shaderConfig));
   shader.back() = c.dstAlpha == UINT32_MAX;
   const bool first = s_shaders.insert(std::move(shader)).second;
-  const Tier tier = post != 0 ? (small && c.dstAlpha != UINT32_MAX ? PostSmall : Rest)
+  const Tier tier = !s_from_disc && ghost_kind(c, post, small) && s_course_fogs.count(fog) != 0 ? Ghost
+                    : post != 0 ? (small && c.dstAlpha != UINT32_MAX ? PostSmall : Rest)
                     : first && c.dstAlpha != UINT32_MAX ? (s_from_disc ? DiscFirst : First)
                     : first || c.dstAlpha == 255 ? Same
                                                  : Rest;
   s_tiers[tier].push_back(Form{c, true, false});
+  if (tier == Ghost) ++s_ghost_forms;
   if (!s_from_disc) s_tiers[Rest].push_back(Form{c, false, true});
 }
 
@@ -347,14 +375,15 @@ void forms(const Mesh& m) {
         }
         for (const auto cull : {GX_CULL_NONE, GX_CULL_FRONT, GX_CULL_BACK}) {
           for (const bool depth : {true, false}) {
-            for (const uint32_t dst : {255u, 128u, UINT32_MAX}) {
+            for (const uint32_t dst : {255u, 128u, UINT32_MAX})
+            for (const bool additive : {false, true}) {
               PipelineConfig p{};
               p.shaderConfig = c;
               p.depthFunc = GX_LEQUAL;
               p.cullMode = cull;
               p.blendMode = GX_BM_BLEND;
-              p.blendFacSrc = blend_src;
-              p.blendFacDst = blend_dst;
+              p.blendFacSrc = additive ? GX_BL_SRCALPHA : blend_src;  // (fn_80074A60(4, 1): the ghost's visible pass)
+              p.blendFacDst = additive ? GX_BL_ONE : blend_dst;
               p.blendOp = GX_LO_CLEAR;
               p.dstAlpha = dst;
               p.polygonOffsetBits = p.polygonOffsetScaleBits = p.polygonOffsetClampBits = 0;
@@ -362,6 +391,7 @@ void forms(const Mesh& m) {
               p.depthUpdate = depth;
               p.alphaUpdate = true;
               p.colorUpdate = true;
+              if (additive && (s_from_disc || !ghost_kind(p, post, (m.model & 1) != 0))) continue;
               std::vector<uint8_t> key(sizeof(p));
               std::memcpy(key.data(), &p, sizeof(p));
               if (s_from_disc) {
@@ -460,9 +490,14 @@ void read_file(const File& f) {
     const uint32_t at = be32(whole.data() + 0x84);
     if (at >= whole.size()) return;
     const uint8_t fog = whole[at];
+    const bool course_new = s_course_fogs.insert(fog).second;
     if (s_fogs.insert(fog).second) {
       std::fprintf(stderr, "[pipelines] fog type %u from %s\n", fog, f.path.c_str());
       for (const Base& b : s_bases) plan(b.config, fog, b.post, b.small);
+    } else if (course_new && ghosts()) {
+      // (a course of a fog already planned, as none: its ghosts' forms of the models read before go to the front too)
+      for (const Base& b : s_bases)
+        if (ghost_kind(b.config, b.post, b.small)) plan(b.config, fog, b.post, b.small);
     }
     return;
   }
@@ -480,7 +515,8 @@ bool tiers_empty() {
 }
 
 bool near_tiers_empty() {
-  return s_tiers[First].empty() && s_tiers[Same].empty() && s_tiers[PostSmall].empty() && s_tiers[DiscFirst].empty();
+  return s_tiers[First].empty() && s_tiers[Ghost].empty() && s_tiers[Same].empty() && s_tiers[PostSmall].empty() &&
+         s_tiers[DiscFirst].empty();
 }
 
 // The nearest tier's next few; false when none is left
@@ -511,7 +547,8 @@ void run() {
     return v != nullptr && std::atoi(v) > 0 ? unsigned(std::atoi(v)) : 3u;
   }();
   constexpr size_t Short = 32;  // the compile queue counts as short: later work never stands in front of a file being read
-  bool told = true, told_first = true, walk_told = false;
+  bool told = true, told_first = true, walk_told = false, ghosts_told = true;
+  uint64_t ghosts_since = 0;
   for (;;) {
     File f;
     bool have = false;
@@ -524,12 +561,19 @@ void run() {
         s_files.pop_front();
         have = true;
       } else {
+        if (s_ghost_forms != ghosts_since) ghosts_told = false;
+        if (s_tiers[Ghost].empty() && !ghosts_told) {  // (asked: the compile queue holds at most Short more before them)
+          ghosts_told = true;
+          ghosts_since = s_ghost_forms;
+          std::fprintf(stderr, "[pipelines] Time Attack's ghosts: %llu forms asked, %.0f ms after the first file\n",
+                       (unsigned long long)s_ghost_forms, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+        }
         if (s_tiers[First].empty() && aurora::gfx::pipelines_waiting() == 0 && !told_first) {
           told_first = true;
           std::fprintf(stderr, "[pipelines] every shader so far made: %zu shaders, %.0f ms after the first file\n", s_shaders.size(),
                        std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
         }
-        aurora::gfx::set_background_compile_threads(s_tiers[First].empty() ? behind : UINT_MAX);
+        aurora::gfx::set_background_compile_threads(s_tiers[First].empty() && s_tiers[Ghost].empty() ? behind : UINT_MAX);
         const bool more = !tiers_empty() || !s_disc_files.empty();
         const size_t waiting = aurora::gfx::pipelines_waiting();
         if (waiting >= Short || (waiting != 0 && !more)) {
