@@ -4,7 +4,7 @@
 //   pipeline_census --disc DIR [--dbs LIST] [--log RUNNER_LOG=PIPELINE_CACHE_DB ...] [--out DIR]
 //
 // (a) the disc: every file under DIR goes through the load-time planner (model_pipelines.cpp, included below unchanged, its
-//     compile calls stubbed) as if the game read it, Time Attack's ghost forms on (AURORA_MODEL_GHOSTS); the forms it plans
+//     compile calls stubbed) as if the game read it, Time Attack's ghost forms among them; the forms it plans
 //     are counted, not compiled.
 // (b) recorded keys: the GX rows of every pipeline_cache.db in LIST (one path a line, opened read-only and immutable): version
 //     14 as they are, version 13 brought to 14 (gx.cpp populate_pipeline_config's normalisation of 4862060).
@@ -421,7 +421,6 @@ Look current() noexcept { return census::g_look; }
 
 int main(int argc, char** argv) {
   using namespace census;
-  setenv("AURORA_MODEL_GHOSTS", "1", 1);
   std::string disc, list, out_dir;
   std::string seed_out;  // --seed-out PATH: the merged recorded keys as initial_pipeline_cache.db
   int explain = 0;  // --explain N: N recorded keys of each class not in (a), against their nearest planned key

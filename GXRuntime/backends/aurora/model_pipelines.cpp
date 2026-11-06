@@ -26,12 +26,12 @@
 // Nothing here reads or writes the guest: the bytes are the disc's, copied on the disc thread. Effects and the HUD are not models,
 // so they stay as they were: their pipelines compile at their first draw.
 //
-// Time Attack's ghosts (AURORA_MODEL_GHOSTS=1: the runner's, for a race whose mode draws machines as ghosts, seat.look = ghost).
+// Time Attack's ghosts (a race whose mode draws machines as ghosts, seat.look = ghost: always planned, whatever the mode).
 // The runner's ghost task draws such a machine after the scene as Time Attack's fn_1_EE530 does: the tint first (fn_1_5621C,
 // so the post stage fn_80077654, K2), with the course's fog and no destination alpha, twice: a depth pass at the file's
 // blend, then the visible pass at the blend fn_80074A60(4, 1) forces (fn_80075C78 takes it over the file's): SRCALPHA, ONE.
 // The file's blend form is among the forms above, but in Rest (a post stage, no destination alpha), which drains through the
-// race; the additive one is not. With the switch both forms of every model in the 16-bit vertex form (machines are) at the
+// race; the additive one is not. Both forms of every model in the 16-bit vertex form (machines are) at the
 // course's fog, depth written, go in tier Ghost right after First, so they are made during the load, not when the ghosts
 // appear at GO (build j's Ghost race, course 11: 31 shaders, 62 pipelines first wanted at GO, the machines left out of the
 // picture and the pictures at half rate for 1.7 s while they compiled; seen in the pipeline cache's rows of that frame).
@@ -79,7 +79,7 @@ std::mutex s_lock;
 std::condition_variable s_wake;
 std::deque<File> s_files, s_disc_files;
 uint64_t s_disc_bytes = 0;
-// Tier: First a new shader, plain form, the scene's target. Ghost: Time Attack's ghost passes (above), only with the switch.
+// Tier: First a new shader, plain form, the scene's target. Ghost: Time Attack's ghost passes (above).
 // Same: more pipelines of known shaders. PostSmall: post stages of models in the 16-bit vertex form (machines are; only an
 // order, a guess that costs nothing if wrong). Rest: all else. DiscFirst: a new shader from the disc walk, not from a file the
 // game reads.
@@ -316,18 +316,10 @@ void ask(const Form& f) {
   if (s_dump) std::fwrite(&f.config, sizeof(f.config), 1, s_dump);
 }
 
-bool ghosts() {
-  static const bool on = [] {
-    const char* v = std::getenv("AURORA_MODEL_GHOSTS");
-    return v != nullptr && v[0] == '1';
-  }();
-  return on;
-}
-
 // A form of Time Attack's ghost passes (above): a machine's model with the tint's post stage alone, no destination alpha, depth
 // written, the file's blend or the visible pass's
 bool ghost_kind(const PipelineConfig& c, int post, bool small) {
-  return ghosts() && small && post == 1 && c.dstAlpha == UINT32_MAX && c.depthUpdate;
+  return small && post == 1 && c.dstAlpha == UINT32_MAX && c.depthUpdate;
 }
 
 // A form with this fog goes in its tier: its first of a shader (destination alpha off or on makes a different one) for the
@@ -506,7 +498,7 @@ void read_file(const File& f) {
     if (s_fogs.insert(fog).second) {
       std::fprintf(stderr, "[pipelines] fog type %u from %s\n", fog, f.path.c_str());
       for (const Base& b : s_bases) plan(b.config, fog, b.post, b.small);
-    } else if (course_new && ghosts()) {
+    } else if (course_new) {
       // (a course of a fog already planned, as none: its ghosts' forms of the models read before go to the front too)
       for (const Base& b : s_bases)
         if (ghost_kind(b.config, b.post, b.small)) plan(b.config, fog, b.post, b.small);
