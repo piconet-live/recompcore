@@ -45,6 +45,20 @@ void precompile_pipeline(const gx::PipelineConfig& config, bool scene_target = t
 size_t pipelines_waiting();
 void set_background_compile_threads(unsigned count);
 size_t pipelines_compiled();
+// Where the game stands, from the host (aurora_present_scene): `racing` from the race's own phase to its end. While racing nothing
+// is compiled ahead (the background queue stands; a draw's own pipeline still compiles). `where` names the moment in the miss
+// log. Any thread.
+void set_scene(bool racing, const char* where);
+bool racing();
+// The pipelines still queued ahead of any draw (the background queue)
+size_t pipelines_ahead_waiting();
+// The pipeline build (aurora_present_build_start), before initialize_pipeline_cache: a pipeline is let go as soon as it is
+// compiled (only Dawn's cache is wanted: a whole disc's pipelines would not fit in memory, about 300,000), its key kept so it
+// is not compiled twice; no line a compile; and Dawn's cache is never pruned.
+void set_build_mode(bool on);
+// The mark the build leaves in Aurora's folder when it is done: a start that finds it never prunes Dawn's cache (the default
+// prune keeps only the entries one session used, which would undo the build)
+inline constexpr const char* PipelinesBuiltMark = "pipelines_built";
 
 bool get_pipeline(PipelineRef ref, CompiledPipeline& pipeline);
 

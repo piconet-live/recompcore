@@ -17,7 +17,8 @@ struct DrawData {
   uint32_t dstAlpha;
 };
 
-constexpr uint32_t GXPipelineConfigVersion = 14;
+// 15: unread swap table entries out of the key (look_keys.hpp unread_swaps_out); rows of 14 are brought to 15 when the cache opens
+constexpr uint32_t GXPipelineConfigVersion = 15;
 struct PipelineConfig {
   uint32_t version = GXPipelineConfigVersion;
   uint32_t msaaSamples = 1; // deprecated

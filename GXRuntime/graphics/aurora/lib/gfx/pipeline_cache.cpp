@@ -7,6 +7,7 @@
 #include "resources.hpp"
 #include "hash.hpp"
 #include "../gx/pipeline.hpp"
+#include "../gx/look_keys.hpp"
 #include "../io.hpp"
 #ifdef AURORA_ENABLE_RMLUI
 #include "../rmlui/pipeline.hpp"
@@ -104,6 +105,7 @@ static std::optional<uint64_t> g_pipelineLayoutKey;
 static std::deque<PendingPipeline> g_pipelineQueue;
 static std::deque<PendingPipeline> g_backgroundPipelineQueue;
 static absl::flat_hash_set<PipelineRef> g_pendingPipelines;
+static absl::flat_hash_set<PipelineRef> g_plannedAhead;  // every runtime key ever queued ahead of a draw (the miss log's "planned")
 static std::atomic_bool g_gpuCachePrunePending = false;
 
 static sqlite3* g_pipelineCacheDb = nullptr;
@@ -509,6 +511,7 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallbac
       };
       switch (priority) {
       case PipelinePriority::Background:
+        g_plannedAhead.insert(runtimeKey);
         g_backgroundPipelineQueue.emplace_back(std::move(pending));
         break;
       case PipelinePriority::Normal:
@@ -540,9 +543,17 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallbac
   return runtimeKey;
 }
 
+// For the miss log: a GX pipeline's key in the cache (pipeline_cache.db's hash) by its runtime key (with the target's layout)
+static absl::flat_hash_map<PipelineRef, HashType> g_cacheKeys;  // under g_pipelineMutex
+
 static PipelineRef resolve_pipeline(ShaderType type, const gx::PipelineConfig& config, const RenderTargetLayout& layout,
                                     PipelinePriority priority) {
-  const auto runtimeKey = xxh3_hash(layout.key, xxh3_hash(config, static_cast<HashType>(type)));
+  const auto cacheKey = xxh3_hash(config, static_cast<HashType>(type));
+  const auto runtimeKey = xxh3_hash(layout.key, cacheKey);
+  {
+    std::lock_guard lock{g_pipelineMutex};
+    g_cacheKeys.try_emplace(runtimeKey, cacheKey);
+  }
   return find_pipeline_impl(runtimeKey, [config, layout] { return create_pipeline(config, layout); }, priority);
 }
 
@@ -857,6 +868,47 @@ static void prune_old_pipeline_cache_versions() {
     return;
   }
 
+  // Rows of config version 14 are 15's after unread_swaps_out (look_keys.hpp): brought over, not dropped (a user's recorded keys,
+  // and a seed made before 15)
+  static_assert(gx::GXPipelineConfigVersion == 15);
+  {
+    std::vector<PipelineCacheWrite> moved;
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(g_pipelineCacheDb, "SELECT config, first_frame_used FROM pipeline_cache WHERE type = ? AND config_version = 14", -1, &st,
+                           nullptr) == SQLITE_OK) {
+      sqlite3_bind_int(st, 1, underlying(ShaderType::GX));
+      while (sqlite3_step(st) == SQLITE_ROW) {
+        if (sqlite3_column_bytes(st, 0) != static_cast<int>(sizeof(gx::PipelineConfig)))
+          continue;
+        gx::PipelineConfig config;
+        std::memcpy(&config, sqlite3_column_blob(st, 0), sizeof(config));
+        config.version = gx::GXPipelineConfigVersion;
+        gx::unread_swaps_out(config.shaderConfig);
+        moved.push_back(make_pipeline_cache_write(ShaderType::GX, xxh3_hash(config, static_cast<HashType>(ShaderType::GX)), config,
+                                                  static_cast<uint32_t>(sqlite3_column_int64(st, 1))));
+      }
+    }
+    sqlite3_finalize(st);
+    if (!moved.empty()) {
+      bool ok = false;
+      {
+        sqlite::Transaction tx(g_pipelineCacheDb, Log, true);
+        ok = static_cast<bool>(tx);
+        for (const auto& write : moved)
+          if (ok && !write_pipeline_cache_record(write))
+            ok = false;
+        if (ok)
+          tx.commit();
+      }
+      if (!ok) {
+        Log.error("Failed to bring pipeline cache rows of version 14 to {}", gx::GXPipelineConfigVersion);
+        pipeline_cache_abort();
+        return;
+      }
+      std::fprintf(stderr, "[pipelines] cache: %zu rows of version 14 brought to %u\n", moved.size(), gx::GXPipelineConfigVersion);
+    }
+  }
+
   const auto gxDelete = fmt::format("DELETE FROM pipeline_cache WHERE type = {} AND config_version < {}",
                                     underlying(ShaderType::GX), gx::GXPipelineConfigVersion);
   ret = sqlite::exec(g_pipelineCacheDb, gxDelete.c_str());
@@ -983,8 +1035,44 @@ static double ms_since_start() {
   return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
+// The host's word on where the game stands (set_scene)
+static std::mutex g_sceneMutex;
+static std::string g_where = "before the host said";
+static std::atomic_bool g_racing{false};
+static absl::flat_hash_set<PipelineRef> g_missTold;  // under g_pipelineMutex
+
+void set_scene(bool racing, const char* where) {
+  {
+    std::lock_guard lock{g_sceneMutex};
+    g_where = where != nullptr ? where : "";
+  }
+  if (g_racing.exchange(racing) != racing) {
+    { std::lock_guard lock{g_pipelineMutex}; }  // (a worker between its test and its wait sees the change)
+    g_pipelineQueueCv.notify_all();
+    std::fprintf(stderr, "[pipelines] %s: %s\n", racing ? "racing, nothing compiled ahead" : "not racing, compiling ahead", where ? where : "");
+  }
+}
+
+bool racing() { return g_racing.load(std::memory_order_relaxed); }
+
 static void report_skipped_draws() {
   std::lock_guard lock{g_pipelineMutex};
+  // MISS: a pipeline a draw wanted that nothing had made ready, said once a key, with where the game stood: the keys the
+  // seed and the planner lack (and in a race, a draw left out of the picture)
+  for (const PipelineRef ref : g_frameSkippedPipelines) {
+    if (!g_missTold.insert(ref).second)
+      continue;
+    const auto key = g_cacheKeys.find(ref);
+    std::string where;
+    {
+      std::lock_guard lock{g_sceneMutex};
+      where = g_where;
+    }
+    std::fprintf(stderr, "[pipelines] MISS%s: key %016llx (target %016llx) at frame %u, %s, %s\n", g_racing ? " IN A RACE" : "",
+                 key != g_cacheKeys.end() ? static_cast<unsigned long long>(key->second) : 0ull, static_cast<unsigned long long>(ref),
+                 current_frame(), where.c_str(),
+                 g_plannedAhead.contains(ref) ? "planned ahead, not made in time" : "planned by nothing (the seed and the planner lack it)");
+  }
   if (g_frameSkippedDraws != 0) {
     g_totalSkippedDraws += g_frameSkippedDraws;
     ++g_framesWithSkips;
@@ -1002,6 +1090,9 @@ static void report_skipped_draws() {
 
 // How many compile threads may work on the background queue at once; a draw's pipeline can always take any thread
 static std::atomic_uint g_backgroundLimit{UINT_MAX};
+static bool g_buildMode = false;  // set_build_mode: the pipeline build (aurora_present_build_start)
+
+void set_build_mode(bool on) { g_buildMode = on; }
 static unsigned g_backgroundWorking = 0;  // under g_pipelineMutex
 
 void set_background_compile_threads(unsigned count) {
@@ -1028,13 +1119,16 @@ static void pipeline_worker() {
       if (g_hasPipelineThread) {
         g_pipelineQueueCv.wait(lock, [] {
           return !g_pipelineQueue.empty() || g_pipelineThreadEnd ||
-                 (!g_backgroundPipelineQueue.empty() && g_backgroundWorking < g_backgroundLimit);
+                 (!g_backgroundPipelineQueue.empty() && g_backgroundWorking < g_backgroundLimit && !g_racing.load(std::memory_order_relaxed));
         });
       } else if (g_pipelineQueue.empty() && g_backgroundPipelineQueue.empty()) {
         return;
       }
       if (g_pipelineThreadEnd) {
         break;
+      }
+      if (g_hasPipelineThread && g_pipelineQueue.empty() && g_racing.load(std::memory_order_relaxed)) {
+        continue;  // (the race began while this thread waited: the background queue stands)
       }
       wantedByDraw = !g_pipelineQueue.empty();
       auto& source = !g_pipelineQueue.empty() ? g_pipelineQueue : g_backgroundPipelineQueue;
@@ -1056,11 +1150,14 @@ static void pipeline_worker() {
     auto result = pending.create();
     const auto compileEnd = std::chrono::steady_clock::now();
     const auto pipelineCount = result.pipeline_count();
-    std::fprintf(stderr, "[pipelines] compiled %s: %.1f ms, %.1f ms after it was queued, at %.0f ms%s\n",
-                 wanted ? "for a draw" : "ahead",
-                 std::chrono::duration<double, std::milli>(compileEnd - compileStart).count(),
-                 std::chrono::duration<double, std::milli>(compileEnd - pending.queuedAt).count(), ms_since_start(),
-                 result.main ? "" : ", FAILED");
+    if (!g_buildMode || !result.main)
+      std::fprintf(stderr, "[pipelines] compiled %s: %.1f ms, %.1f ms after it was queued, at %.0f ms%s\n",
+                   wanted ? "for a draw" : "ahead",
+                   std::chrono::duration<double, std::milli>(compileEnd - compileStart).count(),
+                   std::chrono::duration<double, std::milli>(compileEnd - pending.queuedAt).count(), ms_since_start(),
+                   result.main ? "" : ", FAILED");
+    if (g_buildMode)
+      result = {};  // (the build wants Dawn's cache only: the key stays, so it is not compiled again)
     {
       std::lock_guard lock{g_pipelineMutex};
       g_pipelines.try_emplace(pending.hash, std::move(result));
@@ -1234,7 +1331,14 @@ void rebuild_pipeline_cache() {
     }
   }
   std::ranges::sort(known, {}, &KnownPipeline::firstFrameUsed);
+  // Only the keys of Aurora's look (gx/look_keys.hpp): the seed and a user's cache hold both looks', and the other's are never drawn
+  const auto look = gx::look::current();
+  size_t otherLook = 0;
   for (const auto& pipeline : known) {
+    if (const auto* gxConfig = std::get_if<gx::PipelineConfig>(&pipeline.config); gxConfig != nullptr && !gx::look::fits(*gxConfig, look)) {
+      ++otherLook;
+      continue;
+    }
     std::visit(
         [&](const auto& config) {
           resolve_pipeline(pipeline.type, config, scene, PipelinePriority::Background);
@@ -1244,6 +1348,14 @@ void rebuild_pipeline_cache() {
         },
         pipeline.config);
   }
+  if (otherLook != 0) {
+    std::fprintf(stderr, "[pipelines] cache: %zu known keys of the other look left out\n", otherLook);
+  }
+}
+
+size_t pipelines_ahead_waiting() {
+  std::lock_guard lock{g_pipelineMutex};
+  return g_backgroundPipelineQueue.size();
 }
 
 void initialize_pipeline_cache() {
@@ -1270,7 +1382,13 @@ void initialize_pipeline_cache() {
   const size_t loadedCount = load_pipeline_cache();
   rebuild_pipeline_cache();
   std::fprintf(stderr, "[pipelines] cache: %zu known at start, compiled ahead in the background\n", loadedCount);
-  if (!g_pipelineCacheBroken && loadedCount > 0) {
+  // Dawn's cache is pruned to what this session used, unless the pipeline build made it (its mark) or this is the build
+  std::error_code markError;
+  const bool built = std::filesystem::exists(io::fs_path_from_string(g_config.cachePath) / PipelinesBuiltMark, markError);
+  if (built || g_buildMode) {
+    std::fprintf(stderr, "[pipelines] Dawn's cache is not pruned (%s)\n", g_buildMode ? "the pipeline build" : "the pipeline build made it");
+  }
+  if (!g_pipelineCacheBroken && loadedCount > 0 && !built && !g_buildMode) {
     g_gpuCachePrunePending = true;
   }
 
@@ -1311,6 +1429,9 @@ void shutdown_pipeline_cache() {
   g_pipelineQueue.clear();
   g_backgroundPipelineQueue.clear();
   g_pendingPipelines.clear();
+  g_cacheKeys.clear();
+  g_missTold.clear();
+  g_plannedAhead.clear();
 
   queuedPipelines = 0;
   createdPipelines = 0;

@@ -7,6 +7,7 @@
 #include "gx/rt_capture.hpp"
 #include "gx/redraw.hpp"
 #include "gfx/render_worker.hpp"
+#include "gfx/pipeline_cache.hpp"
 #include "webgpu/gpu.hpp"
 #include "../../graphics/aurora/lib/thread.hpp"
 #include "gxruntime/aurora_present.h"
@@ -15,6 +16,7 @@
 #include "aurora_overlay.h"
 #include "model_pipelines.h"
 #include "gxruntime/aurora_backend.h"
+#include <SDL3/SDL_hints.h>
 #include "gxruntime/gx_recomp.h"
 
 #include <aurora/gfx.h>
@@ -28,6 +30,7 @@
 #include <chrono>
 #include <csignal>
 #include <exception>
+#include <filesystem>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -1862,5 +1865,128 @@ void aurora_present_stop(void) {
   if (s->thread.joinable())
     s->thread.join();
   // (s is kept: a picture taken before the stop may still be read; the process ends soon after)
+}
+
+// ---- The pipeline build (aurora_present.h: aurora_present_build_start) ----------------------------------------------------
+namespace {
+struct Build {
+  std::string data_dir;
+  std::thread thread;
+  std::mutex lock;
+  std::condition_variable wake;
+  bool quit = false;
+  std::atomic<uint32_t> state{0};  // AuroraBuildProgress::state
+};
+Build* s_build = nullptr;
+
+[[noreturn]] void build_fatal(const char* message) {
+  std::fprintf(stderr, "[pipelines] build: a fatal error of Aurora's: %s\n", message != nullptr ? message : "");
+  std::fflush(stderr);
+  std::_Exit(4);
+}
+
+void build_run() {
+  aurora::webgpu::set_host_window(nullptr);
+  aurora_backend_set_fatal_handler(build_fatal);
+  // The device's surface is a window that is never shown, never focused, never activated, with no taskbar button (window.cpp)
+  SDL_SetHint("AURORA_WINDOW_NEVER_ACTIVE", "1");
+  SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "0");
+  aurora::gfx::set_build_mode(true);
+  model_pipelines_build_mode();
+  // The look and the picture's switches are a game's (the caller sets the same environment): the same targets, the same keys
+  const auto env_number = [](const char* name) -> unsigned {
+    const char* v = std::getenv(name);
+    return v != nullptr ? static_cast<unsigned>(std::strtoul(v, nullptr, 10)) : 0u;
+  };
+  const AuroraBackendConfig config = {
+      .app_name = "Piconet Aurora",
+      .window_width = 640,
+      .window_height = 528,
+      .vsync = false,
+      .allow_texture_dumps = false,
+      .info_logging = false,
+      .graphics_logging = false,
+      .force_untextured = false,
+      .data_dir = s_build->data_dir.c_str(),
+      .embedded = true,
+      .msaa = env_number("AURORA_MSAA"),
+      .max_anisotropy = env_number("AURORA_ANISO"),
+  };
+  char arg0[] = "aurora-present";
+  char* argv[] = {arg0, nullptr};
+  const auto t0 = Clock::now();
+  if (!dol_aurora_initialize(1, argv, &config)) {
+    std::fprintf(stderr, "[pipelines] build: Aurora could not start\n");
+    s_build->state = 3;
+    return;
+  }
+  static std::vector<std::uint8_t> gx_fifo(64u * 1024u);
+  GXInit(gx_fifo.data(), static_cast<u32>(gx_fifo.size()));
+  GXFlush();
+  model_pipelines_aurora_up();
+  s_build->state = 1;
+  std::fprintf(stderr, "[pipelines] build: Aurora is up (%.0f ms), compiling\n", std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+  for (;;) {
+    {
+      std::unique_lock g{s_build->lock};
+      if (s_build->wake.wait_for(g, std::chrono::milliseconds(100), [] { return s_build->quit; }))
+        break;
+    }
+    // Dawn lets go of what was released (the pipelines compiled and dropped) at its ticks
+    aurora::webgpu::g_instance.ProcessEvents();
+    if (s_build->state == 1 && model_pipelines_build_state().planned_all && aurora::gfx::pipelines_waiting() == 0) {
+      std::error_code e;
+      const auto mark = std::filesystem::path(std::u8string(s_build->data_dir.begin(), s_build->data_dir.end())) / aurora::gfx::PipelinesBuiltMark;
+      std::ofstream(mark, std::ios::binary) << "the pipeline build made Dawn's cache here: it is not pruned\n";
+      std::fprintf(stderr, "[pipelines] build: done, %zu pipelines compiled, %llu shaders, %.0f s\n", aurora::gfx::pipelines_compiled(),
+                   static_cast<unsigned long long>(model_pipelines_build_state().shaders),
+                   std::chrono::duration<double>(Clock::now() - t0).count());
+      s_build->state = std::filesystem::exists(mark, e) ? 2 : 3;
+    }
+  }
+  model_pipelines_stop();
+  // (the process ends right after: the device and what is left are left to its end, as a game's stop does)
+  aurora::webgpu::g_processEnding.store(true, std::memory_order_relaxed);
+  dol_aurora_shutdown();
+}
+}  // namespace
+
+int aurora_present_build_start(const AuroraBuildConfig* config) {
+  if (s != nullptr || s_build != nullptr || config == nullptr || config->abi != AURORA_PRESENT_ABI || config->data_dir == nullptr)
+    return 0;
+  s_build = new Build();
+  s_build->data_dir = config->data_dir;
+  s_build->thread = std::thread(build_run);
+  return 1;
+}
+
+void aurora_present_build_progress(AuroraBuildProgress* out) {
+  if (out == nullptr)
+    return;
+  *out = {};
+  if (s_build == nullptr)
+    return;
+  out->state = s_build->state.load();
+  const ModelPipelinesBuild b = model_pipelines_build_state();
+  out->bytes_read = b.bytes_read;
+  out->shaders = b.shaders;
+  out->asked = b.asked;
+  out->left = b.left;
+  if (out->state == 1 || out->state == 2) {
+    out->compiled = aurora::gfx::pipelines_compiled();
+    out->waiting = aurora::gfx::pipelines_waiting();
+  }
+}
+
+void aurora_present_build_stop(void) {
+  if (s_build == nullptr)
+    return;
+  {
+    std::lock_guard g{s_build->lock};
+    s_build->quit = true;
+  }
+  s_build->wake.notify_all();
+  if (s_build->thread.joinable())
+    s_build->thread.join();
 }
 }

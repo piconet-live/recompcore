@@ -132,6 +132,12 @@ if(GXRUNTIME_ENABLE_AURORA)
             PRIVATE GXRUNTIME_HAS_AURORA_RECOMP=1)
         target_link_libraries(gxruntime_aurora_present
             PRIVATE GXRuntime::aurora)
+        # The shipped pipeline seed (backends/aurora/seed: the keys recorded in real play, merged by the pipeline census),
+        # beside the library: Aurora merges it into the player's pipeline cache when the cache opens (pipeline_cache.cpp)
+        add_custom_command(TARGET gxruntime_aurora_present POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E tar xf "${CMAKE_CURRENT_SOURCE_DIR}/backends/aurora/seed/initial_pipeline_cache.tar.xz"
+            WORKING_DIRECTORY "$<TARGET_FILE_DIR:gxruntime_aurora_present>"
+            VERBATIM)
     else()
         target_compile_definitions(gxruntime_aurora
             PRIVATE GXRUNTIME_HAS_AURORA_RECOMP=0)

@@ -118,6 +118,11 @@ AURORA_PRESENT_API int aurora_present_start(const AuroraPresentConfig* config);
 // A model or course file the game is reading from the disc (its path, its whole bytes, copied here). Its materials' pipelines
 // compile on Aurora's compile threads. Any thread, at any time, before or after the start.
 AURORA_PRESENT_API void aurora_present_model_file(const char* path, const uint8_t* bytes, uint64_t size, int later);
+// Where the game stands (the host's word, on any change): `racing` 1 from the race's own phase (the countdown and the race) to its
+// end, 0 otherwise (menus, the load, the course intro, the results); `where` a short text for the log ("course 11, phase 0x29").
+// While racing Aurora compiles nothing ahead: every compile thread is a draw's, and what the load left waits for the race's end.
+// A pipeline a draw then misses is logged ("[pipelines] MISS IN A RACE", its key and `where`). Copied; any thread.
+AURORA_PRESENT_API void aurora_present_scene(int racing, const char* where);
 AURORA_PRESENT_API void aurora_present_write(const uint8_t* bytes, uint32_t size);
 // The GPU thread: the stream so far ends frame `copy` (its XFB copy, numbered from 1). Never blocks.
 // The copy about to be marked is a picture between two steps, shown `fraction` of a field after the true one before it.
@@ -149,6 +154,37 @@ AURORA_PRESENT_API int aurora_present_take(AuroraPresentPicture* out);
 AURORA_PRESENT_API void aurora_present_stats(AuroraPresentStats* out);
 // Ends Aurora's thread (it finishes the frame it is on, drops the rest) and shuts Aurora down.
 AURORA_PRESENT_API void aurora_present_stop(void);
+
+// ---- The pipeline build: no game, only the compiles (the runner's --build-pipelines, which the launcher starts) ----------
+// Aurora starts with no picture to draw: its device on a window that is never shown and can never be focused or activated
+// (SDL_WINDOW_HIDDEN, NOT_FOCUSABLE, UTILITY: no taskbar button), its compile threads on every core
+// (AURORA_PIPELINE_THREADS, which the caller sets), and every model file handed over with
+// aurora_present_model_file(path, bytes, size, 1) is read as the disc walk reads it (one form of every shader) and compiled.
+// What a compile leaves is Dawn's cache in data_dir (the shaders' compiled code), which every later start of Aurora in that
+// folder reads instead of compiling: the pipelines themselves are let go as soon as they are made (a whole disc of them
+// would not fit in memory). The keys pipeline_cache.db and the shipped seed know are compiled too. The caller sets the
+// same Aurora switches a game's start sets (the look), so the shaders are the game's.
+// After the walk's end (aurora_present_model_file with an empty path) the build is done once nothing is left to compile;
+// then data_dir holds the mark `pipelines_built`, and from then on no start of Aurora in that folder prunes Dawn's cache of
+// the entries its own session did not use (Aurora's default, which would undo the build). Not with aurora_present_start.
+typedef struct AuroraBuildConfig {
+  uint32_t abi;          // AURORA_PRESENT_ABI
+  const char* data_dir;  // Aurora's folder, as a game's start gives it (made by the caller first); UTF-8
+} AuroraBuildConfig;
+typedef struct AuroraBuildProgress {
+  uint32_t state;           // 0 starting, 1 compiling, 2 done (the mark written), 3 failed (Aurora could not start)
+  uint64_t bytes_read;      // of the files handed over, the bytes Aurora has read (ahead of the compiles: see waiting)
+  uint64_t compiled;        // pipelines compiled so far
+  uint64_t waiting;         // pipelines asked for and not yet compiled
+  uint64_t shaders;         // shaders planned so far
+  uint64_t asked;           // forms (a pipeline or two each) asked for so far
+  uint64_t left;            // forms planned, not asked for yet: the compiles ask for them a few at a time
+} AuroraBuildProgress;
+// 1, or 0 when the ABI differs or Aurora already runs. Aurora's start happens on a thread of its own.
+AURORA_PRESENT_API int aurora_present_build_start(const AuroraBuildConfig* config);
+AURORA_PRESENT_API void aurora_present_build_progress(AuroraBuildProgress* out);
+// Ends the build (done or not) and shuts Aurora down; Dawn's cache keeps what was compiled.
+AURORA_PRESENT_API void aurora_present_build_stop(void);
 
 #ifdef __cplusplus
 }

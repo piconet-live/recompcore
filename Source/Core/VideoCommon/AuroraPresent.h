@@ -50,6 +50,9 @@ bool WantsModelFiles();
 bool WantsWholeDisc();
 // A model or course file the game is reading: its materials' pipelines compile ahead. Disc bytes only; any thread.
 void ModelFile(const std::string& path, const u8* bytes, u64 size, bool later);
+// Where the game stands, on any change (the host's: the runner's frame tick): racing from the race's own phase to its end, and a
+// short text for Aurora's log. While racing Aurora compiles nothing ahead. Any thread; nothing without the library.
+void Scene(bool racing, const std::string& where);
 // The Null video backend, at its start: the emulator will draw nothing, so Aurora presents straight into this window
 // (a window system's handle; none in a headless run) and no picture comes back.
 void SetVideoOffWindow(void* window);
