@@ -211,12 +211,38 @@ struct Frame {
   Clock::time_point in;
   float between = 0;  // a picture between two steps (aurora_present_frame_between): its fraction of a field
   std::uint64_t position = 0;  // the stream's read position at its XFB copy (aurora_present_frame_at)
+  std::uint32_t step = 0xFFFFFFFFu;  // the game's step when it was marked (aurora_present_step; one off at most: the GPU thread lags)
 };
+std::atomic<std::uint32_t> g_step{0xFFFFFFFFu};  // aurora_present_step's
 
 // The run ahead's pictures between two steps: each a fraction of a field after the true picture before it, or left out.
 constexpr double kFieldMs = 1000.0 * 1001.0 / 60000.0;
 constexpr std::uint64_t kRedrawMostBurstsAfterCopy = 4096;  // a request belongs to the copy just before it: tuned, 128 KB of stream
 constexpr double kLateMs = 5.0;  // past its time by more than this, a picture between is not drawn at all
+
+// Step-stamped event lines, so that a player's log places a moment the picture may have stumbled (the m39 hunt, glitch-2min.md):
+// a frame decoded and not drawn to catch up, a picture between slower than a refresh at 240, a true frame late on the GPU, a true
+// frame held for the late pictures before it (AURORA_PACE_EVEN). Each kind at most kEventLinesPerMinute lines a minute (so a moment late
+// in a race still gets its line: one cap for the whole run was used up in the first minute, m39 after run); all counted for the stop's line.
+enum EventKind { EvCatchUp, EvSlowPicture, EvLateTrue, EvEvenHold, EvKinds };
+constexpr std::uint64_t kEventLinesPerMinute = 10;
+constexpr double kSlowPictureMs = 8.0;  // a picture between slower than this on the render worker (1269 over a refresh in the m39 run)
+std::atomic<std::uint64_t> g_events[EvKinds]{}, g_events_this_minute[EvKinds]{};
+std::atomic<long long> g_events_minute[EvKinds]{};
+bool event_line(EventKind kind) {
+  g_events[kind].fetch_add(1, std::memory_order_relaxed);
+  const long long minute = std::chrono::duration_cast<std::chrono::minutes>(Clock::now().time_since_epoch()).count();
+  if (g_events_minute[kind].exchange(minute, std::memory_order_relaxed) != minute)
+    g_events_this_minute[kind].store(0, std::memory_order_relaxed);
+  return g_events_this_minute[kind].fetch_add(1, std::memory_order_relaxed) < kEventLinesPerMinute;
+}
+struct StepText {
+  char text[16] = "?";
+  explicit StepText(std::uint32_t step) {
+    if (step != 0xFFFFFFFFu)
+      std::snprintf(text, sizeof text, "%u", step);
+  }
+};
 
 void wait_until(Clock::time_point due) {
 #if defined(_WIN32)
@@ -329,6 +355,17 @@ float g_picture_fraction = 0;  // >0: the present coming is a picture between, t
 // a true frame (they were taken for true frames: each shot moved the true presents' count ahead of the true frames sent, and with
 // AURORA_PRESENT_OVERLAP every picture after was timed from the true present before and passed)
 bool g_shot_picture = false;
+// AURORA_PACE_EVEN=1 (with AURORA_PRESENT_OVERLAP=1; off by default): a true frame whose GPU work comes late (the m39 frame at 1:58, rays
+// 11 ms on the GPU at 240) shows as one picture held a refresh longer, its pictures between after it at their even spacing, never as
+// pictures stacked behind it and then passed or cut (a jump). Its pictures are timed from when its work was done (even_from), and the
+// next true frame's end waits on Aurora's thread for the late pictures still to come (the debt, at most 3/4 of a field), which each true
+// frame after repays by AURORA_PACE_EVEN_REPAY_US (250): the added latency goes as one picture's step about half a second later.
+// AURORA_PACE_EVEN_LEAST_US (4170, a refresh at 240): a true frame later than its usual GPU lag by less is on time (2 ms held 1219 frames for
+// 275 late ones on a busy PC, most of them 2-5 ms late: m39 after run). Presentation only.
+bool g_even = false;
+double g_even_least_ms = kFieldMs / 4, g_even_repay_ms = 0.25;
+constexpr double kLateLineMs = 2.0;  // a true frame this late or more gets its "late true frame" line (the hold's mark above is apart)
+std::atomic<std::uint64_t> g_true_seq{0};  // the true frame presented last: its submit's number (aurora_timing_true_submit_seq)
 long long g_true_slot = 0, g_last_slot = 0;
 Clock::time_point g_true_at{};
 bool g_have_true = false;
@@ -457,6 +494,7 @@ void before_present() {
     const Grid g = grid();
     g_true_slot = g_last_slot = g.slot(t);
     g_true_ns.store(t, std::memory_order_relaxed);
+    g_true_seq.store(aurora_timing_true_submit_seq(), std::memory_order_relaxed);
     g_true_presented.fetch_add(1, std::memory_order_release);
     if (slots_on(1))
       wake_waiters();  // (the pictures after it are timed from it)
@@ -526,9 +564,42 @@ Clock::time_point overlap_from() {
   return true_at() + std::chrono::nanoseconds(add);
 }
 
+// The moment the pictures between of the true frame presented last are timed from (overlap_from), and how late its GPU work came
+// past the usual lag (`late_ms`, 0 when on time or not known yet). AURORA_PACE_EVEN: `from` moves by that, and false while the frame
+// is already late and not done (the caller looks again shortly). Without it the moment is today's and `late_ms` only for the log.
+bool even_from(Clock::time_point now, Clock::time_point& from, double& late_ms) {
+  from = overlap_from();
+  late_ms = 0;
+  const std::uint64_t seq = g_true_seq.load(std::memory_order_relaxed);
+  if (seq == 0)
+    return true;
+  if (aurora_timing_true_done_seq() >= seq) {
+    const double excess = static_cast<double>(aurora_timing_true_excess_ns()) / 1e6;  // (the newest done's: this one)
+    if (excess >= kLateLineMs)
+      late_ms = excess;
+    if (g_even && excess >= g_even_least_ms)
+      from += std::chrono::nanoseconds(static_cast<long long>(excess * 1e6));
+    return true;
+  }
+  if (!g_even)
+    return true;
+  const double usual = static_cast<double>(aurora_timing_true_gpu_lag_ns()) / 1e6;
+  return std::chrono::duration<double, std::milli>(now - true_at()).count() < usual + g_even_least_ms;
+}
+
 void start(void* window, bool overlap) {
   const char* v = std::getenv("AURORA_PACE");
   g_mode = v != nullptr ? std::atoi(v) : 0;
+  if (const char* e = std::getenv("AURORA_PACE_EVEN"); e != nullptr && e[0] == '1' && overlap) {
+    g_even = true;
+    if (const char* r = std::getenv("AURORA_PACE_EVEN_REPAY_US"))
+      g_even_repay_ms = std::max(0.01, std::atof(r) / 1000.0);
+    if (const char* l = std::getenv("AURORA_PACE_EVEN_LEAST_US"))
+      g_even_least_ms = std::max(0.0, std::atof(l) / 1000.0);
+    std::fprintf(stderr, "[aurora-present] pace: even (AURORA_PACE_EVEN=1): a true frame late on the GPU by %.2f ms or more has its pictures "
+                 "between timed from its end; the late pictures go before the next true frame, %.2f ms of that repaid a field\n",
+                 g_even_least_ms, g_even_repay_ms);
+  }
   if (overlap) {
     g_absolute = true;
     if (const char* b = std::getenv("AURORA_PRESENT_OVERLAP_BASE_US")) {
@@ -630,11 +701,38 @@ struct State {
   bool up = false;  // (under lock) Aurora started and the frames that waited for it drained: the tight bound from then on
   std::vector<double> feed_ms, present_ms, readback_ms;
   std::uint64_t frames_not_drawn = 0;  // (Aurora's thread) into the host's window: decoded, not drawn, to catch up
+  // the frame Aurora's thread decodes now (its own: the drain's hold says which)
+  std::uint64_t feeding_copy = 0;
+  std::uint32_t feeding_step = 0xFFFFFFFFu;
+  // the late true frames seen by the pictures' timing (under lock): the last one's submit number and lateness, and the counts
+  std::uint64_t late_seq = 0, late_true = 0;
+  double late_ms = 0, late_most_ms = 0;
+  // AURORA_PACE_EVEN: the debt (ms) the late pictures put on the next true frames' ends, and the holds it made (under lock)
+  double even_debt_ms = 0, even_hold_ms = 0;
+  std::uint64_t even_debt_seq = 0, even_holds = 0;
+  std::condition_variable drain_wake;  // (nobody notifies it: the hold's short timed waits)
 };
 State* s = nullptr;
 
 double ms(Clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); }
 double us_since(Clock::time_point t) { return std::chrono::duration<double, std::micro>(t - s->t0).count(); }
+
+// A true frame its pictures' timing found late on the GPU (pace::even_from's late_ms): counted once, a line for the first ones (under lock)
+void note_late_true(double late_ms, std::uint64_t copy) {
+  if (late_ms <= 0)
+    return;
+  const std::uint64_t seq = pace::g_true_seq.load(std::memory_order_relaxed);
+  if (seq == s->late_seq)
+    return;
+  s->late_seq = seq;
+  s->late_ms = late_ms;
+  ++s->late_true;
+  s->late_most_ms = std::max(s->late_most_ms, late_ms);
+  if (event_line(EvLateTrue))
+    std::fprintf(stderr, "[aurora-present] late true frame: step %s (copy %llu): its GPU work done %.2f ms past the usual %.2f ms%s\n",
+                 StepText(aurora::gx::rt::step_of(copy)).text, static_cast<unsigned long long>(copy), late_ms,
+                 static_cast<double>(aurora_timing_true_gpu_lag_ns()) / 1e6, pace::g_even ? "; its pictures between timed from then" : "");
+}
 
 // AURORA_STAGELOG: what the presenter chose about the pictures between (pk_* rows: a moment, a length in us, a number), for
 // tool/slots.py to say why a picture slot stayed empty. Reads and writes nothing else.
@@ -1019,6 +1117,9 @@ void draw_between(const std::shared_ptr<aurora::gx::redraw::Request>& request, s
     aurora::gx::redraw::test_uncorrected(0);
   }
   const double took = ms(done - began) - pace::g_last_hold_ms;
+  if (!shoot && took > kSlowPictureMs && event_line(EvSlowPicture))
+    std::fprintf(stderr, "[aurora-present] slow picture between: step %s (copy %llu), picture %zu of %zu: %.2f ms on the render worker\n",
+                 StepText(aurora::gx::rt::step_of(copy)).text, static_cast<unsigned long long>(copy), index + 1, request->pictures.size(), took);
   const bool first = aurora::gfx::frame_held() != s->redraw_last_held;
   s->redraw_last_held = aurora::gfx::frame_held();
   auto& cost = slots_on(1) && first ? s->redraw_cost_first_ms : s->redraw_cost_ms;
@@ -1171,7 +1272,34 @@ void run() {
       // the next frame's stream is decoded: its end goes to the worker now, and a picture of the held frame asked from here would
       // only delay it (and be stale behind it); a held picture is let go
       {
-        std::lock_guard g{s->lock};
+        std::unique_lock g{s->lock};
+        if (pace::g_even) {
+          // AURORA_PACE_EVEN: the held frame came late on the GPU: its pictures still to come go first (they are timed from its end),
+          // for as long as its lateness, less what the true frames since repaid; never while another frame waits behind this one
+          s->even_debt_ms = std::max(0.0, s->even_debt_ms - pace::g_even_repay_ms);
+          if (s->late_seq != 0 && s->late_seq != s->even_debt_seq && s->late_seq == pace::g_true_seq.load(std::memory_order_relaxed)) {
+            s->even_debt_seq = s->late_seq;
+            if (s->late_ms >= pace::g_even_least_ms)  // (late frames under the mark are only logged)
+              s->even_debt_ms = std::max(s->even_debt_ms, s->late_ms);
+          }
+          const auto began = Clock::now();
+          const auto until = began + std::chrono::microseconds(static_cast<long long>(std::min(s->even_debt_ms, kFieldMs * 0.75) * 1000.0));
+          bool held = false;
+          while (s->carry_on && s->carry.request && s->carry.next < s->carry.request->pictures.size() && s->queue.empty() &&
+                 Clock::now() < until) {
+            held = true;
+            s->drain_wake.wait_until(g, std::min(until, Clock::now() + std::chrono::microseconds(250)));
+          }
+          if (held) {
+            const double took = ms(Clock::now() - began);
+            ++s->even_holds;
+            s->even_hold_ms += took;
+            if (event_line(EvEvenHold))
+              std::fprintf(stderr, "[aurora-present] even: the true frame of step %s (copy %llu) waited %.2f ms for the late pictures before it "
+                           "(debt %.2f ms)\n", StepText(s->feeding_step).text, static_cast<unsigned long long>(s->feeding_copy), took,
+                           s->even_debt_ms);
+          }
+        }
         if (s->carry_on) {
           ++s->overlap_cut;
           if (s->carry.request)
@@ -1210,7 +1338,19 @@ void run() {
         }
         const double cost = (slots_on(1) && !c.asked ? s->redraw_cost_first_ms : s->redraw_cost_ms).load(std::memory_order_relaxed);
         const auto& pictures = c.request->pictures;
-        const Clock::time_point from = pace::overlap_from();
+        Clock::time_point from;
+        double late_ms = 0;
+        if (!pace::even_from(now, from, late_ms)) {
+          // (AURORA_PACE_EVEN: its true frame is late on the GPU and not done yet: its pictures wait for its end)
+          if (ms(now - c.taken) > kFieldMs) {
+            s->carry_on = false;
+            c.request.reset();
+            continue;
+          }
+          timed_wait(s->carry_wake, g_carryWaker, g, now + std::chrono::microseconds(250));
+          continue;
+        }
+        note_late_true(late_ms, c.copy);
         const auto moment = [&](std::size_t i) { return pictures[i].fraction * kFieldMs; };
         const double slack = kFieldMs / (pictures.size() + 1);
         const double since = ms(now - from);
@@ -1341,7 +1481,23 @@ void run() {
           pk("pk_tpw", tp_wait, ms(now - tp_wait) * 1000.0, static_cast<std::uint64_t>(std::max(0.0, ms(now - pace::true_at()) * 1000.0)));
           tp_wait = {};
         }
-        const Clock::time_point from = overlap ? pace::overlap_from() : paced ? pace::true_at() : last_true;
+        Clock::time_point from = paced ? pace::true_at() : last_true;
+        if (overlap) {
+          double late_ms = 0;
+          if (!pace::even_from(now, from, late_ms)) {
+            // (AURORA_PACE_EVEN: the true frame is late on the GPU and not done yet: its pictures wait for its end)
+            if (ms(now - last_true) > kFieldMs) {
+              ++s->redraw_no_request;
+              pk("pk_noreq", now, 0, 3);
+              redraw_frame = false;
+              redraw_for.reset();
+              continue;
+            }
+            timed_wait(s->wake, g_presenterWaker, g, now + std::chrono::microseconds(250));
+            continue;
+          }
+          note_late_true(late_ms, redraw_copy);
+        }
         const auto moment = [&](std::size_t i) { return pictures[i].fraction * kFieldMs; };
         const double slack = kFieldMs / (pictures.size() + 1);
         const double since = ms(now - from);
@@ -1463,7 +1619,10 @@ void run() {
     }
     s_test_frame = &f.bytes;
     s_test_frame_copy = f.copy;
+    aurora::gx::rt::copy_step(f.copy, f.step);
     aurora::gx::rt::begin_copy(f.copy);
+    s->feeding_copy = f.copy;
+    s->feeding_step = f.step;
     // A picture between that cannot be on time is left out: the true one never waits for it. (Decoded all the same: a
     // frame missed would leave Aurora's state wrong.)
     const bool between = f.between > 0;
@@ -1484,6 +1643,9 @@ void run() {
     }
     if (not_drawn) {
       ++s->frames_not_drawn;
+      if (!too_late && event_line(EvCatchUp))
+        std::fprintf(stderr, "[aurora-present] catch-up: step %s (copy %llu) decoded and not drawn, %zu frames waiting behind it\n",
+                     StepText(f.step).text, static_cast<unsigned long long>(f.copy), waiting);
       aurora::gfx::timewarp::frame_not_drawn();
       continue;
     }
@@ -1628,6 +1790,20 @@ void run() {
   if (s->frames_not_drawn != 0)
     std::fprintf(stderr, "[aurora-present] %llu frames not drawn, to catch up\n",
                  static_cast<unsigned long long>(s->frames_not_drawn));
+  {
+    const auto n = [](EventKind k) { return static_cast<unsigned long long>(g_events[k].load(std::memory_order_relaxed)); };
+    std::string holds;
+    if (pace::g_even) {
+      char text[128];
+      std::snprintf(text, sizeof text, ", true frames held for late pictures %llu (%.2f ms on average)", static_cast<unsigned long long>(s->even_holds),
+                    s->even_holds ? s->even_hold_ms / static_cast<double>(s->even_holds) : 0.0);
+      holds = text;
+    }
+    if (overlap || n(EvCatchUp) != 0 || n(EvSlowPicture) != 0)
+      std::fprintf(stderr, "[aurora-present] events: catch-ups %llu, slow pictures between (over 8 ms) %llu, late true frames %llu (most %.2f ms past "
+                   "the usual)%s; at most %llu lines of a kind a minute\n", n(EvCatchUp), n(EvSlowPicture), static_cast<unsigned long long>(s->late_true),
+                   s->late_most_ms, holds.c_str(), static_cast<unsigned long long>(kEventLinesPerMinute));
+  }
   if (aurora::gx::redraw::g_on) {
     aurora::gfx::render_worker::synchronize();
     const auto c = aurora::gx::redraw::counts();
@@ -1694,6 +1870,10 @@ void aurora_present_write(const uint8_t* bytes, uint32_t size) {
   s->building.insert(s->building.end(), bytes, bytes + size);
 }
 
+void aurora_present_step(uint32_t step) {
+  g_step.store(step, std::memory_order_relaxed);
+}
+
 void aurora_present_frame_at(uint64_t position) {
   if (s != nullptr)
     s->next_position = position;
@@ -1745,6 +1925,7 @@ void aurora_present_frame(uint64_t copy) {
   f.in = Clock::now();
   f.between = s->next_between;
   f.position = s->next_position;
+  f.step = g_step.load(std::memory_order_relaxed);
   s->next_between = 0;
   f.bytes = std::move(s->building);
   s->building = {};

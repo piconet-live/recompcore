@@ -53,6 +53,9 @@ void ModelFile(const std::string& path, const u8* bytes, u64 size, bool later);
 // Where the game stands, on any change (the host's: the runner's frame tick): racing from the race's own phase to its end, and a
 // short text for Aurora's log. While racing Aurora compiles nothing ahead. Any thread; nothing without the library.
 void Scene(bool racing, const std::string& where);
+// The game's step, once a frame (the host's: the runner's frame tick), for the step-stamped lines in Aurora's log (a catch-up, a
+// slow picture between, a true frame late on the GPU). Any thread; nothing without the library or with one too old for it.
+void Step(u32 step);
 // The Null video backend, at its start: the emulator will draw nothing, so Aurora presents straight into this window
 // (a window system's handle; none in a headless run) and no picture comes back.
 void SetVideoOffWindow(void* window);

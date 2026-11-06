@@ -51,6 +51,9 @@ uint64_t aurora_timing_last_submit_ns();
 uint64_t aurora_timing_last_gpu_done_ns();
 /* AURORA_PRESENT_OVERLAP: a true frame's submit to its GPU done, smoothed (ns; 0 before the first). */
 uint64_t aurora_timing_true_gpu_lag_ns();
+uint64_t aurora_timing_true_submit_seq();
+uint64_t aurora_timing_true_done_seq();
+uint64_t aurora_timing_true_excess_ns();
 
 #ifdef __cplusplus
 }

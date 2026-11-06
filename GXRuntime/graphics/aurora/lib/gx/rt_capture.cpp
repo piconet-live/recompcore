@@ -2088,6 +2088,27 @@ void efb_cleared() noexcept {
   s_seenPerspective = false;
 }
 
+namespace {
+constexpr std::size_t kCopySteps = 512;
+std::atomic<std::uint64_t> s_stepCopy[kCopySteps]{};
+std::atomic<std::uint32_t> s_stepOf[kCopySteps]{};
+} // namespace
+
+void copy_step(std::uint64_t copy, std::uint32_t step) noexcept {
+  const std::size_t at = copy % kCopySteps;
+  s_stepCopy[at].store(~0ull, std::memory_order_relaxed);  // (a reader between the two stores finds no copy, not a wrong step)
+  s_stepOf[at].store(step, std::memory_order_relaxed);
+  s_stepCopy[at].store(copy, std::memory_order_release);
+}
+
+std::uint32_t step_of(std::uint64_t copy) noexcept {
+  const std::size_t at = copy % kCopySteps;
+  if (s_stepCopy[at].load(std::memory_order_acquire) != copy)
+    return 0xFFFFFFFFu;
+  const std::uint32_t step = s_stepOf[at].load(std::memory_order_relaxed);
+  return s_stepCopy[at].load(std::memory_order_acquire) == copy ? step : 0xFFFFFFFFu;
+}
+
 void begin_copy(std::uint64_t copy) noexcept {
 #if defined(AURORA_RT_LIVE)
   s_copyNow = copy;
