@@ -135,7 +135,11 @@ bool PlatformWin32::RegisterRenderWindowClass()
 
 bool PlatformWin32::CreateRenderWindow()
 {
-  m_hwnd = CreateWindowEx(WS_EX_CLIENTEDGE, WINDOW_CLASS_NAME, _T("Dolphin"), WS_OVERLAPPEDWINDOW,
+  // FZGX_WINDOW_NOACTIVATE=1 (tests beside someone at the PC): the window never takes the foreground. Shown without
+  // activation, made WS_EX_NOACTIVATE (Windows does not hand it the foreground when the foreground window closes or is
+  // minimised, and a click does not activate it) and put at the bottom of the z-order; full screen keeps it there.
+  const bool no_activate = RunSettings::Get("FZGX_WINDOW_NOACTIVATE") != nullptr;
+  m_hwnd = CreateWindowEx(WS_EX_CLIENTEDGE | (no_activate ? WS_EX_NOACTIVATE : 0), WINDOW_CLASS_NAME, _T("Dolphin"), WS_OVERLAPPEDWINDOW,
                           m_window_x < 0 ? CW_USEDEFAULT : m_window_x,
                           m_window_y < 0 ? CW_USEDEFAULT : m_window_y, m_window_width,
                           m_window_height, nullptr, nullptr, GetModuleHandle(nullptr), this);
@@ -147,8 +151,9 @@ bool PlatformWin32::CreateRenderWindow()
 
   // Whether the window has the focus is asked of the system in the main loop: a window shown without it has none.
   m_window_focus = false;
-  // FZGX_WINDOW_NOACTIVATE=1 (tests): the window is shown without taking the keyboard from whoever is at the PC
-  ShowWindow(m_hwnd, RunSettings::Get("FZGX_WINDOW_NOACTIVATE") ? SW_SHOWNOACTIVATE : SW_SHOW);
+  ShowWindow(m_hwnd, no_activate ? SW_SHOWNOACTIVATE : SW_SHOW);
+  if (no_activate)
+    SetWindowPos(m_hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
   UpdateWindow(m_hwnd);
   return true;
 }
@@ -287,10 +292,13 @@ void PlatformWin32::ToggleFullscreen()
 
     SetMenu(m_hwnd, nullptr);
     SetWindowLong(m_hwnd, GWL_STYLE, m_windowed_style & ~WS_OVERLAPPEDWINDOW);
+    // (FZGX_WINDOW_NOACTIVATE: laid over the monitor where it is in the z-order, not activated)
+    const bool no_activate = RunSettings::Get("FZGX_WINDOW_NOACTIVATE") != nullptr;
     SetWindowPos(m_hwnd, HWND_TOP, monitor.rcMonitor.left, monitor.rcMonitor.top,
                  monitor.rcMonitor.right - monitor.rcMonitor.left,
                  monitor.rcMonitor.bottom - monitor.rcMonitor.top,
-                 SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+                 SWP_NOOWNERZORDER | SWP_FRAMECHANGED |
+                     (no_activate ? SWP_NOACTIVATE | SWP_NOZORDER : 0));
     m_fullscreen = true;
     return;
   }
