@@ -52,8 +52,10 @@ public:
   void FastWrite32(u32 value);
   void FastWrite64(u64 value);
 
-private:
+  // the bytes written into the pipe and not yet bursted (VideoCommon AuroraPresent's draw marks: their stream position)
   size_t GetGatherPipeCount();
+
+private:
   void SetGatherPipeCount(size_t size);
 
   // More room for the fastmodes
