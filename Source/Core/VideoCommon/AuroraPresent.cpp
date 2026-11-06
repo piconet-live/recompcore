@@ -192,7 +192,6 @@ constexpr u8 GX_AURORA_COMMAND = 0x50;
 std::mutex s_marks_lock;
 std::deque<Mark> s_marks;
 std::atomic<u64> s_mark_first{~u64{0}};      // the oldest waiting mark's position: the GPU thread's cheap look
-std::atomic<u64> s_linked_bursts{0};         // the CPU's: bursts written to the FIFO the GPU reads, since the boot
 u64 s_read_bytes = 0;                        // the GPU thread's: bytes of the bursts read, since the boot
 std::atomic<u64> s_marks_noted{0}, s_marks_merged{0}, s_marks_dropped{0};
 u64 s_marks_exact = 0, s_marks_late = 0, s_marks_inside = 0;  // the GPU thread's: placed at a command's edge, before, inside
@@ -439,18 +438,15 @@ void Redraw(const RedrawRequest* request)
     s_lib.redraw(request);
 }
 
-void OnBurstWritten(bool linked)
-{
-  if (linked)
-    s_linked_bursts.fetch_add(1, std::memory_order_relaxed);
-}
-
 void NoteMark(u32 tag)
 {
   if (!s_on.load(std::memory_order_relaxed))
     return;
   auto& system = Core::System::GetInstance();
-  const u64 at = s_linked_bursts.load(std::memory_order_relaxed) * GPFifo::GATHER_PIPE_SIZE +
+  // every burst, linked or not: the game fills its next FIFO unlinked while the GPU reads the one before, and hands it
+  // over whole (FrameRedraw's position counts the same; the GPU reads them all, in that order). Linked bursts alone put
+  // every mark early, none at its command's edge
+  const u64 at = FrameRedraw::WrittenPosition() * GPFifo::GATHER_PIPE_SIZE +
                  system.GetGPFifo().GetGatherPipeCount();
   s_marks_noted.fetch_add(1, std::memory_order_relaxed);
   std::lock_guard guard(s_marks_lock);
