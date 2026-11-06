@@ -1,5 +1,6 @@
 #include "gx.hpp"
 #include "rt_capture.hpp"
+#include "look_keys.hpp"
 
 #include "pipeline.hpp"
 #include "shader_info.hpp"
@@ -503,9 +504,14 @@ static u8 card_range() noexcept {
     return v != nullptr ? std::atoi(v) : 0;
   }();
   const auto& s = g_gxState;
-  const bool blended = s.blendMode == GX_BM_BLEND && !(s.blendFacSrc == GX_BL_ONE && s.blendFacDst == GX_BL_ZERO);
   // AURORA_RT_CARDS=2 (a check): the alpha alone
-  return blended && level != 2 ? 2 : 1;
+  return look::card_range(s.blendMode, s.blendFacSrc, s.blendFacDst, level);
+}
+
+look::Look look::current() noexcept {
+  const char* v = std::getenv("AURORA_RT_CARDS");
+  return Look{.neutral = rt::g_neutral, .gameLightOff = rt::g_gameLightOff, .soft = soft::on(), .cards = cards_on(),
+              .cardLevel = v != nullptr ? std::atoi(v) : 0};
 }
 
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept {
@@ -604,6 +610,7 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
       stage.tevSwapTex = GX_TEV_SWAP0;
     }
   }
+  unread_swaps_out(config.shaderConfig);
   const auto sampledChannels = build_shader_info(config.shaderConfig).sampledColorChannels;
   for (u8 i = 0; i < MaxColorChannels; ++i) {
     const auto& cc = g_gxState.colorChannelConfig[i];

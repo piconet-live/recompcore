@@ -124,7 +124,7 @@ void v13_to_v14(PipelineConfig& config) {
   }
   for (u32 i = 0; i < MaxColorChannels; ++i)
     if (!reads_raster || !sampled.test(i % 2)) sc.colorChannels[i] = {};
-  config.version = GXPipelineConfigVersion;
+  config.version = 14;
 }
 
 struct Row {
@@ -143,20 +143,9 @@ struct Planned {
   uint64_t forms = 0;  // with the other target's copies
 };
 
-// Aurora's ray-traced look (the runner's "ray tracing on" set: AURORA_RT_CARDS=1, AURORA_RT_SOFT_CARDS=1) puts two more fields in
-// every key: gx.cpp card_range() and soft_cards.cpp kind() of the draw's state (triangles; efb_alpha: the EFB format has alpha)
-PipelineConfig rt_form(PipelineConfig c, bool efb_alpha) {
-  const bool blended = c.blendMode == GX_BM_BLEND && !(c.blendFacSrc == GX_BL_ONE && c.blendFacDst == GX_BL_ZERO);
-  c.shaderConfig.cardRange = blended ? 2 : 1;
-  u8 kind = 0;
-  if (c.blendMode == GX_BM_BLEND && c.depthCompare && !c.depthUpdate && c.colorUpdate && !(efb_alpha && c.alphaUpdate && c.dstAlpha != UINT32_MAX)) {
-    if (c.blendFacSrc == GX_BL_SRCALPHA && (c.blendFacDst == GX_BL_INVSRCALPHA || c.blendFacDst == GX_BL_ONE)) kind = 1;
-    else if (c.blendFacSrc == GX_BL_ONE && c.blendFacDst == GX_BL_ONE) kind = 2;
-  }
-  c.shaderConfig.softCard = kind;
-  return c;
-}
-int g_variants = 1;  // --rt: 1 the plain look, 2 the ray-traced look's, 3 both
+// --look: the look the planner plans in (look_keys.hpp): plain, or the runner's "ray tracing on" set (AURORA_RT=1,
+// AURORA_RT_LOOK=2 (reflection layers kept), AURORA_RT_GAME_LIGHT=0, AURORA_RT_SOFT_CARDS=1, AURORA_RT_CARDS=1)
+aurora::gx::look::Look g_look;
 
 // (a): every file under dir through the planner, as files the game reads
 Planned plan_disc(const fs::path& dir, bool keep) {
@@ -178,19 +167,11 @@ Planned plan_disc(const fs::path& dir, bool keep) {
         ++out.forms;
         if (!form.scene) continue;  // (the other target's copy: the same key, another layout)
         ++out.tiers[t];
-        std::vector<PipelineConfig> looks;
-        if (g_variants & 1) looks.push_back(form.config);
-        if (g_variants & 2) {
-          looks.push_back(rt_form(form.config, false));
-          const auto other = rt_form(form.config, true);
-          if (std::memcmp(&other, &looks.back(), sizeof other) != 0) looks.push_back(other);
-        }
-        for (const auto& c : looks) {
-          if (out.keys.insert(key_of(c)).second && keep) out.kept.push_back(c);
-          out.shaders.insert(shader_of(c));
-          out.shader_only_keys.insert(key_of(shader_only(c)));
-          for (int fi = 0; fi < Fields; ++fi) out.by_field[fi].insert(key_of(without(c, Field(fi))));
-        }
+        const auto& c = form.config;
+        if (out.keys.insert(key_of(c)).second && keep) out.kept.push_back(c);
+        out.shaders.insert(shader_of(c));
+        out.shader_only_keys.insert(key_of(shader_only(c)));
+        for (int fi = 0; fi < Fields; ++fi) out.by_field[fi].insert(key_of(without(c, Field(fi))));
       }
       s_tiers[t].clear();
     }
@@ -217,7 +198,7 @@ std::unordered_map<uint64_t, Row> read_rows(const std::vector<std::string>& dbs,
       std::unordered_set<uint64_t> here;
       while (sqlite3_step(st) == SQLITE_ROW) {
         const int version = sqlite3_column_int(st, 1);
-        if (sqlite3_column_bytes(st, 2) != int(sizeof(PipelineConfig)) || (version != 13 && version != 14)) continue;
+        if (sqlite3_column_bytes(st, 2) != int(sizeof(PipelineConfig)) || version < 13 || version > int(aurora::gx::GXPipelineConfigVersion)) continue;
         Row r{};
         std::memcpy(&r.config, sqlite3_column_blob(st, 2), sizeof(PipelineConfig));
         r.first_frame = uint32_t(sqlite3_column_int64(st, 3));
@@ -225,9 +206,12 @@ std::unordered_map<uint64_t, Row> read_rows(const std::vector<std::string>& dbs,
           v13_to_v14(r.config);
           r.from_v13 = true;
           ++v13;
-        } else if (uint64_t(sqlite3_column_int64(st, 0)) != key_of(r.config)) {
+        } else if (version == int(aurora::gx::GXPipelineConfigVersion) && uint64_t(sqlite3_column_int64(st, 0)) != key_of(r.config)) {
           ++bad_hash;
         }
+        // 14 to 15: pipeline_cache.cpp prune_old_pipeline_cache_versions
+        r.config.version = aurora::gx::GXPipelineConfigVersion;
+        aurora::gx::unread_swaps_out(r.config.shaderConfig);
         const uint64_t k = key_of(r.config);
         if (!here.insert(k).second) continue;
         auto [it, fresh] = rows.try_emplace(k, r);
@@ -290,6 +274,20 @@ std::string diff(const PipelineConfig& x, const PipelineConfig& y) {
 #define SUB(f) sub(#f, &p.f, &q.f, sizeof p.f)
       SUB(colorPass); SUB(alphaPass); SUB(colorOp); SUB(alphaOp); SUB(kcSel); SUB(kaSel); SUB(texCoordId); SUB(texMapId); SUB(channelId);
       SUB(tevSwapRas); SUB(tevSwapTex);
+      const auto st = [&](const aurora::gx::TevStage& t) {
+        return "c" + std::to_string(t.colorPass.a) + "," + std::to_string(t.colorPass.b) + "," + std::to_string(t.colorPass.c) + "," +
+               std::to_string(t.colorPass.d) + " op" + std::to_string(t.colorOp.op) + " out" + std::to_string(t.colorOp.outReg) + " tc" +
+               std::to_string(t.texCoordId) + " tm" + std::to_string(t.texMapId) + " k" + std::to_string(t.kcSel);
+      };
+      out += ": " + st(p) + " vs planned " + st(q);
+      if (p.texCoordId < aurora::gx::MaxTexCoord) {
+        const auto& g = x.shaderConfig.tcgs[p.texCoordId];
+        out += " [tcg " + std::to_string(g.type) + "/" + std::to_string(g.src) + "/" + std::to_string(g.mtx) + "]";
+      }
+      if (q.texCoordId < aurora::gx::MaxTexCoord) {
+        const auto& g = y.shaderConfig.tcgs[q.texCoordId];
+        out += " [planned tcg " + std::to_string(g.type) + "/" + std::to_string(g.src) + "/" + std::to_string(g.mtx) + "]";
+      }
       out += ") ";
     }
   const auto chans = [](const PipelineConfig& c) {
@@ -304,6 +302,15 @@ std::string diff(const PipelineConfig& x, const PipelineConfig& y) {
   if (x.depthFunc != y.depthFunc) out += "| depthFunc " + std::to_string(x.depthFunc) + " vs " + std::to_string(y.depthFunc) + " ";
   if (x.blendFacSrc != y.blendFacSrc || x.blendFacDst != y.blendFacDst)
     out += "| blend " + std::to_string(x.blendFacSrc) + "," + std::to_string(x.blendFacDst) + " vs " + std::to_string(y.blendFacSrc) + "," + std::to_string(y.blendFacDst) + " ";
+  const auto swaps = [](const PipelineConfig& c) {
+    std::string o;
+    for (const auto& w : c.shaderConfig.tevSwapTable) o += std::to_string(w.red) + std::to_string(w.green) + std::to_string(w.blue) + std::to_string(w.alpha) + " ";
+    for (u32 i = 0; i < c.shaderConfig.tevStageCount; ++i)
+      o += "s" + std::to_string(i) + ":" + std::to_string(c.shaderConfig.tevStages[i].tevSwapRas) + std::to_string(c.shaderConfig.tevStages[i].tevSwapTex) + " ";
+    return o;
+  };
+  if (std::memcmp(&x.shaderConfig.tevSwapTable, &y.shaderConfig.tevSwapTable, sizeof x.shaderConfig.tevSwapTable))
+    out += "| swaps " + swaps(x) + "vs planned " + swaps(y);
   for (int i = 0; i < 4 && false; ++i) {
     const auto& s = x.shaderConfig.tevSwapTable[i];
     out += "| swap" + std::to_string(i) + "=" + std::to_string(s.red) + std::to_string(s.green) + std::to_string(s.blue) + std::to_string(s.alpha) + " ";
@@ -324,6 +331,45 @@ void explain_one(const Planned& a, const PipelineConfig& c) {
   }
   std::printf("        %s\n", describe(c).c_str());
   if (best) std::printf("        nearest planned (%d bytes off): %s\n", best_n, diff(c, *best).c_str());
+}
+
+// The shipped seed (pipeline_cache.cpp seed_pipeline_cache reads it from Aurora's resources: initial_pipeline_cache.db): every
+// recorded key of every look, at the current config version, with its earliest first frame
+bool write_seed(const std::string& path, const std::vector<const Row*>& rows) {
+  std::error_code e;
+  fs::remove(path, e);
+  sqlite3* db = nullptr;
+  if (sqlite3_open(path.c_str(), &db) != SQLITE_OK) return false;
+  const char* schema = R"(CREATE TABLE aurora_schema(value INTEGER);
+INSERT INTO aurora_schema VALUES (1);
+CREATE TABLE pipeline_cache (
+  type INTEGER NOT NULL,
+  hash INTEGER NOT NULL,
+  config_version INTEGER NOT NULL,
+  config_size INTEGER NOT NULL,
+  config BLOB NOT NULL,
+  first_frame_used INTEGER NOT NULL,
+  PRIMARY KEY (type, hash)
+);
+CREATE INDEX pipeline_cache_load_order_idx ON pipeline_cache(type, config_version, first_frame_used);
+BEGIN;)";
+  bool ok = sqlite3_exec(db, schema, nullptr, nullptr, nullptr) == SQLITE_OK;
+  sqlite3_stmt* st = nullptr;
+  ok = ok && sqlite3_prepare_v2(db, "INSERT INTO pipeline_cache VALUES (1, ?, ?, ?, ?, ?)", -1, &st, nullptr) == SQLITE_OK;
+  for (const Row* r : rows) {
+    if (!ok) break;
+    sqlite3_bind_int64(st, 1, static_cast<sqlite3_int64>(key_of(r->config)));
+    sqlite3_bind_int(st, 2, int(r->config.version));
+    sqlite3_bind_int(st, 3, int(sizeof r->config));
+    sqlite3_bind_blob(st, 4, &r->config, int(sizeof r->config), SQLITE_STATIC);
+    sqlite3_bind_int64(st, 5, r->first_frame);
+    ok = sqlite3_step(st) == SQLITE_DONE;
+    sqlite3_reset(st);
+  }
+  sqlite3_finalize(st);
+  ok = ok && sqlite3_exec(db, "COMMIT; VACUUM;", nullptr, nullptr, nullptr) == SQLITE_OK;
+  sqlite3_close(db);
+  return ok;
 }
 
 struct LogFacts {
@@ -361,11 +407,15 @@ void times(const char* what, std::vector<double> v) {
               big.size(), med(big), sb / 1000, small.size(), med(small), ss / 1000);
 }
 }  // namespace census
+namespace aurora::gx::look {
+Look current() noexcept { return census::g_look; }
+}  // namespace aurora::gx::look
 
 int main(int argc, char** argv) {
   using namespace census;
   setenv("AURORA_MODEL_GHOSTS", "1", 1);
   std::string disc, list, out_dir;
+  std::string seed_out;  // --seed-out PATH: the merged recorded keys as initial_pipeline_cache.db
   int explain = 0;  // --explain N: N recorded keys of each class not in (a), against their nearest planned key
   std::vector<std::pair<std::string, std::string>> logs;
   for (int i = 1; i + 1 < argc; i += 2) {
@@ -373,14 +423,16 @@ int main(int argc, char** argv) {
     if (k == "--disc") disc = v;
     else if (k == "--dbs") list = v;
     else if (k == "--out") out_dir = v;
+    else if (k == "--seed-out") seed_out = v;
     else if (k == "--explain") explain = std::atoi(v.c_str());
-    else if (k == "--rt") g_variants = std::atoi(v.c_str());
+    else if (k == "--look") g_look = v == "rt" ? aurora::gx::look::Look{false, true, true, true, 1} : aurora::gx::look::Look{};
     else if (k == "--log" && v.find('=') != std::string::npos) logs.emplace_back(v.substr(0, v.find('=')), v.substr(v.find('=') + 1));
   }
   if (disc.empty()) {
     std::fprintf(stderr, "pipeline_census --disc DIR [--dbs LIST] [--log RUNNER_LOG=PIPELINE_CACHE_DB ...] [--out DIR]\n");
     return 2;
   }
+  s_look = g_look;
   const Planned a = plan_disc(disc, explain != 0);
   static const char* tier_names[] = {"First", "Ghost", "Same", "PostSmall", "DiscFirst", "Rest"};
   std::printf("(a) the disc through today's planner, every form (ghosts on):\n");
@@ -395,7 +447,17 @@ int main(int argc, char** argv) {
       if (!l.empty()) dbs.push_back(l);
   }
   uint64_t bad = 0, v13 = 0;
-  const auto rows = read_rows(dbs, bad, v13);
+  auto rows = read_rows(dbs, bad, v13);
+  if (!seed_out.empty()) {
+    std::vector<const Row*> all;
+    for (const auto& [k, r] : rows) all.push_back(&r);
+    std::sort(all.begin(), all.end(), [](const Row* x, const Row* y) { return x->first_frame != y->first_frame ? x->first_frame < y->first_frame : key_of(x->config) < key_of(y->config); });
+    std::printf("seed %s: %zu keys, %s\n", seed_out.c_str(), all.size(), write_seed(seed_out, all) ? "written" : "FAILED");
+  }
+  // only the keys of the look planned: a key of the other look is never drawn in this one
+  const size_t all_rows = rows.size();
+  std::erase_if(rows, [](const auto& kv) { return !aurora::gx::look::fits(kv.second.config, g_look); });
+  std::printf("(b) %zu of the %zu recorded keys are of this look (%s)\n", rows.size(), all_rows, g_look.cards ? "ray-traced" : "plain");
   std::unordered_set<uint64_t> row_shaders;
   uint64_t only13 = 0;
   for (const auto& [k, r] : rows) {
@@ -461,7 +523,8 @@ int main(int argc, char** argv) {
     // its own folder's keys, by first frame; (b) without that folder: the keys of the other dbs
     std::vector<std::string> mine{db};
     uint64_t b2 = 0, v2 = 0;
-    const auto own = read_rows(mine, b2, v2);
+    auto own = read_rows(mine, b2, v2);
+    std::erase_if(own, [](const auto& kv) { return !aurora::gx::look::fits(kv.second.config, g_look); });
     // (b) as it stood before this run: the keys of the dbs last written before this log's folder's
     const auto when = [](const std::string& p) { std::error_code e; return fs::last_write_time(p, e); };
     const auto mine_time = when(db);

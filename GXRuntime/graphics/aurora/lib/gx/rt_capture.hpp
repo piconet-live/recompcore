@@ -3,6 +3,7 @@
 // the texture generators and the blend in the stream, never a table of models. See rt_capture.cpp.
 
 #include "gx.hpp"
+#include "look_keys.hpp"
 
 #include <atomic>
 
@@ -26,10 +27,7 @@ bool is_engine_star(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* data
 void note_draw(u16 vtxCount, GXPrimitive prim, GXVtxFmt fmt, const u8* data) noexcept;
 void start() noexcept;  // reads the switches, once
 
-// A stage is a reflection layer when it adds or multiplies a texture looked up by the normal (a sphere map), with a
-// constant strength: fn_80075908's reflection layers, for any model.
-bool is_reflection_stage(const TevStage& stage, const std::array<TcgConfig, MaxTexCoord>& tcgs) noexcept;
-void neutralise(ShaderConfig& config) noexcept;
+// is_reflection_stage and neutralise: look_keys.hpp (the planner works out the same keys)
 
 // The live pass: before each draw (the first orthographic draw after the view is the HUD: the rays go first), and at a copy that
 // clears the EFB (what was drawn so far went to a texture, not the picture)

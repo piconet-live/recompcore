@@ -1,4 +1,5 @@
 #include "soft_cards.hpp"
+#include "look_keys.hpp"
 
 #include "fifo.hpp"
 #include "../gfx/recording.hpp"
@@ -54,16 +55,8 @@ float share() noexcept {
 u8 kind(GXPrimitive primitive) noexcept {
   const auto& s = g_gxState;
   // blended over what is there, depth tested, writing no depth, colour written, no destination alpha constant (its alpha is the EFB's); whole triangles
-  if (s.blendMode != GX_BM_BLEND || !s.depthCompare || s.depthUpdate || !s.colorUpdate || primitive == GX_LINES || primitive == GX_LINESTRIP ||
-      primitive == GX_POINTS)
-    return 0;
-  if (efb_has_alpha(s.pixelFmt) && s.alphaUpdate && s.dstAlpha != UINT32_MAX)
-    return 0;
-  if (s.blendFacSrc == GX_BL_SRCALPHA && (s.blendFacDst == GX_BL_INVSRCALPHA || s.blendFacDst == GX_BL_ONE))
-    return 1;
-  if (s.blendFacSrc == GX_BL_ONE && s.blendFacDst == GX_BL_ONE)
-    return 2;
-  return 0;
+  return look::soft_kind(s.blendMode, s.depthCompare, s.depthUpdate, s.colorUpdate,
+                         efb_has_alpha(s.pixelFmt) && s.alphaUpdate && s.dstAlpha != UINT32_MAX, s.blendFacSrc, s.blendFacDst, primitive);
 }
 
 void before_draw(GXPrimitive primitive) noexcept {

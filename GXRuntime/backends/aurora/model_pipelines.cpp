@@ -39,6 +39,7 @@
 
 #include "gfx/pipeline_cache.hpp"
 #include "gx/pipeline.hpp"
+#include "gx/look_keys.hpp"
 #include "gx/rt_scene.hpp"
 
 #include <algorithm>
@@ -106,6 +107,8 @@ std::set<uint8_t> s_fogs{0};
 std::set<uint8_t> s_course_fogs;  // the fog types of the course files read (a ghost is drawn with the course's)
 uint64_t s_meshes = 0, s_meshes_left_out = 0, s_configs = 0, s_ghost_forms = 0;
 FILE* s_dump = nullptr;
+// Aurora's look (gx/look_keys.hpp), read when Aurora is up: every form is planned as a draw in this look keys it
+aurora::gx::look::Look s_look;
 
 uint32_t be32(const uint8_t* p) { return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3]; }
 uint16_t be16(const uint8_t* p) { return uint16_t(p[0] << 8 | p[1]); }
@@ -326,6 +329,8 @@ bool ghost_kind(const PipelineConfig& c, int post, bool small) {
 void plan(const PipelineConfig& base, uint8_t fog, int post, bool small) {
   PipelineConfig c = base;
   c.shaderConfig.fogType = fog;
+  aurora::gx::look::apply(c, s_look);
+  aurora::gx::unread_swaps_out(c.shaderConfig);
   std::vector<uint8_t> shader(sizeof(c.shaderConfig) + 1);
   std::memcpy(shader.data(), &c.shaderConfig, sizeof(c.shaderConfig));
   shader.back() = c.dstAlpha == UINT32_MAX;
@@ -539,6 +544,9 @@ void run() {
   {
     std::unique_lock g{s_lock};
     s_wake.wait(g, [] { return s_aurora_up || s_quit; });
+    s_look = aurora::gx::look::current();
+    std::fprintf(stderr, "[pipelines] planned in the look: reflections %s, game lights %s, soft cards %s, cards %s\n", s_look.neutral ? "off" : "on",
+                 s_look.gameLightOff ? "off" : "on", s_look.soft ? "on" : "off", s_look.cards ? "on" : "off");
   }
   if (const char* dump = std::getenv("AURORA_TEST_MODEL_DUMP")) s_dump = std::fopen(dump, "wb");
   const auto t0 = Clock::now();

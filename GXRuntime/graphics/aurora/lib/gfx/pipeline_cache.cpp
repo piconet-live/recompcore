@@ -7,6 +7,7 @@
 #include "resources.hpp"
 #include "hash.hpp"
 #include "../gx/pipeline.hpp"
+#include "../gx/look_keys.hpp"
 #include "../io.hpp"
 #ifdef AURORA_ENABLE_RMLUI
 #include "../rmlui/pipeline.hpp"
@@ -855,6 +856,47 @@ static void prune_old_pipeline_cache_versions() {
     Log.error("Failed to prune clear pipeline cache rows: {}", sqlite3_errmsg(g_pipelineCacheDb));
     pipeline_cache_abort();
     return;
+  }
+
+  // Rows of config version 14 are 15's after unread_swaps_out (look_keys.hpp): brought over, not dropped (a user's recorded keys,
+  // and a seed made before 15)
+  static_assert(gx::GXPipelineConfigVersion == 15);
+  {
+    std::vector<PipelineCacheWrite> moved;
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(g_pipelineCacheDb, "SELECT config, first_frame_used FROM pipeline_cache WHERE type = ? AND config_version = 14", -1, &st,
+                           nullptr) == SQLITE_OK) {
+      sqlite3_bind_int(st, 1, underlying(ShaderType::GX));
+      while (sqlite3_step(st) == SQLITE_ROW) {
+        if (sqlite3_column_bytes(st, 0) != static_cast<int>(sizeof(gx::PipelineConfig)))
+          continue;
+        gx::PipelineConfig config;
+        std::memcpy(&config, sqlite3_column_blob(st, 0), sizeof(config));
+        config.version = gx::GXPipelineConfigVersion;
+        gx::unread_swaps_out(config.shaderConfig);
+        moved.push_back(make_pipeline_cache_write(ShaderType::GX, xxh3_hash(config, static_cast<HashType>(ShaderType::GX)), config,
+                                                  static_cast<uint32_t>(sqlite3_column_int64(st, 1))));
+      }
+    }
+    sqlite3_finalize(st);
+    if (!moved.empty()) {
+      bool ok = false;
+      {
+        sqlite::Transaction tx(g_pipelineCacheDb, Log, true);
+        ok = static_cast<bool>(tx);
+        for (const auto& write : moved)
+          if (ok && !write_pipeline_cache_record(write))
+            ok = false;
+        if (ok)
+          tx.commit();
+      }
+      if (!ok) {
+        Log.error("Failed to bring pipeline cache rows of version 14 to {}", gx::GXPipelineConfigVersion);
+        pipeline_cache_abort();
+        return;
+      }
+      std::fprintf(stderr, "[pipelines] cache: %zu rows of version 14 brought to %u\n", moved.size(), gx::GXPipelineConfigVersion);
+    }
   }
 
   const auto gxDelete = fmt::format("DELETE FROM pipeline_cache WHERE type = {} AND config_version < {}",

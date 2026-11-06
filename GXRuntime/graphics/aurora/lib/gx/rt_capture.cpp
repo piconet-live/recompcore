@@ -295,39 +295,6 @@ void start() noexcept {
                  s_path.c_str(), static_cast<unsigned long long>(s_at));
 }
 
-bool is_reflection_stage(const TevStage& stage, const std::array<TcgConfig, MaxTexCoord>& tcgs) noexcept {
-  if (stage.texCoordId == GX_TEXCOORD_NULL || stage.texMapId == GX_TEXMAP_NULL || stage.texCoordId >= MaxTexCoord)
-    return false;
-  const auto& tcg = tcgs[stage.texCoordId];
-  if (tcg.src != GX_TG_NRM || (tcg.type != GX_TG_MTX2x4 && tcg.type != GX_TG_MTX3x4))
-    return false;
-  if (stage.colorOp.outReg != GX_TEVPREV)
-    return false;
-  const auto& c = stage.colorPass;
-  const bool adds = c.d == GX_CC_CPREV && c.a == GX_CC_ZERO && c.b == GX_CC_TEXC &&
-                    (c.c == GX_CC_KONST || c.c == GX_CC_ONE || c.c == GX_CC_RASC);
-  const bool multiplies = c.a == GX_CC_ZERO && c.d == GX_CC_ZERO && ((c.b == GX_CC_TEXC && c.c == GX_CC_CPREV) || (c.b == GX_CC_CPREV && c.c == GX_CC_TEXC));
-  return adds || multiplies;
-}
-
-void neutralise(ShaderConfig& config) noexcept {
-  for (u32 i = 0; i < config.tevStageCount; ++i) {
-    auto& s = config.tevStages[i];
-    if (!is_reflection_stage(s, config.tcgs))
-      continue;
-    s.colorPass.a = s.colorPass.b = s.colorPass.c = GX_CC_ZERO;
-    s.colorPass.d = GX_CC_CPREV;
-    s.colorOp.op = GX_TEV_ADD;
-    s.colorOp.bias = GX_TB_ZERO;
-    s.colorOp.scale = GX_CS_SCALE_1;
-    // the alpha part reads nothing of the texture in these layers (it passes through), so the sampling can go
-    if (s.alphaPass.a != GX_CA_TEXA && s.alphaPass.b != GX_CA_TEXA && s.alphaPass.c != GX_CA_TEXA && s.alphaPass.d != GX_CA_TEXA) {
-      s.texCoordId = GX_TEXCOORD_NULL;
-      s.texMapId = GX_TEXMAP_NULL;
-    }
-  }
-}
-
 // All a draw's translation reads, copied where the stream stands: the same names as GXState, the parts only this draw uses
 struct Packet {
   u32 size;        // bytes to the next packet
