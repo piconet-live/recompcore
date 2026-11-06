@@ -1026,12 +1026,12 @@ void log_lights(const live::Job& j, const Frame& f) {
   std::fprintf(s_lightLog, "F,%llu,%g,%g,%g,%g,%g,%g,%g,%g\n", static_cast<unsigned long long>(j.copy), j.proj[0], j.proj[5], j.proj[2], j.proj[6], j.viewport[0],
                j.viewport[1], j.viewport[2], j.viewport[3]);
   for (const auto& p : f.merged)
-    std::fprintf(s_lightLog, "M,%g,%g,%g,%g,%g,%g,%g\n", p.pos[0], p.pos[1], p.pos[2], p.colour[0], p.colour[1], p.colour[2], p.weight);
+    std::fprintf(s_lightLog, "M,%g,%g,%g,%g,%g,%g,%g,%u,%u\n", p.pos[0], p.pos[1], p.pos[2], p.colour[0], p.colour[1], p.colour[2], p.weight, p.owner, p.burner);
   for (u32 i = 0; i < j.drawCount; ++i) {
     const DrawRec& d = j.draws[j.baseDraw + i];
     if (d.lightExtent > 0.f)
-      std::fprintf(s_lightLog, "C,%u,%u,%g,%g,%g,%g,%g,%g,%g,%g,%u,%u,%u,%u\n", static_cast<u32>(d.prim), d.vtxCount, d.lightPos[0], d.lightPos[1], d.lightPos[2], d.lightColour[0], d.lightColour[1],
-                   d.lightColour[2], d.lightExtent, d.lightBright, d.stage[0].tex, d.stage[0].ca, d.stage[0].cc, d.blendSrc);
+      std::fprintf(s_lightLog, "C,%u,%u,%g,%g,%g,%g,%g,%g,%g,%g,%u,%u,%u,%u,%u\n", static_cast<u32>(d.prim), d.vtxCount, d.lightPos[0], d.lightPos[1], d.lightPos[2], d.lightColour[0], d.lightColour[1],
+                   d.lightColour[2], d.lightExtent, d.lightBright, d.stage[0].tex, d.stage[0].ca, d.stage[0].cc, d.blendSrc, d.tag);
   }
 }
 
@@ -1211,11 +1211,6 @@ void run_rules(live::Job& j) {
       tuning.maxGlows = static_cast<u32>(std::atoi(most));
   }
   tuning.reflectCap = s_reflectCap;
-  static const bool ownLightFull = [] {
-    const char* v = std::getenv("AURORA_RT_OWN_LIGHT_FULL");
-    return v != nullptr && std::atof(v) != 0;
-  }();
-  tuning.ownLightFull = ownLightFull;
   // AURORA_RT_HUD_SKIP=1 (off by default): cards turned to the picture, the game's overlay in the world (the place markers), are left out of every ray but the
   // camera's (rt_rules.hpp faces_picture). AURORA_RT_HUD_LOG=1: each such draw on stderr, a line each, every 30th copy, and the count of copies that had any
   static const bool overlayApart = [] {

@@ -22,12 +22,14 @@ struct EngineLight {
 };
 
 // The one rule for lights: anything additive, small and bright in the main view casts light. No labels: a flame, a spark or a
-// mine's blast are the same to it. Colour from the draw, strength its brightness by its size. Draws the game marked as one
-// machine's (its burner's flames, any glowing part of its body: the draw marks) become that machine's one light; any other
-// draws within MergeR of one another become one.
+// mine's blast are the same to it. Colour from the draw, strength its brightness by its size. Lights follow what the game has:
+// the draws the game marked as one burner of a machine (the draw marks: one Burner record, one nozzle of the machine's .fmi)
+// become that burner's light, so a machine with three engines has three; a machine's other marked glows (its body's) one more;
+// never merged across burners or machines. Unmarked draws (a course's lamps, sparks, blasts) within MergeR of one another become one.
 struct LightPick {
   float pos[3], colour[3], weight, extent, bright;
-  std::uint32_t owner;  // EngineLight::owner
+  std::uint32_t owner;   // EngineLight::owner
+  std::uint32_t burner;  // which of the owner's burners (tag_burner), 0 none
 };
 inline void light_picks(const DrawRec* draws, std::uint32_t count, bool (*in_view)(const DrawRec&), std::vector<LightPick>& out, float maxSize, float minBright) {
   out.clear();
@@ -37,7 +39,7 @@ inline void light_picks(const DrawRec* draws, std::uint32_t count, bool (*in_vie
       continue;
     out.push_back({{d.lightPos[0], d.lightPos[1], d.lightPos[2]},
                    {d.lightColour[0], d.lightColour[1], d.lightColour[2]},
-                   d.lightBright * std::max(d.lightExtent, 0.5f), d.lightExtent, d.lightBright, tag_machine(d.tag)});
+                   d.lightBright * std::max(d.lightExtent, 0.5f), d.lightExtent, d.lightBright, tag_machine(d.tag), tag_burner(d.tag)});
   }
 }
 inline void merge_lights(std::vector<LightPick>& picks, float mergeR, std::vector<LightPick>& out) {
@@ -46,7 +48,7 @@ inline void merge_lights(std::vector<LightPick>& picks, float mergeR, std::vecto
   for (const LightPick& p : picks) {
     bool merged = false;
     for (LightPick& q : out) {
-      if (q.owner != p.owner)
+      if (q.owner != p.owner || q.burner != p.burner)
         continue;
       const float dx = q.pos[0] / q.weight - p.pos[0], dy = q.pos[1] / q.weight - p.pos[1], dz = q.pos[2] / q.weight - p.pos[2];
       if (p.owner != 0 || dx * dx + dy * dy + dz * dz < mergeR * mergeR) {
@@ -223,7 +225,6 @@ struct Tuning {
   float reflectCap = 0.25f;  // the most reflection strength a draw takes (AURORA_RT_REFLECT_CAP; the look's)
   std::uint32_t maxLights = 16;
   float lightMaxSize = 40.f, lightMinBright = 0.07f, lightMerge = 8.f, lightFull = 2.f;
-  bool ownLightFull = false;  // AURORA_RT_OWN_LIGHT_FULL=1 (a look, off by default): a machine's one light (its flames merged) keeps its whole strength, no cap of 1.5
   // Glowing surfaces: on when texMeans is given. The size where small lights end is where these begin.
   const float (*texMeans)[4] = nullptr;
   std::uint32_t texCount = 0, maxGlows = 64, glowPerDraw = 0;  // glowPerDraw: most lights one draw may hold, 0 no limit
@@ -257,6 +258,7 @@ struct Frame {
   std::uint32_t machineDraws = 0, reflective = 0;  // machineDraws: draws the game marked as a machine's (DrawRec::tag)
   std::uint32_t burnerSolid = 0;  // of them, solid or see-through (not additive) with a burner's mark: drawn in a burner's span, not its flames
   std::uint32_t machineLights = 0, machineGlows = 0;  // lights and glow lights of a machine (owner)
+  std::uint32_t machinesLit = 0;  // machines with a light (machineLights over it: lights a machine, its burners)
   std::vector<float> extent;  // each draw's size in the main view
   float largest = 0.f;
   bool is_sky(std::uint32_t i) const { return extent[i] > largest * 0.3f && draws[i].cls != 0 && draws[i].cls != 3; }
@@ -391,7 +393,7 @@ inline bool faces_picture(const DrawRec& d, const Vertex* verts) {
 // The main view is the perspective projection with the most triangles. Sky: the largest see-through shells around the view,
 // by size against the largest in the frame, with no table of courses.
 inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex* verts, const Tuning& t, Frame& out) {
-  out.verts.clear(), out.prevPos.clear(), out.spans.clear(), out.draws.clear(), out.stages.clear(), out.main = nullptr, out.machineDraws = out.reflective = out.machineLights = out.burnerSolid = 0, out.seeFirstVertex = out.layerFirstVertex = out.skyFirstVertex = out.primaryFirstVertex = out.passFirstVertex = 0;
+  out.verts.clear(), out.prevPos.clear(), out.spans.clear(), out.draws.clear(), out.stages.clear(), out.main = nullptr, out.machineDraws = out.reflective = out.machineLights = out.machinesLit = out.burnerSolid = 0, out.seeFirstVertex = out.layerFirstVertex = out.skyFirstVertex = out.primaryFirstVertex = out.passFirstVertex = 0;
   const auto key = [](const DrawRec& d) { return std::array<int, 2>{static_cast<int>(d.proj[0] * 1000), static_cast<int>(d.proj[5] * 1000)}; };
   std::array<int, 2> best{};
   {
@@ -428,20 +430,29 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
   };
   light_picks(draws, count, inMain, out.picks, t.lightMaxSize, t.lightMinBright);
   merge_lights(out.picks, t.lightMerge, out.merged);
-  // the nearest few, with their strengths: colour by strength, reach by the root of it, so a spark lights close by and a flame further
+  // the nearest few sources, with their strengths: colour by strength (each light at most 1.5), reach by the root of it, so a spark lights
+  // close by and a flame further. A source is a machine with all its lights (its burners), or an unmarked light: maxLights of them
   std::sort(out.merged.begin(), out.merged.end(), [](const LightPick& a, const LightPick& b) {
     return a.pos[0] * a.pos[0] + a.pos[1] * a.pos[1] + a.pos[2] * a.pos[2] < b.pos[0] * b.pos[0] + b.pos[1] * b.pos[1] + b.pos[2] * b.pos[2];
   });
   out.lights.clear();
+  std::uint64_t lit = 0;  // the machines taken (bit owner)
+  std::uint32_t sources = 0;
   for (const LightPick& q : out.merged) {
-    if (out.lights.size() == t.maxLights)
-      break;
+    const std::uint64_t bit = q.owner != 0 ? 1ull << std::min(q.owner, 63u) : 0;
+    if ((lit & bit) == 0) {
+      if (sources == t.maxLights)
+        continue;
+      ++sources, lit |= bit;
+    }
     const float k = q.weight / t.lightFull;
-    const float strength = q.owner != 0 && t.ownLightFull ? k : std::min(k, 1.5f);
+    const float strength = std::min(k, 1.5f);
     out.lights.push_back({{q.pos[0], q.pos[1], q.pos[2]}, {q.colour[0] * strength, q.colour[1] * strength, q.colour[2] * strength},
                           std::clamp(std::sqrt(k), 0.25f, 1.25f), q.owner});
     out.machineLights += q.owner != 0 ? 1 : 0;
   }
+  for (std::uint64_t m = lit; m != 0; m &= m - 1)
+    ++out.machinesLit;
   out.draws.resize(count);
   out.extent.assign(count, 0.f);
   std::vector<float>& extent = out.extent;
