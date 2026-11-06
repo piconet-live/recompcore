@@ -130,6 +130,7 @@ struct Library
   int (*picture_in_window)(u32, u32, s32*) = nullptr;
   void (*picture_shape)(float) = nullptr;
   void (*model_file)(const char*, const u8*, u64, int) = nullptr;
+  void (*scene)(int, const char*) = nullptr;
 };
 
 Settings s_settings;
@@ -232,6 +233,7 @@ bool Load(const std::string& path)
   Bind(&s_lib.frame_between, "aurora_present_frame_between");
   Bind(&s_lib.frame_at, "aurora_present_frame_at");
   Bind(&s_lib.redraw, "aurora_present_redraw");
+  Bind(&s_lib.scene, "aurora_present_scene");
   return true;
 #else
   s_load_problem = "Aurora is only loaded on Windows so far";
@@ -367,6 +369,12 @@ void ModelFile(const std::string& path, const u8* bytes, u64 size, bool later)
 {
   if (WantsModelFiles())
     s_lib.model_file(path.c_str(), bytes, size, later ? 1 : 0);
+}
+
+void Scene(bool racing, const std::string& where)
+{
+  if (s_on.load(std::memory_order_relaxed) && s_lib.scene != nullptr)
+    s_lib.scene(racing ? 1 : 0, where.c_str());
 }
 
 void Configure(const Settings& settings)
