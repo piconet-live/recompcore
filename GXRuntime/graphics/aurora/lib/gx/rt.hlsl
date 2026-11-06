@@ -89,7 +89,6 @@ StructuredBuffer<Stage> Stages : register(t5);
 RWTexture2D<float4> Out : register(u0);
 RWTexture2D<float4> Final : register(u1);
 Texture2D<float4> Term : register(t6);
-RWTexture2D<uint> HitMachine : register(u16);  // the machine whose body main's camera ray hit (body_machine: 1 + the racer, 0 none); between_warp reads it
 StructuredBuffer<GlowLight> Glows : register(t7);
 Texture2D<float4> Tex[] : register(t0, space1);
 SamplerState Linear : register(s0);
@@ -763,7 +762,6 @@ void main(uint3 id : SV_DispatchThreadID) {
   float3 light = 0;
   float3 dbg = 0;
   float hitDepth = 0;
-  uint hitMachine = 0;  // HitMachine: the machine of the surface at hitDepth
   bool wideHere = false;  // GLOW_WIDE
   uint seed = id.x * 1973u + id.y * 9277u + P.frame * 26699u + 1u;
   for (uint n = 0; n < P.spp; ++n) {
@@ -850,7 +848,6 @@ void main(uint3 id : SV_DispatchThreadID) {
         if (surf.a < 0.5) { tmin = t + 0.02; ++whyCard; continue; }
       }
       hitDepth = t;
-      hitMachine = body_machine(d);
       surfT = t;
       if (MAIN_PROBE == 1) break;
       // a card turned to the picture, the game's overlay in the world (AURORA_RT_HUD_SKIP, rt_rules.hpp faces_picture): no light, no reflection; only this ray meets it
@@ -1005,7 +1002,6 @@ void main(uint3 id : SV_DispatchThreadID) {
     if (MAIN_PROBE == 9) { Out[id.xy] = float4(traces <= 1 ? 0.xxx : traces == 2 ? float3(1, 0, 0) : traces == 3 ? float3(0, 1, 0) : float3(0, 0, 1), 1); return; }
     sum += term;
   }
-  HitMachine[id.xy] = hitMachine;
   // own light falls on the surface: on what lies under the last blended effects, not on them. They are drawn over as they are.
   if (P.mode == 8) { Out[id.xy] = float4(sum + ((P.stableShine & 2) != 0 ? Before[id.xy].rgb : raster) * light, wideHere ? -hitDepth - 1 : hitDepth); return; }
   if (P.mode >= 6) { Out[id.xy] = float4(dbg, 1); return; }
@@ -1363,14 +1359,13 @@ float3 glow_flare(int2 c) {
 }
 
 // Pictures between (AURORA_REDRAW with rays): light and reflections once per true frame, carried to each picture. Each pixel looks for the
-// true frame's pixel that lands on it: from a guess, that pixel's own hit distance gives its place in the true view; the machine whose
-// draw main's ray hit there (HitMachine, the game's marks) decides its move (that machine's correction, else the camera's), and the miss
-// corrects the guess.
-struct BetweenMachine { float4 m[3]; };
+// true frame's pixel that lands on it: from a guess, that pixel's own hit distance gives its place in the true view; the place decides
+// its move (within a machine's radius of its place: that machine's correction, else the camera's), and the miss corrects the guess.
+struct BetweenMachine { float4 m[3]; float4 at; };
 struct BetweenParams {
   float2 size, rectXY, rectWH, vpXY, vpWH, pScale, pOffset;
-  uint machines, iterations;  // machines: a bit for each racer with a correction in machine[racer]
-  float farAway, pad0, pad1, pad2;
+  uint count, iterations;
+  float radius2, farAway, pad0, pad1;
   float4 camera[3];
   BetweenMachine machine[30];
 };
@@ -1387,8 +1382,14 @@ void between_warp(uint3 id : SV_DispatchThreadID) {
     float3 v = normalize(float3((ndc + BW.pOffset) / BW.pScale, -1));
     float3 p = v * (t > 0 ? t : BW.farAway);
     float4 m0 = BW.camera[0], m1 = BW.camera[1], m2 = BW.camera[2];
-    const uint mark = t > 0 ? HitMachine[clamp(int2(s), 0, most)] : 0;
-    if (mark != 0 && mark <= 30 && ((BW.machines >> (mark - 1)) & 1) != 0) { m0 = BW.machine[mark - 1].m[0]; m1 = BW.machine[mark - 1].m[1]; m2 = BW.machine[mark - 1].m[2]; }
+    if (t > 0) {
+      float nearest = BW.radius2;
+      for (uint i = 0; i < BW.count; ++i) {
+        float3 d = p - BW.machine[i].at.xyz;
+        float d2 = dot(d, d);
+        if (d2 < nearest) { nearest = d2; m0 = BW.machine[i].m[0]; m1 = BW.machine[i].m[1]; m2 = BW.machine[i].m[2]; }
+      }
+    }
     float4 h = float4(p, 1);
     float3 q = float3(dot(m0, h), dot(m1, h), dot(m2, h));
     if (q.z > -0.01) break;

@@ -494,10 +494,10 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
     if (t.overlayApart && inView && g.cls < 2 && faces_picture(d, verts))
       g.highlight |= 16 | 4;
     // the machine whose draw this is, by the game's own mark: every light of that machine passes it (rt.hlsl engine_light, glow_light), its
-    // reflections pass its own flames (trace_reflection), the pictures between move its pixels with it (main's HitMachine)
+    // reflections pass its own flames (trace_reflection)
     if (g.cls < 3 && (g.highlight & 16) == 0) {
       g.highlight |= std::min(tag_machine(d.tag), 31u) << 8;
-      // bit 13: the mark is a body's (CarDisp's span), the one draw kind the pictures between move with the machine (rt.hlsl HitMachine)
+      // bit 13: the mark is a body's (CarDisp's span): a surface of that machine (rt.hlsl body_machine)
       if (tag_machine(d.tag) != 0 && tag_kind(d.tag) == TagBody)
         g.highlight |= 1u << 13;
     }

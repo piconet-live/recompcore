@@ -1083,7 +1083,7 @@ struct Material {
 // A draw's material as the rays read it, without what they never read (stale registers, a reflection layer's fields, a K colour no stage picks): those change without the surface changing.
 bool material_of(const DrawRec& d, const GpuDraw& from, Material& out) {
   out.draw = from;
-  out.draw.highlight &= ~(63u << 8);  // a placement of the track is no machine's, whatever mark its draw came with (rt.hlsl HitMachine, trace_reflection)
+  out.draw.highlight &= ~(63u << 8);  // a placement of the track is no machine's, whatever mark its draw came with (rt.hlsl trace_reflection)
   out.draw.firstStage = 0;
   out.stages.assign(d.stage, d.stage + from.stages);
   out.coords = {255, 255, 255, 255};
