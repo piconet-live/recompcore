@@ -177,6 +177,8 @@ typedef struct AuroraBuildProgress {
   uint64_t compiled;        // pipelines compiled so far
   uint64_t waiting;         // pipelines asked for and not yet compiled
   uint64_t shaders;         // shaders planned so far
+  uint64_t asked;           // forms (a pipeline or two each) asked for so far
+  uint64_t left;            // forms planned, not asked for yet: the compiles ask for them a few at a time
 } AuroraBuildProgress;
 // 1, or 0 when the ABI differs or Aurora already runs. Aurora's start happens on a thread of its own.
 AURORA_PRESENT_API int aurora_present_build_start(const AuroraBuildConfig* config);

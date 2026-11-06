@@ -1970,6 +1970,8 @@ void aurora_present_build_progress(AuroraBuildProgress* out) {
   const ModelPipelinesBuild b = model_pipelines_build_state();
   out->bytes_read = b.bytes_read;
   out->shaders = b.shaders;
+  out->asked = b.asked;
+  out->left = b.left;
   if (out->state == 1 || out->state == 2) {
     out->compiled = aurora::gfx::pipelines_compiled();
     out->waiting = aurora::gfx::pipelines_waiting();

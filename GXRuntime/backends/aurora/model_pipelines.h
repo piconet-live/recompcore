@@ -11,5 +11,7 @@ struct ModelPipelinesBuild {
   unsigned long long shaders = 0;     // planned
   bool walk_read = false;             // the walk's end read
   bool planned_all = false;           // and every form asked for (what is asked may still be compiling)
+  unsigned long long asked = 0;       // forms asked for so far
+  unsigned long long left = 0;        // forms planned and not asked for yet (the compile queue is kept short)
 };
 ModelPipelinesBuild model_pipelines_build_state();

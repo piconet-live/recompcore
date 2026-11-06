@@ -710,6 +710,8 @@ ModelPipelinesBuild model_pipelines_build_state() {
   b.shaders = s_shader_count.load(std::memory_order_relaxed);
   b.walk_read = s_walk_read;
   b.planned_all = s_walk_read && s_idle && s_files.empty() && s_disc_files.empty();
+  b.asked = s_configs;
+  for (const auto& t : s_tiers) b.left += t.size();
   return b;
 }
 
