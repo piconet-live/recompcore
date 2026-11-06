@@ -173,7 +173,7 @@ typedef struct AuroraBuildConfig {
 } AuroraBuildConfig;
 typedef struct AuroraBuildProgress {
   uint32_t state;           // 0 starting, 1 compiling, 2 done (the mark written), 3 failed (Aurora could not start)
-  uint64_t bytes_read;      // of the files handed over, the bytes Aurora has read (its reading follows the compiles)
+  uint64_t bytes_read;      // of the files handed over, the bytes Aurora has read (ahead of the compiles: see waiting)
   uint64_t compiled;        // pipelines compiled so far
   uint64_t waiting;         // pipelines asked for and not yet compiled
   uint64_t shaders;         // shaders planned so far
