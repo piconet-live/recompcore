@@ -45,7 +45,6 @@ bool g_live = false;
 bool g_hook = false;
 static float s_starFrom = 4.f;  // AURORA_RT_ENGINE_STAR_FROM: the star's size (world units) from which is_engine_star takes it; StarGrown by default
 static bool s_seenPerspective = false;
-bool g_noGameShadow = false;
 static bool s_motionOn = false;  // AURORA_RT_DENOISE=1: motion data from the draws (rt_motion.hpp)
 
 bool skip_draw() noexcept {
@@ -243,11 +242,7 @@ void start() noexcept {
     g_ambientWarmth = static_cast<float>(std::atof(v));
   if (const char* v = std::getenv("AURORA_RT_DENOISE"); v != nullptr && v[0] == '1')
     s_motionOn = true;
-  // with our own light: the rays' shadows stand in for the game's. AURORA_RT_GAME_SHADOW=1 keeps the game's
-  if (g_gameLightOff && std::getenv("AURORA_RT_LIGHTING") != nullptr) {
-    const char* v = std::getenv("AURORA_RT_GAME_SHADOW");
-    g_noGameShadow = v == nullptr || v[0] != '1';
-  }
+  // (the game's own machine shadow with rays on: the runner keeps the game from drawing it, port/core/src/game_shadow.h)
   // with our own light: the star the game puts on far machines' engines, to keep them readable, looks out of place. Off by default
   if (g_live && std::getenv("AURORA_RT_LIGHTING") != nullptr) {
     const char* v = std::getenv("AURORA_RT_NO_ENGINE_STAR");
@@ -1578,12 +1573,6 @@ static bool samples_copy() noexcept {
   }
   return false;
 }
-// The game's own machine shadow, from the draw alone: its blend takes the source by one minus the picture's alpha and the picture by its alpha, and it writes no depth. No rule by model or course. Rays stand in for it.
-// Not asked: whether its texture is a known picture copy. The game's shadow samples an address only sometimes known as one (the rule missed 15 in 16 draws on course 15).
-bool is_game_shadow() noexcept {
-  const auto& st = g_gxState;
-  return st.blendMode == GX_BM_BLEND && st.blendFacSrc == GX_BL_INVDSTALPHA && st.blendFacDst == GX_BL_DSTALPHA && !st.depthUpdate;
-}
 // A draw's corners in view space, read from its own bytes before it is drawn: where its middle is, how big it is, and how squarely
 // its first triangle lies in the view plane (1: square to the view's axis, as a sprite the game turns to the screen)
 struct DrawShape {
@@ -1750,9 +1739,9 @@ void note_draw(const u16 vtxCount, const GXPrimitive prim, const GXVtxFmt fmt, c
   if (st.depthUpdate && !samples_copy())
     return;
   const auto& m = st.pnMtx[st.currentPnMtx / 3];
-  std::fprintf(stderr, "[rt] draw copy %llu: proj %d blend %d src %d dst %d zwrite %d zcmp %d zfunc %d colour %d alpha %d copy %d stages %u gens %u verts %u cull %d rule %d tex %p at %.1f %.1f %.1f\n",
+  std::fprintf(stderr, "[rt] draw copy %llu: proj %d blend %d src %d dst %d zwrite %d zcmp %d zfunc %d colour %d alpha %d copy %d stages %u gens %u verts %u cull %d tex %p at %.1f %.1f %.1f\n",
                static_cast<unsigned long long>(s_copyNow), int(st.projType), int(st.blendMode), int(st.blendFacSrc), int(st.blendFacDst), int(st.depthUpdate), int(st.depthCompare), int(st.depthFunc),
-               int(st.colorUpdate), int(st.alphaUpdate), int(samples_copy()), st.numTevStages, st.numTexGens, vtxCount, int(st.cullMode), int(is_game_shadow()), st.numTevStages > 0 && st.tevStages[0].texMapId < MaxTextures ? st.textures[st.tevStages[0].texMapId].texObj.data : nullptr, m.pos.m0.w(), m.pos.m1.w(), m.pos.m2.w());
+               int(st.colorUpdate), int(st.alphaUpdate), int(samples_copy()), st.numTevStages, st.numTexGens, vtxCount, int(st.cullMode), st.numTevStages > 0 && st.tevStages[0].texMapId < MaxTextures ? st.textures[st.tevStages[0].texMapId].texObj.data : nullptr, m.pos.m0.w(), m.pos.m1.w(), m.pos.m2.w());
 }
 static std::uint64_t s_stateKeyNow = 0;  // this draw's, while it's captured: on the stream's thread
 static bool s_keyLater = false;  // AURORA_RT_CAPTURE_ASYNC=1: this draw's state key is for its packet's translation to work out
