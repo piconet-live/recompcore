@@ -223,6 +223,7 @@ struct Tuning {
   float reflectCap = 0.25f;  // the most reflection strength a draw takes (AURORA_RT_REFLECT_CAP; the look's)
   std::uint32_t maxLights = 16;
   float lightMaxSize = 40.f, lightMinBright = 0.07f, lightMerge = 8.f, lightFull = 2.f;
+  bool ownLightFull = false;  // AURORA_RT_OWN_LIGHT_FULL=1 (a look, off by default): a machine's one light (its flames merged) keeps its whole strength, no cap of 1.5
   // Glowing surfaces: on when texMeans is given. The size where small lights end is where these begin.
   const float (*texMeans)[4] = nullptr;
   std::uint32_t texCount = 0, maxGlows = 64, glowPerDraw = 0;  // glowPerDraw: most lights one draw may hold, 0 no limit
@@ -435,7 +436,7 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
     if (out.lights.size() == t.maxLights)
       break;
     const float k = q.weight / t.lightFull;
-    const float strength = std::min(k, 1.5f);
+    const float strength = q.owner != 0 && t.ownLightFull ? k : std::min(k, 1.5f);
     out.lights.push_back({{q.pos[0], q.pos[1], q.pos[2]}, {q.colour[0] * strength, q.colour[1] * strength, q.colour[2] * strength},
                           std::clamp(std::sqrt(k), 0.25f, 1.25f), q.owner});
     out.machineLights += q.owner != 0 ? 1 : 0;

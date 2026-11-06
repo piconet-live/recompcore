@@ -1211,6 +1211,11 @@ void run_rules(live::Job& j) {
       tuning.maxGlows = static_cast<u32>(std::atoi(most));
   }
   tuning.reflectCap = s_reflectCap;
+  static const bool ownLightFull = [] {
+    const char* v = std::getenv("AURORA_RT_OWN_LIGHT_FULL");
+    return v != nullptr && std::atof(v) != 0;
+  }();
+  tuning.ownLightFull = ownLightFull;
   // AURORA_RT_HUD_SKIP=1 (off by default): cards turned to the picture, the game's overlay in the world (the place markers), are left out of every ray but the
   // camera's (rt_rules.hpp faces_picture). AURORA_RT_HUD_LOG=1: each such draw on stderr, a line each, every 30th copy, and the count of copies that had any
   static const bool overlayApart = [] {
