@@ -445,6 +445,8 @@ struct GXState {
   void clearVtxSizeCache() { lastVtxFmt = GX_MAX_VTXFMT; }
 };
 extern GXState g_gxState;
+// The game's draw mark the stream set last (GX_AURORA_SET_DRAW_TAG; aurora_present.h): the stream's thread; a copy to the XFB clears it
+extern u32 g_drawTag;
 struct ShaderInfo;
 
 void initialize() noexcept;

@@ -331,6 +331,7 @@ struct Packet {
   Mat3x4<float> texMtx[MaxUv], ptTexMtx[MaxUv];
   u32 currentPnMtx;
   u32 gameLit;  // bit c: the game asked for lights on colour channel c (kept apart from AURORA_RT_GAME_LIGHT=0, which turns them off in the state)
+  u32 tag;      // the game's draw mark (g_drawTag)
 };
 
 u32 triangle_vertices(GXPrimitive prim, u32 n) {
@@ -489,6 +490,7 @@ void translate(const Packet& st, DrawRec& d, Vertex* outVerts) noexcept {
   d.blendMode = st.blendMode, d.blendSrc = st.blendFacSrc, d.blendDst = st.blendFacDst;
   d.depthUpdate = st.depthUpdate, d.depthCompare = st.depthCompare, d.cull = st.cullMode, d.colorUpdate = st.colorUpdate;
   d.prim = prim, d.vtxCount = vtxCount;
+  d.tag = st.tag;
   d.fogType = st.fog.type, d.fog[0] = st.fog.a, d.fog[1] = st.fog.b, d.fog[2] = st.fog.c;
   for (int i = 0; i < 4; ++i)
     d.fogColour[i] = st.fog.color[i];
@@ -1821,6 +1823,7 @@ static void make_packet(u8* room, const size_t size, const u32 stages, const u32
                              : (st.colorChannelConfig[GX_COLOR0].lightingEnabled ? 1u : 0u) | (st.colorChannelConfig[GX_COLOR1].lightingEnabled ? 2u : 0u);
   p.stateKey = s_stateKeyNow;
   p.keyLater = s_keyLater ? 1u : 0u;
+  p.tag = g_drawTag;
   std::memcpy(room + at, vertices, rawBytes);
 }
 

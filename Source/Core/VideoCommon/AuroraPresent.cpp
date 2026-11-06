@@ -23,6 +23,7 @@
 #include "Common/StringUtil.h"
 #include "Core/Config/GraphicsSettings.h"
 #include "VideoCommon/VideoConfig.h"
+#include "Core/HW/GPFifo.h"
 #include "Core/HW/Memmap.h"
 #include "Core/System.h"
 #include "VideoCommon/AbstractGfx.h"
@@ -179,6 +180,23 @@ std::deque<Between> s_between;
 float s_cut_fraction = 0;
 u64 s_cut_position = 0;
 
+// NoteMark's, oldest first: the stream's byte position at the mark and its tag. The CPU's thread adds, the GPU thread places.
+struct Mark
+{
+  u64 position;
+  u32 tag;
+};
+constexpr size_t MOST_MARKS = 4096;  // a frame has about 4 a machine; more waiting means none is being placed
+constexpr u16 SET_DRAW_TAG = 0x0060;  // GX_AURORA's subcommand (GXRuntime's GXAurora.h GX_AURORA_SET_DRAW_TAG), a u32 after it
+constexpr u8 GX_AURORA_COMMAND = 0x50;
+std::mutex s_marks_lock;
+std::deque<Mark> s_marks;
+std::atomic<u64> s_mark_first{~u64{0}};      // the oldest waiting mark's position: the GPU thread's cheap look
+std::atomic<u64> s_linked_bursts{0};         // the CPU's: bursts written to the FIFO the GPU reads, since the boot
+u64 s_read_bytes = 0;                        // the GPU thread's: bytes of the bursts read, since the boot
+std::atomic<u64> s_marks_noted{0}, s_marks_merged{0}, s_marks_dropped{0};
+u64 s_marks_exact = 0, s_marks_late = 0, s_marks_inside = 0;  // the GPU thread's: placed at a command's edge, before, inside
+
 #ifdef _WIN32
 HMODULE s_module = nullptr;
 template <typename T>
@@ -318,7 +336,11 @@ std::string MakeReport()
                      st.failed ? "; Aurora could not start" : "",
                      s_bad_cuts ? fmt::format("; {} frame cuts outside the stream", s_bad_cuts) : "",
                      fmt::format("; {} display lists put in place of their calls ({} KB), {} cut short", s_lists,
-                                 s_list_bytes / 1024, s_cut_lists));
+                                 s_list_bytes / 1024, s_cut_lists)) +
+         fmt::format("; draw marks: {} noted ({} at the place of the one before, {} dropped), {} placed at their command's edge, "
+                     "{} later, {} inside a command",
+                     s_marks_noted.load(), s_marks_merged.load(), s_marks_dropped.load(), s_marks_exact, s_marks_late,
+                     s_marks_inside);
 }
 
 // Aurora's thread ended (it reads the guest's RAM: before the RAM goes), the report kept.
@@ -417,6 +439,73 @@ void Redraw(const RedrawRequest* request)
     s_lib.redraw(request);
 }
 
+void OnBurstWritten(bool linked)
+{
+  if (linked)
+    s_linked_bursts.fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteMark(u32 tag)
+{
+  if (!s_on.load(std::memory_order_relaxed))
+    return;
+  auto& system = Core::System::GetInstance();
+  const u64 at = s_linked_bursts.load(std::memory_order_relaxed) * GPFifo::GATHER_PIPE_SIZE +
+                 system.GetGPFifo().GetGatherPipeCount();
+  s_marks_noted.fetch_add(1, std::memory_order_relaxed);
+  std::lock_guard guard(s_marks_lock);
+  if (!s_marks.empty() && s_marks.back().position == at)
+  {
+    s_marks.back().tag = tag;  // nothing drawn between the two: the later holds
+    s_marks_merged.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  if (s_marks.size() >= MOST_MARKS)
+  {
+    s_marks_dropped.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  s_marks.push_back({at, tag});
+  if (s_marks.size() == 1)
+    s_mark_first.store(at, std::memory_order_relaxed);
+}
+
+namespace
+{
+// OnCommandEnd: every mark up to the end of the command just read goes into Aurora's bytes: before the command when its
+// place is at or before the command's start (it was noted before the command was written), else after it. `end`: the
+// command's end in the stream; `end_at`: the same place in s_pending; `occupies`: the command's bytes there (a list's
+// in place of its call).
+void PlaceMarks(u64 end, size_t end_at, u32 size, size_t occupies)
+{
+  const u64 start = end - size;
+  size_t start_at = end_at - occupies;
+  std::lock_guard guard(s_marks_lock);
+  while (!s_marks.empty() && s_marks.front().position <= end)
+  {
+    const Mark m = s_marks.front();
+    s_marks.pop_front();
+    const u8 bytes[7] = {GX_AURORA_COMMAND, static_cast<u8>(SET_DRAW_TAG >> 8), static_cast<u8>(SET_DRAW_TAG & 0xFF),
+                         static_cast<u8>(m.tag >> 24), static_cast<u8>(m.tag >> 16), static_cast<u8>(m.tag >> 8),
+                         static_cast<u8>(m.tag)};
+    if (m.position <= start)
+    {
+      s_pending.insert(s_pending.begin() + start_at, bytes, bytes + sizeof(bytes));
+      start_at += sizeof(bytes);
+      end_at += sizeof(bytes);
+      ++(m.position == start ? s_marks_exact : s_marks_late);
+    }
+    else
+    {
+      s_pending.insert(s_pending.begin() + end_at, bytes, bytes + sizeof(bytes));
+      end_at += sizeof(bytes);
+      ++(m.position == end ? s_marks_exact : s_marks_inside);
+    }
+  }
+  s_mark_first.store(s_marks.empty() ? ~u64{0} : s_marks.front().position, std::memory_order_relaxed);
+}
+}  // namespace
+
 void NoteBetween(u64 position, float fraction)
 {
   if (!s_started)
@@ -438,6 +527,7 @@ bool On()
 
 void OnBurstRead(const u8* bytes, u32 size)
 {
+  s_read_bytes += size;  // (every burst, Aurora on or not: the marks' places count from the boot, as the CPU's bursts do)
   if (!s_on.load(std::memory_order_relaxed))
     return;
   if (!s_started)
@@ -449,6 +539,8 @@ void OnBurstRead(const u8* bytes, u32 size)
   HandoffTimer timer;
   s_pending.insert(s_pending.end(), bytes, bytes + size);
   s_fed_end = bytes + size;
+  if (s_read_bytes > s_mark_first.load(std::memory_order_relaxed))
+    g_pending = true;  // a mark's place has been read: the commands from here on are looked at (OnCommandEnd)
 }
 
 void OnXFBEntry(const RcTcacheEntry& entry)
@@ -522,6 +614,16 @@ void OnCommandEnd(const u8* data, u32 size)
                       static_cast<size_t>(s_fed_end - data) <= s_pending.size();
   if (inside)
     tail = static_cast<size_t>(s_fed_end - end);
+  // the marks' look goes on while a mark's place lies in what was read
+  struct Rearm
+  {
+    ~Rearm()
+    {
+      if (s_read_bytes > s_mark_first.load(std::memory_order_relaxed))
+        g_pending = true;
+    }
+  } rearm;
+  size_t occupies = size;  // the command's bytes in s_pending: a list's in place of its call
   if (s_list)
   {
     if (FzgxFifoTest::On())
@@ -555,12 +657,15 @@ void OnCommandEnd(const u8* data, u32 size)
       const size_t at = s_pending.size() - tail - size;
       s_pending.erase(s_pending.begin() + at, s_pending.begin() + at + size);
       s_pending.insert(s_pending.begin() + at, s_list, s_list + s_list_size);
+      occupies = s_list_size;
       ++s_lists;
       s_list_bytes += s_list_size;
     }
     s_list = nullptr;
     s_list_size = 0;
   }
+  if (inside && s_read_bytes > s_mark_first.load(std::memory_order_relaxed))
+    PlaceMarks(s_read_bytes - tail, s_pending.size() - tail, size, occupies);
   if (!s_cut)
     return;
   s_cut = false;

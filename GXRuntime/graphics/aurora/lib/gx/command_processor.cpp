@@ -29,6 +29,10 @@
 #include <utility>
 #include <vector>
 
+namespace aurora::gx {
+u32 g_drawTag = 0;
+} // namespace aurora::gx
+
 namespace aurora::gx::fifo {
 // set_drawing_off (Patch 25)
 bool g_drawingOff = false;
@@ -1109,6 +1113,8 @@ void handle_aurora(ByteReader& reader) noexcept {
       g_gxState.clamp = clamp;
       g_gxState.dirty |= DirtyPipeline;
     }
+  } else if (subCmd == GX_AURORA_SET_DRAW_TAG) {
+    g_drawTag = reader.read<u32>();
   } else if (subCmd == GX_AURORA_SET_DRAWS_BLOCKING) {
     const bool blocking = reader.read<u8>() != 0;
     if (g_gxState.drawsBlocking != blocking) {

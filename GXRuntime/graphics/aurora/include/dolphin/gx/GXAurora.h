@@ -99,6 +99,13 @@ extern "C" {
 #define GX_AURORA_SET_DRAWS_BLOCKING 0x0042
 
 /**
+ * The game's draw marks (the host's, never the game's own bytes: the emulator's feed puts them into the stream it hands
+ * Aurora, aurora_present.h): the object the following draws are, until the next mark. Followed by a u32 tag (bits 0-7:
+ * 1 + the machine, 0 none; bits 8-15: the kind, aurora_present.h AURORA_TAG_*). A display copy to the XFB clears it.
+ */
+#define GX_AURORA_SET_DRAW_TAG 0x0060
+
+/**
  * Asynchronous readback of EFB points.
  *
  * Command format:

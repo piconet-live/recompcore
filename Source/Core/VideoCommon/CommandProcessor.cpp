@@ -22,6 +22,7 @@
 #include "VideoCommon/FzgxFifoTest.h"
 #include "Core/System.h"
 #include "VideoCommon/Fifo.h"
+#include "VideoCommon/AuroraPresent.h"
 #include "VideoCommon/FrameRedraw.h"
 
 namespace CommandProcessor
@@ -344,6 +345,8 @@ void CommandProcessorManager::GatherPipeBursted()
 {
   // FrameRedraw: the command stream's position, linked or not (a host's request is keyed by it)
   VideoCommon::FrameRedraw::OnBurstWritten();
+  // AuroraPresent's draw marks: the bytes written to the FIFO the GPU reads (a display list being built is not)
+  VideoCommon::AuroraPresent::OnBurstWritten(m_cp_ctrl_reg.GPLinkEnable != 0);
   SetCPStatusFromCPU();
 
   auto& processor_interface = m_system.GetProcessorInterface();
