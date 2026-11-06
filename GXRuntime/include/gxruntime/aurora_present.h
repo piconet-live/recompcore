@@ -156,6 +156,7 @@ AURORA_PRESENT_API void aurora_present_redraw(const AuroraRedrawRequest* request
 // the machine, 1 + its Burner record's slot in the game's pool (one record a nozzle of the machine's .fmi), 0 none.
 #define AURORA_TAG_BODY 1    /* CarDisp: the machine's body, pilot and parts */
 #define AURORA_TAG_BURNER 2  /* the burner's draw: one engine's flames */
+#define AURORA_TAG_STAR 3    /* inside a burner's draw, its star (the emitter at [lbl_1_bss_38458+8]+0xB8): the burner's bits as well */
 // The GPU thread, before aurora_present_frame: the read position its XFB copy was at.
 AURORA_PRESENT_API void aurora_present_frame_at(uint64_t position);
 // Any one thread: the newest picture finished since the last take (1), none (0), or -1 once Aurora has stopped for

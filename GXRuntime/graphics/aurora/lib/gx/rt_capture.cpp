@@ -43,7 +43,7 @@ bool g_capturing = false;
 bool g_noHud = false;
 bool g_live = false;
 bool g_hook = false;
-static float s_starFrom = 4.f;  // AURORA_RT_ENGINE_STAR_FROM: the star's size (world units) from which is_engine_star takes it; StarGrown by default
+static float s_starFrom = 4.f;  // AURORA_RT_ENGINE_STAR_FROM: the star's size (world units) from which is_engine_star takes it
 static bool s_seenPerspective = false;
 static bool s_motionOn = false;  // AURORA_RT_DENOISE=1: motion data from the draws (rt_motion.hpp)
 
@@ -243,7 +243,7 @@ void start() noexcept {
   if (const char* v = std::getenv("AURORA_RT_DENOISE"); v != nullptr && v[0] == '1')
     s_motionOn = true;
   // (the game's own machine shadow with rays on: the runner keeps the game from drawing it, port/core/src/game_shadow.h)
-  // with our own light: the star the game puts on far machines' engines, to keep them readable, looks out of place. Off by default
+  // with our own light: the star the game puts on far machines' engines (by its mark, is_engine_star), to keep them readable, looks out of place. Off by default
   if (g_live && std::getenv("AURORA_RT_LIGHTING") != nullptr) {
     const char* v = std::getenv("AURORA_RT_NO_ENGINE_STAR");
     g_noEngineStar = v != nullptr && v[0] == '1';
@@ -1633,70 +1633,19 @@ static bool draw_shape(const GXVtxFmt fmt, const u16 vtxCount, const u8* data, D
   out.facing = ln > 0 ? std::fabs(nn[2]) / ln : 0.f;
   return true;
 }
-// A texture whose alpha is a star: thin bright arms along its middle row and column, dark between them. Read on the ring at a quarter
-// to nearly half its size: the arms' mean against the diagonals' mean at the same radius. A round glow is the same both ways; smoke
-// and flame have no arms. Worked out once a texture, from its own pixels.
-static bool star_alpha(const GXTexObj_& in) noexcept {
-  static std::map<std::tuple<const void*, u32, u32, u32>, bool> known;  // what each texture's pixels said, not a list of textures
-  GXTexObj_ obj = in;
-  if (!recomp::resolve_texture_data(obj) || obj.data == nullptr)
-    return false;
-  const u32 w = obj.width(), h = obj.height(), f = obj.format();
-  const auto key = std::make_tuple(obj.data, w, h, f);
-  if (const auto it = known.find(key); it != known.end())
-    return it->second;
-  bool star = false;
-  // square, small, and not a palette texture (whose colours need a table load to read)
-  if (w == h && w >= 16 && w <= 128 && f != GX_TF_C4 && f != GX_TF_C8 && f != GX_TF_C14X2) {
-    const size_t bytes = GXGetTexBufferSize(static_cast<u16>(w), static_cast<u16>(h), f, GX_FALSE, 0);
-    const auto conv = gfx::convert_texture(f, w, h, 1, {static_cast<const u8*>(obj.data), bytes});
-    if (conv.data.size() >= size_t(w) * h * 4) {
-      const u8* px = conv.data.data();
-      const auto alpha = [&](float x, float y) {
-        const int xi = std::clamp(static_cast<int>(x), 0, static_cast<int>(w) - 1), yi = std::clamp(static_cast<int>(y), 0, static_cast<int>(h) - 1);
-        return px[(size_t(yi) * w + xi) * 4 + 3] / 255.f;
-      };
-      const float c = (w - 1) * 0.5f;
-      float arms = 0, diag = 0;
-      int k = 0;
-      for (float r = w * 0.25f; r <= w * 0.45f; r += 1.f, ++k) {
-        // the two pixels either side of the middle line, as the middle of an even texture falls between them
-        arms += (alpha(c + r, c - 0.5f) + alpha(c + r, c + 0.5f) + alpha(c - r, c - 0.5f) + alpha(c - r, c + 0.5f) + alpha(c - 0.5f, c + r) +
-                 alpha(c + 0.5f, c + r) + alpha(c - 0.5f, c - r) + alpha(c + 0.5f, c - r)) / 8.f;
-        const float d = r * 0.7071f;
-        diag += (alpha(c + d, c + d) + alpha(c - d, c + d) + alpha(c + d, c - d) + alpha(c - d, c - d)) / 4.f;
-      }
-      arms /= std::max(k, 1), diag /= std::max(k, 1);
-      star = arms > 0.15f && arms > diag * 4.f;
-    }
-  }
-  known.emplace(key, star);
-  return star;
-}
 bool g_noEngineStar = false;
 std::atomic<u64> g_starsSkipped{0};
-// The game's star on a far machine's engine, from the draw alone: an additive sprite (one quad turned square to the view, writing no
-// depth) whose texture's alpha is a star (star_alpha), and that the game has grown with distance to keep it readable: at least
-// StarGrown across in the world (twice the largest engine glow, which keeps its own size) and a set share of its distance. Near the
-// camera the star keeps its own size and stays, as do glows, flames, smoke and sparks (round, cloudy or lines). Picture only.
-// The game holds the star near one size on screen at every distance (across about a quarter of its distance: 1.5 at 6 units, 7.7 at 25,
-// 18 at 64), so StarGrown alone says how far away a machine must be to lose it: about 4 times StarGrown. 4 (the first rule) took the stars of
-// machines just ahead, the original's lens flare; AURORA_RT_ENGINE_STAR_FROM=<size> moves the line out, so only far machines lose it.
-constexpr float StarGrown = 4.f, StarShareOfDistance = 0.05f;
-bool is_engine_star(const GXPrimitive prim, const GXVtxFmt fmt, const u16 vtxCount, const u8* data) noexcept {
-  const auto& st = g_gxState;
-  if (vtxCount != 4 || (prim != GX_QUADS && prim != GX_TRIANGLESTRIP && prim != GX_TRIANGLEFAN) || st.projType != GX_PERSPECTIVE ||
-      st.blendMode != GX_BM_BLEND || st.blendFacDst != GX_BL_ONE || st.depthUpdate || !st.colorUpdate || st.numTevStages == 0)
-    return false;
-  const u32 map = st.tevStages[0].texMapId;
-  if (map >= MaxTextures)
+// The game's star on a machine's engine, by the game's own mark: the burner draw (fn_1_98F28) draws it as two sprites from the
+// emitter at [lbl_1_bss_38458+8]+0xB8, which the runner marks as the burner's star (sites_marks.py, kind TagStar). The game draws it
+// for a burner whose strength (record +0x74) is over 1.2 and whose nozzle faces the camera, at every distance: grown with the
+// distance to one size on screen (across about a quarter of its distance), dimmer as 1/distance past 20 x (strength - 1.2). The
+// game has no far-only branch, so the line stays ours: from AURORA_RT_ENGINE_STAR_FROM world units across (24 in the switch set:
+// a burner about 100 units away whose nozzle faces the camera), so only far machines lose it; near ones keep the original's lens flare. Picture only.
+bool is_engine_star(const GXPrimitive /*prim*/, const GXVtxFmt fmt, const u16 vtxCount, const u8* data) noexcept {
+  if (tag_kind(g_drawTag) != TagStar)
     return false;
   DrawShape sh{};
-  if (!draw_shape(fmt, vtxCount, data, sh) || sh.facing < 0.95f || sh.mid[2] >= 0.f)
-    return false;
-  if (sh.extent < s_starFrom || sh.extent < -sh.mid[2] * StarShareOfDistance)
-    return false;
-  if (!star_alpha(st.textures[map].texObj))
+  if (!draw_shape(fmt, vtxCount, data, sh) || sh.extent < s_starFrom)
     return false;
   g_starsSkipped.fetch_add(1, std::memory_order_relaxed);
   return true;
@@ -1726,10 +1675,10 @@ void note_draw(const u16 vtxCount, const GXPrimitive prim, const GXVtxFmt fmt, c
       const auto& p = st.proj;
       const float cx = dot4(p.m0, sh.mid[0], sh.mid[1], sh.mid[2], 1.f), cy = dot4(p.m1, sh.mid[0], sh.mid[1], sh.mid[2], 1.f), cw = dot4(p.m3, sh.mid[0], sh.mid[1], sh.mid[2], 1.f);
       const GXTexObj_* t = st.numTevStages > 0 && st.tevStages[0].texMapId < MaxTextures ? &st.textures[st.tevStages[0].texMapId].texObj : nullptr;
-      std::fprintf(stderr, "[rt] star copy %llu: blend %d %d %d z %d%d verts %u prim %d mid %.1f %.1f %.1f ext %.2f face %.3f e/z %.4f screen %.3f %.3f tex %ux%u f%u %p star %d rule %d\n",
+      std::fprintf(stderr, "[rt] star copy %llu: blend %d %d %d z %d%d verts %u prim %d mid %.1f %.1f %.1f ext %.2f face %.3f e/z %.4f screen %.3f %.3f tex %ux%u f%u %p mark %#x rule %d\n",
                    static_cast<unsigned long long>(s_copyNow), int(st.blendMode), int(st.blendFacSrc), int(st.blendFacDst), int(st.depthUpdate), int(st.depthCompare), vtxCount, int(prim),
                    sh.mid[0], sh.mid[1], sh.mid[2], sh.extent, sh.facing, sh.extent / std::max(std::fabs(sh.mid[2]), 1e-3f), cw != 0 ? cx / cw * 0.5f + 0.5f : -1.f,
-                   cw != 0 ? 0.5f - cy / cw * 0.5f : -1.f, t ? t->width() : 0, t ? t->height() : 0, t ? t->format() : 0, t ? t->data : nullptr, t ? int(star_alpha(*t)) : 0,
+                   cw != 0 ? 0.5f - cy / cw * 0.5f : -1.f, t ? t->width() : 0, t ? t->height() : 0, t ? t->format() : 0, t ? t->data : nullptr, g_drawTag,
                    int(is_engine_star(prim, fmt, vtxCount, data)));
     }
   }

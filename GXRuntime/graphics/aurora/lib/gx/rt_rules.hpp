@@ -224,7 +224,7 @@ inline bool soft_alpha(const DrawRec& d, const Vertex* verts, const float (*texS
 
 struct Tuning {
   float reflectCap = 0.25f;  // the most reflection strength a draw takes (AURORA_RT_REFLECT_CAP; the look's)
-  std::uint32_t maxLights = 16;
+  std::uint32_t maxLights = 16;  // unmarked lights (a machine's are all kept)
   float lightMaxSize = 40.f, lightMinBright = 0.07f, lightMerge = 8.f, lightFull = 2.f;
   // Glowing surfaces: on when texMeans is given. The size where small lights end is where these begin.
   const float (*texMeans)[4] = nullptr;
@@ -431,8 +431,9 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
   };
   light_picks(draws, count, inMain, out.picks, t.lightMaxSize, t.lightMinBright);
   merge_lights(out.picks, t.lightMerge, out.merged);
-  // the nearest few sources, with their strengths: colour by strength (a source at most 1.5), reach by the root of it, so a spark lights
-  // close by and a flame further. A source is a machine with all its lights (its burners), or an unmarked light: maxLights of them
+  // with their strengths: colour by strength (a light, or a machine's together, at most 1.5), reach by the root of it, so a spark lights close by and a flame further.
+  // Every machine's lights (its burners; at most 30 machines: 75 lights at the start of m33's 30), and the nearest maxLights unmarked ones.
+  // (Build l kept the 16 nearest lights, each its 8-unit merge; with a light a burner 16 would leave 15% of the machines it lit dark.)
   std::sort(out.merged.begin(), out.merged.end(), [](const LightPick& a, const LightPick& b) {
     return a.pos[0] * a.pos[0] + a.pos[1] * a.pos[1] + a.pos[2] * a.pos[2] < b.pos[0] * b.pos[0] + b.pos[1] * b.pos[1] + b.pos[2] * b.pos[2];
   });
@@ -442,15 +443,15 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
   std::array<float, 256> machineWeight{};
   for (const LightPick& q : out.merged)
     machineWeight[std::min(q.owner, 255u)] += q.owner != 0 ? q.weight : 0.f;
-  std::uint64_t lit = 0;  // the machines taken (bit owner)
-  std::uint32_t sources = 0;
+  std::uint64_t lit = 0;  // the machines lit (bit owner)
+  std::uint32_t unmarked = 0;
   for (const LightPick& q : out.merged) {
-    const std::uint64_t bit = q.owner != 0 ? 1ull << std::min(q.owner, 63u) : 0;
-    if ((lit & bit) == 0) {
-      if (sources == t.maxLights)
+    if (q.owner == 0) {
+      if (unmarked == t.maxLights)
         continue;
-      ++sources, lit |= bit;
+      ++unmarked;
     }
+    lit |= q.owner != 0 ? 1ull << std::min(q.owner, 63u) : 0;
     const float all = q.owner != 0 ? machineWeight[std::min(q.owner, 255u)] : q.weight;
     const float k = all / t.lightFull;
     const float strength = std::min(k, 1.5f) * q.weight / all;
