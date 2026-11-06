@@ -25,7 +25,8 @@ struct EngineLight {
 // mine's blast are the same to it. Colour from the draw, strength its brightness by its size. Lights follow what the game has:
 // the draws the game marked as one burner of a machine (the draw marks: one Burner record, one nozzle of the machine's .fmi)
 // become that burner's light, so a machine with three engines has three; a machine's other marked glows (its body's) one more;
-// never merged across burners or machines. Unmarked draws (a course's lamps, sparks, blasts) within MergeR of one another become one.
+// never merged across burners or machines. Together they are as strong as one light of all the machine's flames (build_frame).
+// Unmarked draws (a course's lamps, sparks, blasts) within MergeR of one another become one.
 struct LightPick {
   float pos[3], colour[3], weight, extent, bright;
   std::uint32_t owner;   // EngineLight::owner
@@ -430,12 +431,17 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
   };
   light_picks(draws, count, inMain, out.picks, t.lightMaxSize, t.lightMinBright);
   merge_lights(out.picks, t.lightMerge, out.merged);
-  // the nearest few sources, with their strengths: colour by strength (each light at most 1.5), reach by the root of it, so a spark lights
+  // the nearest few sources, with their strengths: colour by strength (a source at most 1.5), reach by the root of it, so a spark lights
   // close by and a flame further. A source is a machine with all its lights (its burners), or an unmarked light: maxLights of them
   std::sort(out.merged.begin(), out.merged.end(), [](const LightPick& a, const LightPick& b) {
     return a.pos[0] * a.pos[0] + a.pos[1] * a.pos[1] + a.pos[2] * a.pos[2] < b.pos[0] * b.pos[0] + b.pos[1] * b.pos[1] + b.pos[2] * b.pos[2];
   });
   out.lights.clear();
+  // A machine's lights together are as strong as one light of all its flames (at most 1.5, as any light), shared among its burners by each
+  // one's own flames (their weight); each reaches as that one light would
+  std::array<float, 256> machineWeight{};
+  for (const LightPick& q : out.merged)
+    machineWeight[std::min(q.owner, 255u)] += q.owner != 0 ? q.weight : 0.f;
   std::uint64_t lit = 0;  // the machines taken (bit owner)
   std::uint32_t sources = 0;
   for (const LightPick& q : out.merged) {
@@ -445,8 +451,9 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
         continue;
       ++sources, lit |= bit;
     }
-    const float k = q.weight / t.lightFull;
-    const float strength = std::min(k, 1.5f);
+    const float all = q.owner != 0 ? machineWeight[std::min(q.owner, 255u)] : q.weight;
+    const float k = all / t.lightFull;
+    const float strength = std::min(k, 1.5f) * q.weight / all;
     out.lights.push_back({{q.pos[0], q.pos[1], q.pos[2]}, {q.colour[0] * strength, q.colour[1] * strength, q.colour[2] * strength},
                           std::clamp(std::sqrt(k), 0.25f, 1.25f), q.owner});
     out.machineLights += q.owner != 0 ? 1 : 0;
