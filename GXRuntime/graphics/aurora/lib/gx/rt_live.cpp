@@ -1534,16 +1534,22 @@ void between_row(const u64* t6) {
 
 // A true frame whose rays took more than SlowTrueMs on the GPU (at 240 a refresh is 4.17 ms: the rays and the frame's raster then
 // pass the room a field leaves beside its three pictures between), one line each, step-stamped, so that a player's log places it and
-// names the part that grew. At most SlowTrueLines lines; the rest counted for the stop's line. (The m39 hunt, glitch-2min.md.)
+// names the part that grew. At most SlowTrueLines lines a minute (a moment late in a race still gets its line); all counted for the report's
+// line. (The m39 hunt, glitch-2min.md.)
 constexpr double SlowTrueMs = 8.0;
-constexpr u32 SlowTrueLines = 100;
-u64 g_slowTrue = 0;
+constexpr u32 SlowTrueLines = 10;
+u64 g_slowTrue = 0, g_slowTrueThisMinute = 0;
+long long g_slowTrueMinute = -1;
 double g_slowTrueMost = 0;
 void slow_true_row(const Slot& s, double all, double build, double light, double denoise, double reflect, double compose) {
   if (all <= SlowTrueMs)
     return;
   g_slowTrueMost = std::max(g_slowTrueMost, all);
-  if (g_slowTrue++ >= SlowTrueLines)
+  ++g_slowTrue;
+  const long long minute = std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  if (minute != g_slowTrueMinute)
+    g_slowTrueMinute = minute, g_slowTrueThisMinute = 0;
+  if (g_slowTrueThisMinute++ >= SlowTrueLines)
     return;
   char step[16] = "?";
   if (s.step != 0xFFFFFFFFu)
@@ -1817,8 +1823,8 @@ void run_rays(Job& job) {
     world_report(n);
     if (g_noEngineStar)
       std::fprintf(stderr, "[rt] engine stars not drawn: %llu so far\n", static_cast<unsigned long long>(g_starsSkipped.load(std::memory_order_relaxed)));
-    if (g_slowTrue > SlowTrueLines)  // (each of the first ones has a line of its own)
-      std::fprintf(stderr, "[rt] slow true frames (rays over %.0f ms on the GPU): %llu so far, the first %u with a line each; most %.2f ms\n", SlowTrueMs,
+    if (g_slowTrue != 0)
+      std::fprintf(stderr, "[rt] slow true frames (rays over %.0f ms on the GPU): %llu so far, at most %u lines a minute; most %.2f ms\n", SlowTrueMs,
                    static_cast<unsigned long long>(g_slowTrue), SlowTrueLines, g_slowTrueMost);
     g.msLight = g.msDenoise = g.motionAgree = g.motionOwn = 0;
     g.count = 0, g.gpuTimed = 0, g.msGpuMost = 0, g.msGpu = g.msTrace = g.msBuild = g.msRules = g.msTranslate = g.msComposeWait = 0, g.tris = 0, g.lightsSeen = 0, g.lightsMost = 0, g.picks = g.merged = g.glowsSeen = g.glowPieces = g.glowDraws = g.glowTop = 0;

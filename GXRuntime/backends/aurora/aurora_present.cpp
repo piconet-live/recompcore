@@ -222,11 +222,20 @@ constexpr double kLateMs = 5.0;  // past its time by more than this, a picture b
 
 // Step-stamped event lines, so that a player's log places a moment the picture may have stumbled (the m39 hunt, glitch-2min.md):
 // a frame decoded and not drawn to catch up, a picture between slower than a refresh at 240, a true frame late on the GPU, a true
-// frame held for the late pictures before it (AURORA_PACE_EVEN). Each kind its first kEventLines lines; all counted for the stop's line.
+// frame held for the late pictures before it (AURORA_PACE_EVEN). Each kind at most kEventLinesPerMinute lines a minute (so a moment late
+// in a race still gets its line: one cap for the whole run was used up in the first minute, m39 after run); all counted for the stop's line.
 enum EventKind { EvCatchUp, EvSlowPicture, EvLateTrue, EvEvenHold, EvKinds };
-constexpr std::uint64_t kEventLines = 60;
-std::atomic<std::uint64_t> g_events[EvKinds]{};
-bool event_line(EventKind kind) { return g_events[kind].fetch_add(1, std::memory_order_relaxed) < kEventLines; }
+constexpr std::uint64_t kEventLinesPerMinute = 10;
+constexpr double kSlowPictureMs = 8.0;  // a picture between slower than this on the render worker (1269 over a refresh in the m39 run)
+std::atomic<std::uint64_t> g_events[EvKinds]{}, g_events_this_minute[EvKinds]{};
+std::atomic<long long> g_events_minute[EvKinds]{};
+bool event_line(EventKind kind) {
+  g_events[kind].fetch_add(1, std::memory_order_relaxed);
+  const long long minute = std::chrono::duration_cast<std::chrono::minutes>(Clock::now().time_since_epoch()).count();
+  if (g_events_minute[kind].exchange(minute, std::memory_order_relaxed) != minute)
+    g_events_this_minute[kind].store(0, std::memory_order_relaxed);
+  return g_events_this_minute[kind].fetch_add(1, std::memory_order_relaxed) < kEventLinesPerMinute;
+}
 struct StepText {
   char text[16] = "?";
   explicit StepText(std::uint32_t step) {
@@ -351,9 +360,10 @@ bool g_shot_picture = false;
 // pictures stacked behind it and then passed or cut (a jump). Its pictures are timed from when its work was done (even_from), and the
 // next true frame's end waits on Aurora's thread for the late pictures still to come (the debt, at most 3/4 of a field), which each true
 // frame after repays by AURORA_PACE_EVEN_REPAY_US (250): the added latency goes as one picture's step about half a second later.
-// AURORA_PACE_EVEN_LEAST_US (2000): a true frame later than its usual GPU lag by less is on time. Presentation only.
+// AURORA_PACE_EVEN_LEAST_US (4170, a refresh at 240): a true frame later than its usual GPU lag by less is on time (2 ms held 1219 frames for
+// 275 late ones on a busy PC, most of them 2-5 ms late: m39 after run). Presentation only.
 bool g_even = false;
-double g_even_least_ms = 2.0, g_even_repay_ms = 0.25;
+double g_even_least_ms = kFieldMs / 4, g_even_repay_ms = 0.25;
 std::atomic<std::uint64_t> g_true_seq{0};  // the true frame presented last: its submit's number (aurora_timing_true_submit_seq)
 long long g_true_slot = 0, g_last_slot = 0;
 Clock::time_point g_true_at{};
@@ -1107,10 +1117,9 @@ void draw_between(const std::shared_ptr<aurora::gx::redraw::Request>& request, s
     aurora::gx::redraw::test_uncorrected(0);
   }
   const double took = ms(done - began) - pace::g_last_hold_ms;
-  if (!shoot && took > kFieldMs / 4 && event_line(EvSlowPicture))
-    std::fprintf(stderr, "[aurora-present] slow picture between: step %s (copy %llu), picture %zu of %zu: %.2f ms on the render worker (a refresh "
-                 "at 240 is %.2f)\n", StepText(aurora::gx::rt::step_of(copy)).text, static_cast<unsigned long long>(copy), index + 1,
-                 request->pictures.size(), took, kFieldMs / 4);
+  if (!shoot && took > kSlowPictureMs && event_line(EvSlowPicture))
+    std::fprintf(stderr, "[aurora-present] slow picture between: step %s (copy %llu), picture %zu of %zu: %.2f ms on the render worker\n",
+                 StepText(aurora::gx::rt::step_of(copy)).text, static_cast<unsigned long long>(copy), index + 1, request->pictures.size(), took);
   const bool first = aurora::gfx::frame_held() != s->redraw_last_held;
   s->redraw_last_held = aurora::gfx::frame_held();
   auto& cost = slots_on(1) && first ? s->redraw_cost_first_ms : s->redraw_cost_ms;
@@ -1790,9 +1799,9 @@ void run() {
       holds = text;
     }
     if (overlap || n(EvCatchUp) != 0 || n(EvSlowPicture) != 0)
-      std::fprintf(stderr, "[aurora-present] events: catch-ups %llu, slow pictures between %llu, late true frames %llu (most %.2f ms past the usual)%s; "
-                   "a line each for the first %llu of a kind\n", n(EvCatchUp), n(EvSlowPicture), static_cast<unsigned long long>(s->late_true),
-                   s->late_most_ms, holds.c_str(), static_cast<unsigned long long>(kEventLines));
+      std::fprintf(stderr, "[aurora-present] events: catch-ups %llu, slow pictures between (over 8 ms) %llu, late true frames %llu (most %.2f ms past "
+                   "the usual)%s; at most %llu lines of a kind a minute\n", n(EvCatchUp), n(EvSlowPicture), static_cast<unsigned long long>(s->late_true),
+                   s->late_most_ms, holds.c_str(), static_cast<unsigned long long>(kEventLinesPerMinute));
   }
   if (aurora::gx::redraw::g_on) {
     aurora::gfx::render_worker::synchronize();
