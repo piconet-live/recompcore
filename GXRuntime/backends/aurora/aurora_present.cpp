@@ -364,6 +364,7 @@ bool g_shot_picture = false;
 // 275 late ones on a busy PC, most of them 2-5 ms late: m39 after run). Presentation only.
 bool g_even = false;
 double g_even_least_ms = kFieldMs / 4, g_even_repay_ms = 0.25;
+constexpr double kLateLineMs = 2.0;  // a true frame this late or more gets its "late true frame" line (the hold's mark above is apart)
 std::atomic<std::uint64_t> g_true_seq{0};  // the true frame presented last: its submit's number (aurora_timing_true_submit_seq)
 long long g_true_slot = 0, g_last_slot = 0;
 Clock::time_point g_true_at{};
@@ -574,11 +575,10 @@ bool even_from(Clock::time_point now, Clock::time_point& from, double& late_ms) 
     return true;
   if (aurora_timing_true_done_seq() >= seq) {
     const double excess = static_cast<double>(aurora_timing_true_excess_ns()) / 1e6;  // (the newest done's: this one)
-    if (excess >= g_even_least_ms) {
+    if (excess >= kLateLineMs)
       late_ms = excess;
-      if (g_even)
-        from += std::chrono::nanoseconds(static_cast<long long>(excess * 1e6));
-    }
+    if (g_even && excess >= g_even_least_ms)
+      from += std::chrono::nanoseconds(static_cast<long long>(excess * 1e6));
     return true;
   }
   if (!g_even)
@@ -1279,7 +1279,8 @@ void run() {
           s->even_debt_ms = std::max(0.0, s->even_debt_ms - pace::g_even_repay_ms);
           if (s->late_seq != 0 && s->late_seq != s->even_debt_seq && s->late_seq == pace::g_true_seq.load(std::memory_order_relaxed)) {
             s->even_debt_seq = s->late_seq;
-            s->even_debt_ms = std::max(s->even_debt_ms, s->late_ms);
+            if (s->late_ms >= pace::g_even_least_ms)  // (late frames under the mark are only logged)
+              s->even_debt_ms = std::max(s->even_debt_ms, s->late_ms);
           }
           const auto began = Clock::now();
           const auto until = began + std::chrono::microseconds(static_cast<long long>(std::min(s->even_debt_ms, kFieldMs * 0.75) * 1000.0));
