@@ -5,8 +5,6 @@
 #include "gx.hpp"
 #include "look_keys.hpp"
 
-#include <atomic>
-
 namespace aurora::gx::rt {
 extern bool g_neutral;    // AURORA_RT=1: the game's fake reflection stages pass through; rays stand in for them
 extern bool g_gameLightOff;  // AURORA_RT_GAME_LIGHT=0: no game lights in the picture (never anything the game reads)
@@ -18,10 +16,6 @@ extern bool g_capturing;  // this frame's draws are being written (AURORA_RT_CAP
 // AURORA_RT_NO_HUD=1 (for the composite's mask): orthographic draws after the frame's first perspective draw are left out
 extern bool g_noHud;
 bool skip_draw() noexcept;
-// AURORA_RT_NO_ENGINE_STAR=1, with own light (AURORA_RT=1, AURORA_RT_LIGHTING): the game's star sprite on far machines' engines (by the game's mark) not drawn; AURORA_RT_ENGINE_STAR_FROM=<size>: from what size (4 by default)
-extern bool g_noEngineStar;
-extern std::atomic<u64> g_starsSkipped;  // stars is_engine_star took, for the report
-bool is_engine_star(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* data) noexcept;
 void note_draw(u16 vtxCount, GXPrimitive prim, GXVtxFmt fmt, const u8* data) noexcept;
 void start() noexcept;  // reads the switches, once
 

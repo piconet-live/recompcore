@@ -1822,8 +1822,6 @@ void run_rays(Job& job) {
                  static_cast<unsigned long long>(g.lightsMost), g.picks / n, g.merged / n, g.glowsSeen / n, g.glowPieces / n, g.glowDraws / n, g.glowTop / n);
     std::fprintf(stderr, "[rt] the game's marks: machine draws %.1f a frame in the main view (solid with a burner's mark %.2f), lights of a machine %.1f (machines lit %.1f: %.2f lights each, one a burner), glow lights of a machine %.1f\n", g.machineDraws / n, g.burnerSolid / n, g.machineLights / n, g.machinesLit / n, g.machinesLit > 0 ? g.machineLights / g.machinesLit : 0.0, g.machineGlows / n);
     world_report(n);
-    if (g_noEngineStar)
-      std::fprintf(stderr, "[rt] engine stars not drawn: %llu so far\n", static_cast<unsigned long long>(g_starsSkipped.load(std::memory_order_relaxed)));
     if (g_slowTrue != 0)
       std::fprintf(stderr, "[rt] slow true frames (rays over %.0f ms on the GPU): %llu so far, at most %u lines a minute; most %.2f ms\n", SlowTrueMs,
                    static_cast<unsigned long long>(g_slowTrue), SlowTrueLines, g_slowTrueMost);

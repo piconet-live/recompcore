@@ -47,7 +47,7 @@ struct DrawRec {
   StageRec stage[16];
 };
 // A draw's mark, as the game's draw sites gave it (aurora_present.h AURORA_TAG_*)
-constexpr std::uint32_t TagBody = 1, TagBurner = 2, TagStar = 3;  // TagStar: the burner's star (its emitter at +0xB8), with the burner's bits
+constexpr std::uint32_t TagBody = 1, TagBurner = 2;
 inline std::uint32_t tag_machine(std::uint32_t tag) { return tag & 0xFFu; }  // 1 + the machine, 0 none
 inline std::uint32_t tag_kind(std::uint32_t tag) { return (tag >> 8) & 0xFFu; }
 inline std::uint32_t tag_burner(std::uint32_t tag) { return (tag >> 16) & 0xFFu; }  // which of the machine's burners (1 + its record's slot), 0 none
