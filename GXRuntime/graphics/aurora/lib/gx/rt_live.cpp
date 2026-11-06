@@ -121,7 +121,7 @@ struct Slot {
   std::vector<ComPtr<ID3D12Resource>> keep;
   // what this slot's timings belong to, for the time log
   u64 copy = 0;
-  u32 tris = 0, lightCount = 0, uploads = 0, glows = 0, step = 0xFFFFFFFFu;
+  u32 tris = 0, lightCount = 0, uploads = 0, glowsUsed = 0, step = 0xFFFFFFFFu;
   bool between = false;  // its timings are a picture between's
   ComPtr<ID3D12Resource> betweenConstants;
   void* betweenMap = nullptr;
@@ -1551,7 +1551,7 @@ void slow_true_row(const Slot& s, double all, double build, double light, double
   std::fprintf(stderr,
                "[rt] slow true frame: step %s (copy %llu): rays %.2f ms on the GPU (build %.2f, light %.2f, smoothing %.2f, reflections %.2f, "
                "compose %.2f); %u triangles, %u lights, %u glows, %u textures uploaded\n",
-               step, static_cast<unsigned long long>(s.copy), all, build, light, denoise, reflect, compose, s.tris, s.lightCount, s.glows, s.uploads);
+               step, static_cast<unsigned long long>(s.copy), all, build, light, denoise, reflect, compose, s.tris, s.lightCount, s.glowsUsed, s.uploads);
 }
 
 // A slot's last timings, its work done: a picture between's (b row) or a true frame's (t row; before 2026-11-03 phase 9 a true frame's slot
@@ -1719,7 +1719,7 @@ void run_rays(Job& job) {
   s.keep.clear();
   s.between = false;
   s.copy = job.copy, s.tris = static_cast<u32>(job.frame.verts.size() / 3), s.lightCount = static_cast<u32>(job.frame.lights.size()), s.uploads = static_cast<u32>(job.textures.size());
-  s.step = step_of(job.copy), s.glows = 0;
+  s.step = step_of(job.copy), s.glowsUsed = 0;
   RT_HR(s.alloc->Reset());
   RT_HR(s.cl->Reset(s.alloc.Get(), nullptr));
   ID3D12GraphicsCommandList4* cl = s.cl.Get();
@@ -1759,7 +1759,7 @@ void run_rays(Job& job) {
     trace_part(s, job, base, glowCount);
     if (g.failed)
       return;
-    s.glows = glowCount;
+    s.glowsUsed = glowCount;
   }
   D3D12_RESOURCE_BARRIER uav{};
   uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
