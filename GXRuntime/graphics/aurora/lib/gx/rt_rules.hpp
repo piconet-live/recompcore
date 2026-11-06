@@ -255,6 +255,7 @@ struct Frame {
   std::uint32_t glowDraws = 0, glowPieces = 0, glowTopDraw = 0;  // glowTopDraw: lights held by the draw holding most
   const DrawRec* main = nullptr;
   std::uint32_t machineDraws = 0, reflective = 0;  // machineDraws: draws the game marked as a machine's (DrawRec::tag)
+  std::uint32_t burnerSolid = 0;  // of them, solid or see-through (not additive) with a burner's mark: drawn in a burner's span, not its flames
   std::uint32_t machineLights = 0, machineGlows = 0;  // lights and glow lights of a machine (owner)
   std::vector<float> extent;  // each draw's size in the main view
   float largest = 0.f;
@@ -390,7 +391,7 @@ inline bool faces_picture(const DrawRec& d, const Vertex* verts) {
 // The main view is the perspective projection with the most triangles. Sky: the largest see-through shells around the view,
 // by size against the largest in the frame, with no table of courses.
 inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex* verts, const Tuning& t, Frame& out) {
-  out.verts.clear(), out.prevPos.clear(), out.spans.clear(), out.draws.clear(), out.stages.clear(), out.main = nullptr, out.machineDraws = out.reflective = out.machineLights = 0, out.seeFirstVertex = out.layerFirstVertex = out.skyFirstVertex = out.primaryFirstVertex = out.passFirstVertex = 0;
+  out.verts.clear(), out.prevPos.clear(), out.spans.clear(), out.draws.clear(), out.stages.clear(), out.main = nullptr, out.machineDraws = out.reflective = out.machineLights = out.burnerSolid = 0, out.seeFirstVertex = out.layerFirstVertex = out.skyFirstVertex = out.primaryFirstVertex = out.passFirstVertex = 0;
   const auto key = [](const DrawRec& d) { return std::array<int, 2>{static_cast<int>(d.proj[0] * 1000), static_cast<int>(d.proj[5] * 1000)}; };
   std::array<int, 2> best{};
   {
@@ -494,9 +495,14 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
       g.highlight |= 16 | 4;
     // the machine whose draw this is, by the game's own mark: every light of that machine passes it (rt.hlsl engine_light, glow_light), its
     // reflections pass its own flames (trace_reflection), the pictures between move its pixels with it (main's HitMachine)
-    if (g.cls < 3 && (g.highlight & 16) == 0)
+    if (g.cls < 3 && (g.highlight & 16) == 0) {
       g.highlight |= std::min(tag_machine(d.tag), 31u) << 8;
+      // bit 13: the mark is a body's (CarDisp's span), the one draw kind the pictures between move with the machine (rt.hlsl HitMachine)
+      if (tag_machine(d.tag) != 0 && tag_kind(d.tag) == TagBody)
+        g.highlight |= 1u << 13;
+    }
     out.machineDraws += inView && tag_machine(d.tag) != 0 ? 1 : 0;
+    out.burnerSolid += inView && g.cls < 2 && tag_machine(d.tag) != 0 && tag_kind(d.tag) == TagBurner ? 1 : 0;
     if (strength > 0 && inView) {
       ++out.reflective;
       strength = std::min(strength, t.reflectCap);

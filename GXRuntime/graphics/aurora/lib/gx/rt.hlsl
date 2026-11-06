@@ -12,7 +12,7 @@ struct Draw {
   uint stages, firstStage;
   uint cls;       // 0 solid, 1 translucent, 2 additive, 3 ignored
   float strength; // the draw's own reflection strength
-  uint highlight; // bit 0 the game's own shine, 1 glows, 2 outside the depth (takes no light), 3 a blended layer writing no depth, 4 a card turned to the picture (primary rays alone); 8-12: 1 + the machine whose draw it is (the game's draw marks), 0 none
+  uint highlight; // bit 0 the game's own shine, 1 glows, 2 outside the depth (takes no light), 3 a blended layer writing no depth, 4 a card turned to the picture (primary rays alone); 8-12: 1 + the machine whose draw it is (the game's draw marks), 0 none; 13: that mark is a body's
   uint fogType;
   float3 fog;
   float3 fogColour;
@@ -89,7 +89,7 @@ StructuredBuffer<Stage> Stages : register(t5);
 RWTexture2D<float4> Out : register(u0);
 RWTexture2D<float4> Final : register(u1);
 Texture2D<float4> Term : register(t6);
-RWTexture2D<uint> HitMachine : register(u16);  // the machine whose draw main's camera ray hit (Draw.highlight bits 8-12: 1 + the racer, 0 none); between_warp reads it
+RWTexture2D<uint> HitMachine : register(u16);  // the machine whose body main's camera ray hit (body_machine: 1 + the racer, 0 none); between_warp reads it
 StructuredBuffer<GlowLight> Glows : register(t7);
 Texture2D<float4> Tex[] : register(t0, space1);
 SamplerState Linear : register(s0);
@@ -276,7 +276,10 @@ float3 sky_along(float3 dir, float lod) {
   }
   return sum;
 }
-// own: 1 + the machine the reflecting surface is a draw of (Draw.highlight bits 8-12), 0 none
+// A body's machine: 1 + the racer when the draw is in CarDisp's span by the game's marks (Draw.highlight bit 13, bits 8-12), 0 otherwise.
+// Not a burner's: draws found in a burner's span that are no flame are other deferred draws the mark reached (the road's)
+uint body_machine(Draw d) { return (d.highlight & (1u << 13)) != 0 ? (d.highlight >> 8) & 31 : 0; }
+// own: the reflecting surface's body_machine
 float3 trace_reflection(float3 org, float3 dir, float maxLodScale, uint own) {
   float3 sum = 0;
   float through = 1;
@@ -847,7 +850,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         if (surf.a < 0.5) { tmin = t + 0.02; ++whyCard; continue; }
       }
       hitDepth = t;
-      hitMachine = (d.highlight >> 8) & 31;
+      hitMachine = body_machine(d);
       surfT = t;
       if (MAIN_PROBE == 1) break;
       // a card turned to the picture, the game's overlay in the world (AURORA_RT_HUD_SKIP, rt_rules.hpp faces_picture): no light, no reflection; only this ray meets it
@@ -935,7 +938,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             seen = s.a > 0.01 ? s.rgb / s.a : raster;
           } else {
           float3 R = matte_dir(v, N, layer, id.xy);
-          seen = trace_reflection(h.pos + N * 0.03, R, 8.0 / max(P.size.y, 1) * 512.0 / 4.0, (d.highlight >> 8) & 31);
+          seen = trace_reflection(h.pos + N * 0.03, R, 8.0 / max(P.size.y, 1) * 512.0 / 4.0, body_machine(d));
           seen = min(seen, 2.0);
           }
           // with light from rays the surface under the reflection is the one lit by them, or a shaded face goes dark and takes the reflection's colour
@@ -971,7 +974,7 @@ void main(uint3 id : SV_DispatchThreadID) {
           R = normalize(R + j * rough);
           if (dot(R, N) < 0) R = reflect(v, N);
         }
-        float3 seen = trace_reflection(h.pos + N * 0.03, R, 8.0 / max(P.size.y, 1) * 512.0 / 4.0, (d.highlight >> 8) & 31);
+        float3 seen = trace_reflection(h.pos + N * 0.03, R, 8.0 / max(P.size.y, 1) * 512.0 / 4.0, body_machine(d));
         // on road a broad dim surface tints without showing anything: only what stands out of it counts (the neon)
         if (k <= 0) seen *= smoothstep(0.04, 0.5, max(seen.r, max(seen.g, seen.b)));
         // dim only the surface itself, never a flame or glow the raster drew over it
@@ -1095,7 +1098,7 @@ void light_pass(uint3 id : SV_DispatchThreadID) {
       float f0 = 0.04 + MatMetal * layer;
       float fr = (f0 + max(gloss - f0, 0) * pow(1 - cosv, 5)) * shine;
       if (fr > MatReflLeast && !(MATTE_HALF && layer <= 0 && ((id.x + id.y) & 1) != 0))
-        WriteRefl[id.xy] = float4(min(trace_reflection(h.pos + N * 0.03, matte_dir(v, N, layer, id.xy), 8.0 / max(P.size.y, 1) * 512.0 / 4.0 * DP.litScale, (d.highlight >> 8) & 31), 2.0), 1);
+        WriteRefl[id.xy] = float4(min(trace_reflection(h.pos + N * 0.03, matte_dir(v, N, layer, id.xy), 8.0 / max(P.size.y, 1) * 512.0 / 4.0 * DP.litScale, body_machine(d)), 2.0), 1);
     }
     Guide[id.xy] = float4(oct_of(N), -h.pos.z, sunV);
     break;
