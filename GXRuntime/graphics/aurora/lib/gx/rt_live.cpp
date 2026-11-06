@@ -75,7 +75,8 @@ struct Params {
   u32 stableShine;  // bit 0: AURORA_RT_SHINE_STABLE=1; bit 1: t13 holds the picture from before the last blends; bit 2: AURORA_RT_PAIR_GAP=1; bit 3: AURORA_RT_LAYER_PASS=1. The root signature has no room for more words
 };
 
-constexpr u32 Frames = 3, SlotDescriptors = 13, MaxTextures = 8192, PostLevels = 6;
+// a slot's table: t0-t7, u0 u1, t11-t13, u16 (the pictures between's machine a pixel: State::hitMachine)
+constexpr u32 Frames = 3, SlotDescriptors = 14, MaxTextures = 8192, PostLevels = 6;
 // timestamps a slot: 0 start, 1 structures, 2 light, 3 smoothing, 4 main, 5 end; with AURORA_RT_TIMELOG also 6 bottom levels, 7 temporal, 8 flare, 9 uploads
 constexpr u32 QS = 10;
 // As rt.hlsl's PostParams
@@ -129,14 +130,13 @@ struct Slot {
 // rt.hlsl's BetweenParams
 struct BetweenMachine {
   float m[3][4];
-  float at[4];
 };
 struct BetweenParams {
   float size[2], rectXY[2], rectWH[2], vpXY[2], vpWH[2], pScale[2], pOffset[2];
-  u32 count, iterations;
-  float radius2, far_, pad_[2];
+  u32 machines, iterations;  // machines: a bit for each racer with a correction, machine[racer]
+  float far_, pad_[3];
   float camera[3][4];
-  BetweenMachine machine[30];
+  BetweenMachine machine[redraw::MostMachines];
 };
 struct State {
   // ready: the compile thread has finished, everything below it is the render worker's from then on
@@ -160,6 +160,9 @@ struct State {
   float lastView[10]{};  // viewport's and projection's numbers of the true frame: rect wh, vp xy, vp wh, scale, offset
   BetweenParams betweenParams{};
   ComPtr<ID3D12Resource> termBetween;
+  // the machine whose draw main's camera ray hit, a pixel: 1 + the racer (the game's draw marks, Draw.highlight bits 8-12), 0 none.
+  // Written with the term, read by between_warp (rt.hlsl HitMachine, u16). R8_UINT, or R32_UINT where R8 has no typed UAV loads
+  ComPtr<ID3D12Resource> hitMachine;
   u32 rw = 0, rh = 0;  // the rays' size
   double msBetweenGpu = 0, msBetweenCpu = 0;
   u64 betweenCount = 0, betweenGpuCount = 0;
@@ -654,7 +657,7 @@ void init_device() {
       !traceCs || !composeCs || !hdrCs || !downCs || !upCs || !expoCs || !toneCs)
     return fail("the shader does not compile");
 
-  D3D12_DESCRIPTOR_RANGE1 r1[3]{};
+  D3D12_DESCRIPTOR_RANGE1 r1[4]{};
   r1[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
   r1[0].NumDescriptors = 8;
   r1[0].Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
@@ -667,6 +670,11 @@ void init_device() {
   r1[2].BaseShaderRegister = 11;
   r1[2].OffsetInDescriptorsFromTableStart = 10;
   r1[2].Flags = r1[0].Flags;
+  r1[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;  // u16: the machine a pixel (State::hitMachine)
+  r1[3].NumDescriptors = 1;
+  r1[3].BaseShaderRegister = 16;
+  r1[3].OffsetInDescriptorsFromTableStart = 13;
+  r1[3].Flags = r1[0].Flags;
   D3D12_DESCRIPTOR_RANGE1 rd[2]{};
   rd[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
   rd[0].NumDescriptors = 1;
@@ -693,7 +701,7 @@ void init_device() {
   rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   rp[0].Constants.Num32BitValues = sizeof(Params) / 4;
   rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  rp[1].DescriptorTable.NumDescriptorRanges = 3;
+  rp[1].DescriptorTable.NumDescriptorRanges = 4;
   rp[1].DescriptorTable.pDescriptorRanges = r1;
   rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
   rp[2].DescriptorTable.NumDescriptorRanges = 1;
@@ -941,6 +949,23 @@ void make_targets(u32 w, u32 h, wgpu::TextureFormat format) {
     g.flareW = (w + 3) / 4, g.flareH = (h + 3) / 4;
     for (u32 i = 0; i < 2; ++i)
       g.flareRes[i] = post_texture(g.flareW, g.flareH, DXGI_FORMAT_R16G16B16A16_FLOAT, ViewFlare + 2 * i);
+  }
+  {
+    // the machine a pixel: each slot's table holds it (main writes it, between_warp reads it); no pictures between: a null view, main's writes go nowhere
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+    uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    uv.Format = DXGI_FORMAT_R8_UINT;
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{DXGI_FORMAT_R8_UINT};
+    if (FAILED(g.dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof fs)) || (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD) == 0)
+      uv.Format = DXGI_FORMAT_R32_UINT;
+    g.hitMachine.Reset();
+    if (redraw::g_on) {
+      d.Width = g.rw, d.Height = g.rh, d.Format = uv.Format;
+      if (FAILED(g.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&g.hitMachine))))
+        fail("no texture for the machine a pixel");
+    }
+    for (u32 i = 0; i < Frames; ++i)
+      g.dev->CreateUnorderedAccessView(g.hitMachine.Get(), nullptr, &uv, cpuh(i * SlotDescriptors + 13));
   }
   if (redraw::g_on) {
     g.termBetween = post_texture(g.rw, g.rh, DXGI_FORMAT_R16G16B16A16_FLOAT, ViewBetween);
@@ -2026,10 +2051,9 @@ bool submit_job(std::unique_ptr<Job> job) {
   return true;
 }
 
-// This picture's corrections for the rays' pass: a machine that shows on screen and is near enough to matter (tuned: 200 units; radius 6, as
-// the draws'), for how far away the machine's own pixels take this rule.
+// This picture's corrections for the rays' pass, by racer: a pixel whose surface is a machine's draw (State::hitMachine, the game's marks)
+// moves with that machine, as the raster's draws of it do (redraw.cpp); any other pixel with the camera.
 void between_set(const redraw::Request& q, std::size_t index) {
-  constexpr float Reach = 200.f;
   static const u32 iterations = static_cast<u32>(post_setting("AURORA_RT_BETWEEN_ITERATIONS", 3.f));
   BetweenParams& b = g.betweenParams;
   const redraw::Picture& p = q.pictures[index];
@@ -2037,21 +2061,13 @@ void between_set(const redraw::Request& q, std::size_t index) {
     for (u32 k = 0; k < 4; ++k)
       b.camera[r][k] = p.camera[4 * r + k];
   b.iterations = iterations;
-  b.radius2 = 6.f * 6.f;
   b.far_ = 20000.f;
-  b.count = 0;
-  for (u32 i = 0; i < redraw::MostMachines; ++i) {
-    if (!(q.machines & (1u << i)))
-      continue;
-    const auto& a = q.at[i];
-    if (a[2] > 3.f || a[0] * a[0] + a[1] * a[1] + a[2] * a[2] > Reach * Reach)
-      continue;
-    BetweenMachine& m = b.machine[b.count++];
-    for (u32 r = 0; r < 3; ++r)
-      for (u32 k = 0; k < 4; ++k)
-        m.m[r][k] = p.machine[i][4 * r + k];
-    m.at[0] = a[0], m.at[1] = a[1], m.at[2] = a[2], m.at[3] = 0;
-  }
+  b.machines = q.machines & ((1u << redraw::MostMachines) - 1);
+  for (u32 i = 0; i < redraw::MostMachines; ++i)
+    if (b.machines & (1u << i))
+      for (u32 r = 0; r < 3; ++r)
+        for (u32 k = 0; k < 4; ++k)
+          b.machine[i].m[r][k] = p.machine[i][4 * r + k];
 }
 
 void before_frame_submit() {

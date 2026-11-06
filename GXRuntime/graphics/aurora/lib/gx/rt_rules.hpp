@@ -491,8 +491,9 @@ inline void build_frame(const DrawRec* draws, std::uint32_t count, const Vertex*
     // takes no light through it, and it takes none itself (bit 2); no other ray meets it: no shadow, no reflection, no light from it
     if (t.overlayApart && inView && g.cls < 2 && faces_picture(d, verts))
       g.highlight |= 16 | 4;
-    // the machine whose draw this is, by the game's own mark: every light of that machine passes it (rt.hlsl engine_light, glow_light)
-    if (g.cls < 2 && (g.highlight & 16) == 0)
+    // the machine whose draw this is, by the game's own mark: every light of that machine passes it (rt.hlsl engine_light, glow_light), its
+    // reflections pass its own flames (trace_reflection), the pictures between move its pixels with it (main's HitMachine)
+    if (g.cls < 3 && (g.highlight & 16) == 0)
       g.highlight |= std::min(tag_machine(d.tag), 31u) << 8;
     out.machineDraws += inView && tag_machine(d.tag) != 0 ? 1 : 0;
     if (strength > 0 && inView) {

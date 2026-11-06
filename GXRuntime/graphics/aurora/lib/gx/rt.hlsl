@@ -89,6 +89,7 @@ StructuredBuffer<Stage> Stages : register(t5);
 RWTexture2D<float4> Out : register(u0);
 RWTexture2D<float4> Final : register(u1);
 Texture2D<float4> Term : register(t6);
+RWTexture2D<uint> HitMachine : register(u16);  // the machine whose draw main's camera ray hit (Draw.highlight bits 8-12: 1 + the racer, 0 none); between_warp reads it
 StructuredBuffer<GlowLight> Glows : register(t7);
 Texture2D<float4> Tex[] : register(t0, space1);
 SamplerState Linear : register(s0);
@@ -275,7 +276,8 @@ float3 sky_along(float3 dir, float lod) {
   }
   return sum;
 }
-float3 trace_reflection(float3 org, float3 dir, float maxLodScale) {
+// own: 1 + the machine the reflecting surface is a draw of (Draw.highlight bits 8-12), 0 none
+float3 trace_reflection(float3 org, float3 dir, float maxLodScale, uint own) {
   float3 sum = 0;
   float through = 1;
   float tmin = 0.05;
@@ -314,8 +316,9 @@ float3 trace_reflection(float3 org, float3 dir, float maxLodScale) {
     float lod = clamp(log2(max(t, 1.0) * maxLodScale), 0.0, 8.0);
     float4 c = shade(h, lod);
     c.rgb = fogged(d, h.pos, c.rgb);
-    // a glow right beside the surface is the machine's own flame, a camera-facing sprite: seen from its own bodywork it is a flat sheet
-    if (d.cls == 2) { if (t > 8) sum += through * c.rgb * saturate(c.a); continue; }
+    // the machine's own flame (the game's marks: a glow of the reflecting surface's own machine), a camera-facing sprite: seen from its own
+    // bodywork it is a flat sheet. Any other glow shows, however near
+    if (d.cls == 2) { if (own == 0 || ((d.highlight >> 8) & 31) != own) sum += through * c.rgb * saturate(c.a); continue; }
     if (d.cls == 1) {
       float a = saturate(c.a);
       sum += through * c.rgb * a;
@@ -757,6 +760,7 @@ void main(uint3 id : SV_DispatchThreadID) {
   float3 light = 0;
   float3 dbg = 0;
   float hitDepth = 0;
+  uint hitMachine = 0;  // HitMachine: the machine of the surface at hitDepth
   bool wideHere = false;  // GLOW_WIDE
   uint seed = id.x * 1973u + id.y * 9277u + P.frame * 26699u + 1u;
   for (uint n = 0; n < P.spp; ++n) {
@@ -843,6 +847,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         if (surf.a < 0.5) { tmin = t + 0.02; ++whyCard; continue; }
       }
       hitDepth = t;
+      hitMachine = (d.highlight >> 8) & 31;
       surfT = t;
       if (MAIN_PROBE == 1) break;
       // a card turned to the picture, the game's overlay in the world (AURORA_RT_HUD_SKIP, rt_rules.hpp faces_picture): no light, no reflection; only this ray meets it
@@ -930,7 +935,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             seen = s.a > 0.01 ? s.rgb / s.a : raster;
           } else {
           float3 R = matte_dir(v, N, layer, id.xy);
-          seen = trace_reflection(h.pos + N * 0.03, R, 8.0 / max(P.size.y, 1) * 512.0 / 4.0);
+          seen = trace_reflection(h.pos + N * 0.03, R, 8.0 / max(P.size.y, 1) * 512.0 / 4.0, (d.highlight >> 8) & 31);
           seen = min(seen, 2.0);
           }
           // with light from rays the surface under the reflection is the one lit by them, or a shaded face goes dark and takes the reflection's colour
@@ -966,7 +971,7 @@ void main(uint3 id : SV_DispatchThreadID) {
           R = normalize(R + j * rough);
           if (dot(R, N) < 0) R = reflect(v, N);
         }
-        float3 seen = trace_reflection(h.pos + N * 0.03, R, 8.0 / max(P.size.y, 1) * 512.0 / 4.0);
+        float3 seen = trace_reflection(h.pos + N * 0.03, R, 8.0 / max(P.size.y, 1) * 512.0 / 4.0, (d.highlight >> 8) & 31);
         // on road a broad dim surface tints without showing anything: only what stands out of it counts (the neon)
         if (k <= 0) seen *= smoothstep(0.04, 0.5, max(seen.r, max(seen.g, seen.b)));
         // dim only the surface itself, never a flame or glow the raster drew over it
@@ -997,6 +1002,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     if (MAIN_PROBE == 9) { Out[id.xy] = float4(traces <= 1 ? 0.xxx : traces == 2 ? float3(1, 0, 0) : traces == 3 ? float3(0, 1, 0) : float3(0, 0, 1), 1); return; }
     sum += term;
   }
+  HitMachine[id.xy] = hitMachine;
   // own light falls on the surface: on what lies under the last blended effects, not on them. They are drawn over as they are.
   if (P.mode == 8) { Out[id.xy] = float4(sum + ((P.stableShine & 2) != 0 ? Before[id.xy].rgb : raster) * light, wideHere ? -hitDepth - 1 : hitDepth); return; }
   if (P.mode >= 6) { Out[id.xy] = float4(dbg, 1); return; }
@@ -1089,7 +1095,7 @@ void light_pass(uint3 id : SV_DispatchThreadID) {
       float f0 = 0.04 + MatMetal * layer;
       float fr = (f0 + max(gloss - f0, 0) * pow(1 - cosv, 5)) * shine;
       if (fr > MatReflLeast && !(MATTE_HALF && layer <= 0 && ((id.x + id.y) & 1) != 0))
-        WriteRefl[id.xy] = float4(min(trace_reflection(h.pos + N * 0.03, matte_dir(v, N, layer, id.xy), 8.0 / max(P.size.y, 1) * 512.0 / 4.0 * DP.litScale), 2.0), 1);
+        WriteRefl[id.xy] = float4(min(trace_reflection(h.pos + N * 0.03, matte_dir(v, N, layer, id.xy), 8.0 / max(P.size.y, 1) * 512.0 / 4.0 * DP.litScale, (d.highlight >> 8) & 31), 2.0), 1);
     }
     Guide[id.xy] = float4(oct_of(N), -h.pos.z, sunV);
     break;
@@ -1354,13 +1360,14 @@ float3 glow_flare(int2 c) {
 }
 
 // Pictures between (AURORA_REDRAW with rays): light and reflections once per true frame, carried to each picture. Each pixel looks for the
-// true frame's pixel that lands on it: from a guess, that pixel's own hit distance gives its place in the true view; the place decides
-// its move (within a machine's radius of its place: that machine's correction, else the camera's), and the miss corrects the guess.
-struct BetweenMachine { float4 m[3]; float4 at; };
+// true frame's pixel that lands on it: from a guess, that pixel's own hit distance gives its place in the true view; the machine whose
+// draw main's ray hit there (HitMachine, the game's marks) decides its move (that machine's correction, else the camera's), and the miss
+// corrects the guess.
+struct BetweenMachine { float4 m[3]; };
 struct BetweenParams {
   float2 size, rectXY, rectWH, vpXY, vpWH, pScale, pOffset;
-  uint count, iterations;
-  float radius2, farAway, pad0, pad1;
+  uint machines, iterations;  // machines: a bit for each racer with a correction in machine[racer]
+  float farAway, pad0, pad1, pad2;
   float4 camera[3];
   BetweenMachine machine[30];
 };
@@ -1377,14 +1384,8 @@ void between_warp(uint3 id : SV_DispatchThreadID) {
     float3 v = normalize(float3((ndc + BW.pOffset) / BW.pScale, -1));
     float3 p = v * (t > 0 ? t : BW.farAway);
     float4 m0 = BW.camera[0], m1 = BW.camera[1], m2 = BW.camera[2];
-    if (t > 0) {
-      float nearest = BW.radius2;
-      for (uint i = 0; i < BW.count; ++i) {
-        float3 d = p - BW.machine[i].at.xyz;
-        float d2 = dot(d, d);
-        if (d2 < nearest) { nearest = d2; m0 = BW.machine[i].m[0]; m1 = BW.machine[i].m[1]; m2 = BW.machine[i].m[2]; }
-      }
-    }
+    const uint mark = t > 0 ? HitMachine[clamp(int2(s), 0, most)] : 0;
+    if (mark != 0 && mark <= 30 && ((BW.machines >> (mark - 1)) & 1) != 0) { m0 = BW.machine[mark - 1].m[0]; m1 = BW.machine[mark - 1].m[1]; m2 = BW.machine[mark - 1].m[2]; }
     float4 h = float4(p, 1);
     float3 q = float3(dot(m0, h), dot(m1, h), dot(m2, h));
     if (q.z > -0.01) break;
