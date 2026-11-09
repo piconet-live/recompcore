@@ -164,6 +164,12 @@ AURORA_PRESENT_API int aurora_present_take(AuroraPresentPicture* out);
 AURORA_PRESENT_API void aurora_present_stats(AuroraPresentStats* out);
 // Ends Aurora's thread (it finishes the frame it is on, drops the rest) and shuts Aurora down.
 AURORA_PRESENT_API void aurora_present_stop(void);
+// The host's last call, after it closed everything of its own (its logs, its files): if Aurora had a fatal error the
+// process ends here with exit code `code`, without any library's detach (a thread the fatal error parked was ended at
+// the exit holding a lock some library's static destructor then waits for, for ever); otherwise it returns 0. Optional:
+// a host that never calls it is still ended that way by this library's own detach, which comes after the libraries
+// loaded later than it (the graphics driver's) have run theirs.
+AURORA_PRESENT_API int aurora_present_end_if_fatal(int code);
 
 // ---- The pipeline build: no game, only the compiles (the runner's --build-pipelines, which the launcher starts) ----------
 // Aurora starts with no picture to draw: its device on a window that is never shown and can never be focused or activated

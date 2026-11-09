@@ -866,8 +866,10 @@ void show_stopped_notice(HWND host) {
     ClientToScreen(host, &at);
     constexpr int w = 620, h = 76;
     HWND notice = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, L"STATIC",
-                                  L"The picture has stopped, but your race is still running.\r\n"
-                                  L"Close the game, then rejoin the race from the launcher.",
+                                  // (the same words for every kind of game: a race, offline play, a replay's playback;
+                                  // this library is not told which, and a playback has no race to rejoin)
+                                  L"The picture has stopped, but the game is still running.\r\n"
+                                  L"Close the game. An online race can be rejoined from the launcher.",
                                   WS_POPUP | WS_BORDER | SS_CENTER, at.x - w / 2, at.y - h / 2, w, h, host, nullptr,
                                   GetModuleHandleW(nullptr), nullptr);
     if (notice == nullptr)
@@ -921,6 +923,27 @@ std::uint64_t s_test_frame_copy = 0;
   for (;;)
     std::this_thread::sleep_for(std::chrono::hours(24));
 }
+
+// The process's end after a fatal error of Aurora's. ExitProcess (exit, _Exit, main's return) first ends every other
+// thread, then runs each library's detach: its static objects' destructors (Aurora's and Dawn's devices, buffers,
+// pipelines). After a fatal error on another thread than Aurora's own (the render worker's, a compile thread's) one of
+// aurora-present's static objects, released at its detach, waits inside Dawn on a condition variable for work of a
+// thread ExitProcess has already ended, and waits for ever (seen with cdb in run af-c1: ExitProcess, LdrShutdownProcess,
+// aurora_present dllmain_crt_process_detach, execute_onexit_table, webgpu_dawn, Cnd_wait): the process's exit code is
+// set but its last thread never ends (HasExited, one thread waiting, its memory and files kept). So once Aurora had a fatal error
+// the process ends with TerminateProcess, which runs no library's detach, keeping the exit code ExitProcess was given.
+// Everything of the race (the replay, the logs) is closed before ExitProcess is called, so nothing is lost.
+#ifdef _WIN32
+// `say`: a line and the C runtime's buffers flushed first; never inside ExitProcess, where a thread it ended may hold
+// the C runtime's stream lock.
+void end_process_after_fatal(UINT code, bool say) {
+  if (say) {
+    std::fprintf(stderr, "[aurora-present] the process ends without its libraries' detach (Aurora had a fatal error)\n");
+    std::fflush(nullptr);
+  }
+  TerminateProcess(GetCurrentProcess(), code);
+}
+#endif
 
 #ifdef _WIN32
 bool on_auroras_thread() {
@@ -1221,6 +1244,9 @@ void run() {
   // AURORA_TEST_STALL=<copy>:<ms> (a test): Aurora's thread stops for that long once at this copy.
   // AURORA_TEST_SLOW=<ms> (a test): every frame drawn takes at least that long, as a GPU too slow for the game.
   const std::uint64_t test_device_lost = test_copy("AURORA_TEST_DEVICE_LOST");
+  // AURORA_TEST_WEBGPU_ERROR=<copy> (a test): at this copy the render worker writes a buffer with a size WebGPU refuses (2
+  // bytes, as an odd overlay index count did before its padding): a real validation error, through Dawn's error callback
+  const std::uint64_t test_webgpu_error = test_copy("AURORA_TEST_WEBGPU_ERROR");
   std::uint64_t test_stall_copy = 0;
   unsigned test_stall_ms = 0;
   if (const char* v = std::getenv("AURORA_TEST_STALL")) {
@@ -1602,6 +1628,11 @@ void run() {
     g_auroraDrawDump = dump_copy != 0 && f.copy == dump_copy;
     if (test_fatal != 0 && f.copy == test_fatal) {
       on_fatal("AURORA_TEST_FATAL");
+    }
+    if (test_webgpu_error != 0 && f.copy == test_webgpu_error) {
+      std::fprintf(stderr, "[aurora-present] AURORA_TEST_WEBGPU_ERROR: a refused buffer write at copy %llu\n",
+                   static_cast<unsigned long long>(f.copy));
+      aurora_overlay_test_refused_write();
     }
     if (test_fault != 0 && f.copy == test_fault) {
       *static_cast<volatile int*>(nullptr) = 1;
@@ -2023,6 +2054,25 @@ void aurora_present_stats(AuroraPresentStats* out) {
   out->pictures_between = s->redraw_drawn.load(std::memory_order_relaxed);
 }
 
+#ifdef _WIN32
+// This library's detach at the process's end (reserved != null: ExitProcess, not FreeLibrary), before its static objects'
+// destructors run (the C runtime calls DllMain first): after a fatal error the process ends here, as
+// aurora_present_end_if_fatal ends it, for a host that did not call that
+BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID reserved) {
+  // AURORA_TEST_KEEP_DETACH=1 (a test, the control): the detach runs as before this change. Read with no C runtime
+  // lock (a thread ExitProcess ended may hold the runtime's environment lock)
+  wchar_t keep[4] = {};
+  const bool keep_detach = GetEnvironmentVariableW(L"AURORA_TEST_KEEP_DETACH", keep, 4) == 1 && keep[0] == L'1';
+  if (reason == DLL_PROCESS_DETACH && reserved != nullptr && s != nullptr && s->fatal && !keep_detach) {
+    DWORD code = 0;
+    if (!GetExitCodeProcess(GetCurrentProcess(), &code) || code == STILL_ACTIVE)
+      code = 0;
+    end_process_after_fatal(static_cast<UINT>(code), false);
+  }
+  return TRUE;
+}
+#endif
+
 void aurora_present_stop(void) {
   // The runner's process ends right after this: Aurora's pipelines and device are left to its end, not released one by
   // one (9-11 s of a frozen window after a long session). AURORA_STOP_RELEASE_ALL=1 releases all, as before (a comparison run).
@@ -2030,26 +2080,46 @@ void aurora_present_stop(void) {
     const char* v = std::getenv("AURORA_STOP_RELEASE_ALL");
     aurora::webgpu::g_processEnding.store(!(v && v[0] == '1'), std::memory_order_relaxed);
   }
-  model_pipelines_stop();
-  pace::g_quit.store(true, std::memory_order_relaxed);
-  if (s == nullptr)
-    return;
-  {
-    std::lock_guard g{s->lock};
-    s->quit = true;
+  // The stop (the model files' thread joined, then Aurora's thread told to quit and joined) on a thread of its own, waited
+  // for here until it is done or Aurora has a fatal error: a thread a fatal error parked (before the stop or during it, on
+  // any of Aurora's threads, the render worker's and the compile threads' among them) is never joined, so the stop never
+  // waits for ever, in any order of close. Without a fatal error this is the stop as before, in the same order.
+  auto joined = std::make_shared<std::atomic<bool>>(false);
+  std::thread([joined] {
+    model_pipelines_stop();
+    pace::g_quit.store(true, std::memory_order_relaxed);
+    if (s != nullptr) {
+      {
+        std::lock_guard g{s->lock};
+        s->quit = true;
+      }
+      s->wake.notify_one();
+      s->carry_wake.notify_all();
+      wake_waiters();
+      if (s->thread.joinable() && !s->fatal)
+        s->thread.join();
+    }
+    joined->store(true);
+  }).detach();
+  while (!joined->load()) {
+    if (s != nullptr && s->fatal) {
+      std::fprintf(stderr, "[aurora-present] stop: Aurora had a fatal error, its threads are left (the process ends without them)\n");
+      return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
-  s->wake.notify_one();
-  s->carry_wake.notify_all();
-  wake_waiters();
-  if (s->fatal) {
-    // (a thread of Aurora's is parked for good: nothing of Aurora can be waited for or shut down; the process ends soon)
-    if (s->thread.joinable())
-      s->thread.detach();
-    return;
-  }
-  if (s->thread.joinable())
-    s->thread.join();
   // (s is kept: a picture taken before the stop may still be read; the process ends soon after)
+}
+
+// After the runner closed everything of its own (aurora_present.h): the process ends here if Aurora had a fatal error
+int aurora_present_end_if_fatal(int code) {
+  if (s == nullptr || !s->fatal)
+    return 0;
+#ifdef _WIN32
+  end_process_after_fatal(static_cast<UINT>(code), true);
+#endif
+  std::fflush(nullptr);
+  std::_Exit(code);
 }
 
 // ---- The pipeline build (aurora_present.h: aurora_present_build_start) ----------------------------------------------------
@@ -2067,6 +2137,9 @@ Build* s_build = nullptr;
 [[noreturn]] void build_fatal(const char* message) {
   std::fprintf(stderr, "[pipelines] build: a fatal error of Aurora's: %s\n", message != nullptr ? message : "");
   std::fflush(stderr);
+#ifdef _WIN32
+  end_process_after_fatal(4, true);  // (as after the present's fatal error: no library's detach)
+#endif
   std::_Exit(4);
 }
 
