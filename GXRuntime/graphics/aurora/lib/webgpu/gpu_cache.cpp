@@ -53,6 +53,90 @@ static int check(int ret) {
   return ret;
 }
 
+// A damaged database (SQLITE_CORRUPT, SQLITE_NOTADB: a cache copied in pieces, its -wal older than the file, or written
+// to by a process that did not end) can hand back another row's bytes for a key, and a wrong blob makes D3D12's
+// pipeline creation fail (E_INVALIDARG), fatal to Aurora. A damaged cache is treated as empty: its files are removed
+// and a fresh one is made in their place (once a run; damaged again, it is off for the run). Two ways it is found:
+//  - at the open, when a -wal file is left over (the last process to use it did not close it: a clean close checkpoints
+//    and removes it), `PRAGMA quick_check` before any row is read: nothing of a damaged file reaches Dawn;
+//  - any later load or store that fails with SQLITE_CORRUPT or SQLITE_NOTADB (marked under cache_mutex, dropped by the
+//    caller once no transaction of it is open).
+static bool cache_damaged;
+static bool cache_remade;
+
+static void note_damage(int ret) {
+  const int primary = ret & 0xff;
+  if ((primary == SQLITE_CORRUPT || primary == SQLITE_NOTADB) && !cache_damaged) {
+    cache_damaged = true;
+    Log.error("The Dawn cache is damaged ({}): its files are removed and a fresh cache made", sqlite3_errstr(ret));
+  }
+}
+
+static void remove_cache_files() {
+  std::error_code ec;
+  const auto path = cache_path();
+  for (const char* suffix : {"", "-wal", "-shm"}) {
+    auto file = path;
+    file += suffix;
+    std::filesystem::remove(file, ec);
+  }
+}
+
+static void close_db() {
+  if (load_stmt != nullptr) {
+    sqlite3_finalize(load_stmt);
+    load_stmt = nullptr;
+  }
+  if (store_stmt != nullptr) {
+    sqlite3_finalize(store_stmt);
+    store_stmt = nullptr;
+  }
+  sqlite3_close(db);
+  db = nullptr;
+}
+
+static void drop_if_damaged() {
+  if (!cache_damaged || cache_broken) {
+    return;
+  }
+  close_db();
+  remove_cache_files();
+  cache_damaged = false;
+  if (cache_remade) {
+    Log.error("The fresh Dawn cache is damaged too: off for the run");
+    cache_broken = true;
+  }
+  cache_remade = true;  // (the next load or store opens a fresh one)
+}
+
+// At the open (see above): true when the database passes, or when there was no -wal file left to doubt it by
+static bool open_check_passes(bool walLeft) {
+  if (!walLeft) {
+    return true;
+  }
+  bool ok = false;
+  const auto ret = sqlite::exec(db, "PRAGMA quick_check(1);", [&ok](int n, char** values, char**) {
+    ok = n == 1 && values[0] != nullptr && std::strcmp(values[0], "ok") == 0;
+  }, nullptr);
+  const int primary = ret & 0xff;
+  if (primary == SQLITE_BUSY || primary == SQLITE_LOCKED) {
+    // (another process has it now: the launcher's pipeline build beside a game; that one checks it, this one goes on)
+    Log.warn("Dawn cache: a -wal file was left over and the cache is in use; not checked here");
+    return true;
+  }
+  if ((ret == SQLITE_OK && !ok) || primary == SQLITE_CORRUPT || primary == SQLITE_NOTADB) {
+    Log.error("The Dawn cache is damaged (its check at the open failed{}): its files are removed and a fresh cache made",
+              ret != SQLITE_OK ? fmt::format(": {}", sqlite3_errmsg(db)) : std::string());
+    return false;
+  }
+  if (ret != SQLITE_OK) {
+    Log.warn("Dawn cache: its check at the open could not run: {}", sqlite3_errmsg(db));
+    return true;
+  }
+  Log.info("Dawn cache: a -wal file was left over; the check at the open passed");
+  return true;
+}
+
 static bool ensure_schema_up_to_date() {
   sqlite::Transaction tx(db, Log, true);
   if (!tx) {
@@ -104,16 +188,34 @@ static bool cache_init_core() {
 
   std::string file = io::fs_path_to_string(cache_path());
   Log.debug("Using dawn cache at {}", file);
+  bool walLeft = false;
+  {
+    std::error_code ec;
+    auto wal = cache_path();
+    wal += "-wal";
+    walLeft = std::filesystem::file_size(wal, ec) > 0 && !ec;
+  }
   auto ret = sqlite3_open(file.c_str(), &db);
   if (ret != SQLITE_OK) {
     Log.error("Failed to open database: {}", sqlite3_errmsg(db));
     return false;
+  }
+  if (!open_check_passes(walLeft)) {
+    close_db();
+    remove_cache_files();
+    cache_remade = true;
+    ret = sqlite3_open(file.c_str(), &db);
+    if (ret != SQLITE_OK) {
+      Log.error("Failed to open database: {}", sqlite3_errmsg(db));
+      return false;
+    }
   }
 
   // WAL mode + NORMAL = no need for disk syncs, consistent but not durable is fine.
   ret = sqlite::exec(db, "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");
   if (ret != SQLITE_OK) {
     Log.error("Failed to set pragmas: {}", sqlite3_errmsg(db));
+    note_damage(sqlite3_errcode(db));
     return false;
   }
 
@@ -220,9 +322,7 @@ static bool cache_init() {
   return true;
 }
 
-size_t load_from_cache(void const* key, size_t keySize, void* value, size_t valueSize, void*) {
-  std::lock_guard lock(cache_mutex);
-
+static size_t load_locked(void const* key, size_t keySize, void* value, size_t valueSize) {
   if (!cache_init()) {
     return 0;
   }
@@ -280,6 +380,7 @@ size_t load_from_cache(void const* key, size_t keySize, void* value, size_t valu
     foundSize = 0;
   } else {
     Log.error("Looking up cache key failed: {}", sqlite3_errmsg(db));
+    note_damage(ret);
     return 0;
   }
 
@@ -292,9 +393,17 @@ size_t load_from_cache(void const* key, size_t keySize, void* value, size_t valu
   return foundSize;
 }
 
-void store_to_cache(void const* key, size_t keySize, void const* value, size_t valueSize, void*) {
+size_t load_from_cache(void const* key, size_t keySize, void* value, size_t valueSize, void*) {
   std::lock_guard lock(cache_mutex);
+  const size_t found = load_locked(key, keySize, value, valueSize);
+  if (cache_damaged) {
+    drop_if_damaged();
+    return 0;
+  }
+  return found;
+}
 
+static void store_locked(void const* key, size_t keySize, void const* value, size_t valueSize) {
   if (!cache_init()) {
     return;
   }
@@ -343,6 +452,7 @@ void store_to_cache(void const* key, size_t keySize, void const* value, size_t v
   if (ret != SQLITE_DONE) {
     // Error or something
     Log.error("Failed to insert row: {}", sqlite3_errmsg(db));
+    note_damage(ret);
     return;
   }
 
@@ -352,6 +462,12 @@ void store_to_cache(void const* key, size_t keySize, void const* value, size_t v
 
   tx.commit();
   cache_keys_used.push_back(keyHash);
+}
+
+void store_to_cache(void const* key, size_t keySize, void const* value, size_t valueSize, void*) {
+  std::lock_guard lock(cache_mutex);
+  store_locked(key, keySize, value, valueSize);
+  drop_if_damaged();
 }
 
 void cache_prune() {

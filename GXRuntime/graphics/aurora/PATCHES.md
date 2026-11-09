@@ -39,6 +39,7 @@ ports do not need it); **local** = tools and diagnostics for GXRuntime's harness
 | 23 | Draw dump of one frame (`AURORA_DUMP_COPY`, `AURORA_DUMP_TEX`): TEV, samplers, texture formats, indirect stages, matrices | local | gxr/r3 |
 | 26 | Present hook (`webgpu::PresentHook`): an embedding program's drawing over the present, and a last pass of the whole picture | local | gxr/overlay |
 | 27 | Timewarp (`gfx/timewarp.cpp`, `AURORA_TIMEWARP`): pictures between the true frames; the host's overlay (`set_after_warp`) and the present hook's filter on them too; no warps after a frame not drawn | local | gxr/r4 |
+| 28 | A damaged Dawn cache is treated as empty and made again (`SQLITE_CORRUPT`, `SQLITE_NOTADB`, or `PRAGMA quick_check` failing at an open that finds a -wal left over: a database copied in pieces hands back other rows' bytes, and a wrong cached blob made D3D12's pipeline creation fail with `E_INVALIDARG`, fatal) | upstream | new (fix/aurora-fatal-exit) |
 
 ## Not carried, and why
 
