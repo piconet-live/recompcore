@@ -7,6 +7,7 @@
 // changes as glyphs are baked, and its drawing switches between nearest and smooth sampling mid-list.
 
 #include "aurora_overlay.h"
+#include "aurora_overlay_upload.h"
 
 #include "gxruntime/aurora_present.h"
 
@@ -249,18 +250,18 @@ void draw_frame(const Frame& f, const Copies& copies, const wgpu::RenderPassEnco
     return;
   make_pipeline();
   const uint64_t vertex_bytes = f.vertices.size() * sizeof(AuroraOverlayVertex);
-  const uint64_t index_bytes = (f.indices.size() * sizeof(uint16_t) + 3) & ~uint64_t{3};
+  const uint64_t index_bytes = aurora_overlay_upload::index_bytes(f.indices);  // (a multiple of 4: padded at the frame's intake)
   grow(s_vertex_buffer, s_vertex_room, vertex_bytes, wgpu::BufferUsage::Vertex, "overlay vertices");
   grow(s_index_buffer, s_index_room, index_bytes, wgpu::BufferUsage::Index, "overlay indices");
   webgpu::g_queue.WriteBuffer(s_vertex_buffer, 0, f.vertices.data(), vertex_bytes);
-  webgpu::g_queue.WriteBuffer(s_index_buffer, 0, f.indices.data(), f.indices.size() * sizeof(uint16_t));
+  webgpu::g_queue.WriteBuffer(s_index_buffer, 0, f.indices.data(), index_bytes);
   const float size[4] = {static_cast<float>(f.width), static_cast<float>(f.height), 0, 0};
   webgpu::g_queue.WriteBuffer(s_size_buffer, 0, size, sizeof(size));
 
   pass.SetPipeline(s_pipeline);
   pass.SetBindGroup(0, s_size_bind, 0, nullptr);
   pass.SetVertexBuffer(0, s_vertex_buffer, 0, vertex_bytes);
-  pass.SetIndexBuffer(s_index_buffer, wgpu::IndexFormat::Uint16, 0, f.indices.size() * sizeof(uint16_t));
+  pass.SetIndexBuffer(s_index_buffer, wgpu::IndexFormat::Uint16, 0, index_bytes);
   const float sx = static_cast<float>(surface_w) / static_cast<float>(f.width);
   const float sy = static_cast<float>(surface_h) / static_cast<float>(f.height);
   for (const AuroraOverlayDraw& d : f.draws) {
@@ -501,6 +502,16 @@ void aurora_overlay_start(const uint8_t* ram) {
   });
 }
 
+void aurora_overlay_test_refused_write() {
+  gfx::render_worker::enqueue_work([] {
+    const wgpu::BufferDescriptor desc{.label = "overlay test write", .usage = wgpu::BufferUsage::Index | wgpu::BufferUsage::CopyDst,
+                                      .size = 64};
+    const wgpu::Buffer buffer = webgpu::g_device.CreateBuffer(&desc);
+    const uint16_t one_index = 0;
+    webgpu::g_queue.WriteBuffer(buffer, 0, &one_index, sizeof(one_index));
+  });
+}
+
 extern "C" {
 void aurora_present_overlay_texture(uint64_t id, uint32_t width, uint32_t height, uint32_t x, uint32_t y, uint32_t part_width,
                                     uint32_t part_height, const uint8_t* rgba, uint32_t row_bytes) {
@@ -537,6 +548,22 @@ void aurora_present_overlay_frame(const AuroraOverlayFrame* frame) {
   f->height = frame->height;
   f->vertices.assign(frame->vertices, frame->vertices + frame->vertex_count);
   f->indices.assign(frame->indices, frame->indices + frame->index_count);
+  // AURORA_TEST_ODD_INDICES=1 (a test): every list made odd before the padding, by one index no draw names (as a polygon
+  // with an odd number of corners makes it); the first such upload is logged
+  static const bool test_odd = [] {
+    const char* v = std::getenv("AURORA_TEST_ODD_INDICES");
+    return v != nullptr && v[0] == '1';
+  }();
+  if (test_odd && f->indices.size() % 2 == 0)
+    f->indices.push_back(0);
+  const bool odd = f->indices.size() % 2 != 0;
+  aurora_overlay_upload::pad_indices(f->indices);  // (WriteBuffer: a multiple of 4 bytes, or the picture stops)
+  if (odd && frame->draw_count != 0) {
+    static std::atomic<bool> said{false};
+    if (!said.exchange(true))
+      std::fprintf(stderr, "[aurora-present] overlay: a list of %u indices (odd) goes up as %zu\n",
+                   static_cast<unsigned>(f->indices.size() - 1), f->indices.size());
+  }
   f->draws.assign(frame->draws, frame->draws + frame->draw_count);
   std::lock_guard g{s_lock};
   s_frame = std::move(f);

@@ -150,4 +150,12 @@ if(BUILD_TESTING)
     )
     target_link_libraries(gxruntime_tests PRIVATE GXRuntime::runtime)
     add_test(NAME gxruntime_tests COMMAND gxruntime_tests)
+    if(GXRUNTIME_ENABLE_AURORA)
+        # the overlay's upload sizes (backends/aurora/aurora_overlay_upload.h): no device needed
+        add_executable(aurora_overlay_upload_tests backends/aurora/tests/overlay_upload_test.cpp)
+        target_include_directories(aurora_overlay_upload_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/backends/aurora")
+        target_compile_features(aurora_overlay_upload_tests PRIVATE cxx_std_20)
+        add_test(NAME aurora_overlay_upload_tests COMMAND aurora_overlay_upload_tests)
+    endif()
 endif()
