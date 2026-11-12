@@ -39,6 +39,7 @@ bool g_on = false;
 
 namespace {
 constexpr float Radius = 6.f, WholeNearUnits = 10.f, MoveFull = 3.f, MoveNone = 8.f;
+constexpr float MachineMoved = 0.1f;  // a machine's place in the world further than this from the frame before's: it moved
 constexpr u32 MostWorldVertices = 1024;  // a world-space draw read for vertex-by-vertex moves: at most this many vertices
 // a note's correction: None, World, ByVertex (the world's, its vertices moved), machine i (0..), its icon (Icon + i), over it (Over + i)
 constexpr int None = -1, World = -2, ByVertex = -3, Icon = 100, Over = 200;
@@ -56,7 +57,7 @@ std::string s_tablePath;
 u32 s_testTexture = 0;
 std::atomic<u64> s_tagged{0}, s_tagSame{0}, s_tagOther{0};
 std::atomic<u64> s_pictures{0}, s_world{0}, s_machine{0}, s_whole{0}, s_icon{0}, s_flat{0}, s_offscreen{0}, s_splits{0}, s_frames{0},
-    s_bytes{0}, s_byVertex{0}, s_unreadable{0}, s_moved{0}, s_over{0}, s_written{0};
+    s_bytes{0}, s_byVertex{0}, s_unreadable{0}, s_moved{0}, s_over{0}, s_written{0}, s_stood{0};
 
 float be_float(const u8* p) noexcept {
   u32 v;
@@ -264,6 +265,98 @@ bool near_machine(const Notes& n, const Note& d, const Request& q) noexcept {
   return false;
 }
 
+// What stands still in the world (a request with the true picture's view): the frame before's draws' matrices, its view and its
+// machines' places. The game bakes the view into every draw's matrix: the course is drawn from the world's origin (its matrix is the
+// view itself) and a standing model from its own, and a machine that comes within Radius of such an origin is not what moves it
+// (Big Blue's start line lies at the world's origin: each machine crossing it took the whole course along in the pictures between).
+std::vector<std::array<float, 12>> s_mtxBefore, s_mtxNow;  // sorted by the translation's x
+std::array<float, 12> s_viewBefore{}, s_viewNow{};
+bool s_viewBeforeOn = false, s_viewNowOn = false;
+std::array<std::array<float, 3>, MostMachines> s_atBefore{}, s_atNow{};
+u32 s_atBeforeOn = 0, s_atNowOn = 0;
+std::array<double, 12> s_sinceBefore{};  // the frame before's view times this one's inverse: a place in this view, in that one
+bool s_sinceOn = false;
+
+float most_apart(float a, int i) noexcept { return i % 4 == 3 ? 0.02f + 1e-5f * std::fabs(a) : 2e-3f * std::max(1.f, std::fabs(a)); }
+// a and b the same matrix, as near as two frames' arithmetic leaves a standing one
+bool same(const std::array<float, 12>& a, const std::array<float, 12>& b) noexcept {
+  for (int i = 0; i < 12; ++i)
+    if (!(std::fabs(a[i] - b[i]) <= most_apart(a[i], i)))
+      return false;
+  return true;
+}
+
+// a times b's inverse, both 3x4 (an affine's rows); false when b has none
+bool times_inverse(const std::array<float, 12>& a, const std::array<float, 12>& b, std::array<double, 12>& out) noexcept {
+  const double m[9] = {b[0], b[1], b[2], b[4], b[5], b[6], b[8], b[9], b[10]};
+  const double A = m[4] * m[8] - m[5] * m[7], B = -(m[3] * m[8] - m[5] * m[6]), C = m[3] * m[7] - m[4] * m[6];
+  const double det = m[0] * A + m[1] * B + m[2] * C;
+  if (!(std::fabs(det) > 1e-12))
+    return false;
+  const double r[9] = {A / det, -(m[1] * m[8] - m[2] * m[7]) / det, (m[1] * m[5] - m[2] * m[4]) / det,
+                       B / det, (m[0] * m[8] - m[2] * m[6]) / det,  -(m[0] * m[5] - m[2] * m[3]) / det,
+                       C / det, -(m[0] * m[7] - m[1] * m[6]) / det, (m[0] * m[4] - m[1] * m[3]) / det};
+  double t[3];
+  for (int k = 0; k < 3; ++k)
+    t[k] = -(r[3 * k] * b[3] + r[3 * k + 1] * b[7] + r[3 * k + 2] * b[11]);
+  for (int row = 0; row < 3; ++row) {
+    for (int k = 0; k < 3; ++k)
+      out[4 * row + k] = a[4 * row] * r[k] + a[4 * row + 1] * r[3 + k] + a[4 * row + 2] * r[6 + k];
+    out[4 * row + 3] = a[4 * row] * t[0] + a[4 * row + 1] * t[1] + a[4 * row + 2] * t[2] + a[4 * row + 3];
+  }
+  return true;
+}
+
+// The frame's history of what stands, taken at its first request
+void advance_standing(const Request& q) {
+  s_mtxBefore.swap(s_mtxNow);
+  s_mtxNow.clear();
+  s_viewBefore = s_viewNow, s_viewBeforeOn = s_viewNowOn;
+  s_atBefore = s_atNow, s_atBeforeOn = s_atNowOn;
+  s_viewNow = q.view, s_viewNowOn = q.hasView;
+  s_atNow = q.at, s_atNowOn = q.hasView ? q.machines : 0;
+  s_sinceOn = s_viewBeforeOn && s_viewNowOn && times_inverse(s_viewBefore, s_viewNow, s_sinceBefore);
+  if (!q.hasView)
+    return;
+  for (const Note& d : s_held.notes)
+    if (d.perspective && !d.vertexMatrices && !gfx::redraw_pass_offscreen(d.pass) && !identity(d.mtx) &&
+        (s_mtxNow.empty() || s_mtxNow.back() != d.mtx))
+      s_mtxNow.push_back(d.mtx);
+  std::sort(s_mtxNow.begin(), s_mtxNow.end(), [](const auto& a, const auto& b) { return a[3] < b[3]; });
+}
+
+// Whether a draw the rules give to machine i is the world's all the same: the world's own (its matrix the view itself), or one the
+// frame before had at the same place in the world though that machine has moved since. Without the host's view, no; nor with both at
+// rest: a machine at rest keeps its parts, and takes them along from its first move.
+bool stands(const Note& d, u32 i, const Request& q) noexcept {
+  if (!q.hasView || d.vertexMatrices)
+    return false;
+  if (same(q.view, d.mtx))
+    return true;
+  if (!s_sinceOn || !(s_atBeforeOn & q.machines & (1u << i)))
+    return false;
+  const auto& t = s_sinceBefore;
+  double moved = 0;
+  for (int r = 0; r < 3; ++r) {
+    const double by = t[4 * r] * q.at[i][0] + t[4 * r + 1] * q.at[i][1] + t[4 * r + 2] * q.at[i][2] + t[4 * r + 3] - s_atBefore[i][r];
+    moved += by * by;
+  }
+  if (!(moved > MachineMoved * MachineMoved))
+    return false;
+  std::array<float, 12> then;  // where the frame before had it, had it stood
+  for (int r = 0; r < 3; ++r)
+    for (int k = 0; k < 4; ++k)
+      then[4 * r + k] = static_cast<float>(t[4 * r] * d.mtx[k] + t[4 * r + 1] * d.mtx[4 + k] + t[4 * r + 2] * d.mtx[8 + k] +
+                                           (k == 3 ? t[4 * r + 3] : 0.0));
+  const float apart = most_apart(then[3], 3);
+  auto from = std::lower_bound(s_mtxBefore.begin(), s_mtxBefore.end(), then[3] - apart,
+                               [](const std::array<float, 12>& m, float x) { return m[3] < x; });
+  for (; from != s_mtxBefore.end() && (*from)[3] <= then[3] + apart; ++from)
+    if (same(then, *from))
+      return true;
+  return false;
+}
+
 // The held frame's draws, for a request. `advance`: the first for this frame (its flat draws and machines' places become the frame
 // before's for the next); a request again for the same frame (a test's still) keeps the history as it is.
 void classify(const Request& q, bool advance) {
@@ -284,12 +377,13 @@ void classify(const Request& q, bool advance) {
     for (u32 i = 0; i < MostMachines && s_hasWorld; ++i)
       if ((q.machines & (1u << i)) && on_screen(s_worldProj, q.at[i][0], q.at[i][1], q.at[i][2], &s_screenNow[i][0], &s_screenNow[i][1]))
         s_screenNowOn |= 1u << i;
+    advance_standing(q);
   }
   // (a classification again for the same frame finds its flat draws' places among those already taken)
   std::vector<FlatSeen> taken;
   if (!advance)
     taken.swap(s_flatNow);
-  u64 world = 0, machine = 0, whole = 0, icon = 0, flat = 0, offscreen = 0, byVertex = 0, unreadable = 0, overs = 0;
+  u64 world = 0, machine = 0, whole = 0, icon = 0, flat = 0, offscreen = 0, byVertex = 0, unreadable = 0, overs = 0, stood = 0;
   u64 tagged = 0, tagSame = 0, tagOther = 0;
   for (std::size_t k = 0; k < s_held.notes.size(); ++k) {
     const Note& d = s_held.notes[k];
@@ -319,7 +413,7 @@ void classify(const Request& q, bool advance) {
         c = ByVertex;
         ++byVertex;
       }
-    } else if (const int i = d.vertexMatrices ? -1 : icon_over(d, q); i >= 0) {
+    } else if (const int i = d.vertexMatrices ? -1 : icon_over(d, q); i >= 0 && !stands(d, static_cast<u32>(i), q)) {
       c = Icon + i;
       ++icon;
     } else {
@@ -333,6 +427,10 @@ void classify(const Request& q, bool advance) {
           nearest = d2;
           c = static_cast<int>(i);
         }
+      }
+      if (c >= 0 && stands(d, static_cast<u32>(c), q)) {
+        c = World;  // near a machine, and no part of it
+        ++stood;
       }
       if (c >= 0)
         ++machine;
@@ -359,7 +457,7 @@ void classify(const Request& q, bool advance) {
     s_flatNow.swap(taken);
   if (advance) {  // (the counts once a frame)
     s_world += world, s_machine += machine, s_whole += whole, s_icon += icon, s_flat += flat, s_offscreen += offscreen;
-    s_byVertex += byVertex, s_unreadable += unreadable, s_over += overs;
+    s_byVertex += byVertex, s_unreadable += unreadable, s_over += overs, s_stood += stood;
     s_tagged += tagged, s_tagSame += tagSame, s_tagOther += tagOther;
     ++s_frames;
   }
@@ -715,7 +813,7 @@ Counts counts() noexcept {
   c.pictures = s_pictures.load(), c.world = s_world.load(), c.machine = s_machine.load(), c.whole = s_whole.load(), c.icon = s_icon.load();
   c.flat = s_flat.load(), c.offscreen = s_offscreen.load(), c.splits = s_splits.load(), c.frames = s_frames.load();
   c.uniformBytes = s_bytes.load(), c.byVertex = s_byVertex.load(), c.unreadable = s_unreadable.load(), c.moved = s_moved.load();
-  c.over = s_over.load(), c.written = s_written.load();
+  c.over = s_over.load(), c.written = s_written.load(), c.stood = s_stood.load();
   c.tagged = s_tagged.load(), c.tagSame = s_tagSame.load(), c.tagOther = s_tagOther.load(), c.tagNone = c.tagged - c.tagSame - c.tagOther;
   return c;
 }

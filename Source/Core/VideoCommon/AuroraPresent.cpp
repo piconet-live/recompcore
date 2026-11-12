@@ -133,6 +133,7 @@ struct Library
   void (*model_file)(const char*, const u8*, u64, int) = nullptr;
   void (*scene)(int, const char*) = nullptr;
   void (*step)(u32) = nullptr;  // optional: older libraries have none
+  void (*redraw_view)(const float*) = nullptr;  // optional: older libraries have none
 };
 
 Settings s_settings;
@@ -253,6 +254,7 @@ bool Load(const std::string& path)
   Bind(&s_lib.redraw, "aurora_present_redraw");
   Bind(&s_lib.scene, "aurora_present_scene");
   Bind(&s_lib.step, "aurora_present_step");
+  Bind(&s_lib.redraw_view, "aurora_present_redraw_view");
   return true;
 #else
   s_load_problem = "Aurora is only loaded on Windows so far";
@@ -432,10 +434,13 @@ void Configure(const Settings& settings)
   s_on = true;
 }
 
-void Redraw(const RedrawRequest* request)
+void Redraw(const RedrawRequest* request, const float* view)
 {
-  if (s_started && s_lib.redraw)
-    s_lib.redraw(request);
+  if (!s_started || !s_lib.redraw)
+    return;
+  if (s_lib.redraw_view)
+    s_lib.redraw_view(view);
+  s_lib.redraw(request);
 }
 
 void NoteMark(u32 tag)

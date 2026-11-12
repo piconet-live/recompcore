@@ -25,6 +25,7 @@
 #include <dolphin/vi.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <atomic>
 #include <chrono>
@@ -42,6 +43,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if defined(_WIN32)
@@ -1839,7 +1841,7 @@ void run() {
     aurora::gfx::render_worker::synchronize();
     const auto c = aurora::gx::redraw::counts();
     const auto drawn = s->redraw_drawn.load();
-    std::fprintf(stderr, "[aurora-present] redraw: requests taken %llu, pictures drawn %llu (cost mean %.2f ms, most %.2f on the render worker), passed by the clock %llu, worker busy waits %llu, stale %llu, frames without a request %llu, request ahead of its frame %llu, older than its frame %llu; classes per frame: world %.0f, machine %.0f, whole %.0f, icon %.0f, flat %.0f, offscreen %.0f; uniform bytes %llu; draws with a split matrix %llu; view-space draws moved vertex by vertex %.0f a frame (%.0f vertices moved a picture, %.0f bytes written), with no float positions %.0f; flat draws over a machine (name tags) %.0f a frame\n",
+    std::fprintf(stderr, "[aurora-present] redraw: requests taken %llu, pictures drawn %llu (cost mean %.2f ms, most %.2f on the render worker), passed by the clock %llu, worker busy waits %llu, stale %llu, frames without a request %llu, request ahead of its frame %llu, older than its frame %llu; classes per frame: world %.0f, machine %.0f, whole %.0f, icon %.0f, flat %.0f, offscreen %.0f; uniform bytes %llu; draws with a split matrix %llu; view-space draws moved vertex by vertex %.0f a frame (%.0f vertices moved a picture, %.0f bytes written), with no float positions %.0f; flat draws over a machine (name tags) %.0f a frame; near a machine but standing in the world %.1f a frame\n",
                  (unsigned long long)s->redraw_asked, (unsigned long long)drawn, drawn ? s->redraw_cost_sum / drawn : 0.0, s->redraw_cost_most,
                  (unsigned long long)s->redraw_passed, (unsigned long long)s->redraw_busy, (unsigned long long)s->redraw_stale.load(),
                  (unsigned long long)s->redraw_no_request, (unsigned long long)s->redraw_far, (unsigned long long)s->redraw_old, c.frames ? double(c.world) / c.frames : 0.0,
@@ -1847,7 +1849,7 @@ void run() {
                  c.frames ? double(c.flat) / c.frames : 0.0, c.frames ? double(c.offscreen) / c.frames : 0.0, (unsigned long long)c.uniformBytes, (unsigned long long)c.splits,
                  c.frames ? double(c.byVertex) / c.frames : 0.0, c.pictures ? double(c.moved) / c.pictures : 0.0,
                  c.pictures ? double(c.written) / c.pictures : 0.0, c.frames ? double(c.unreadable) / c.frames : 0.0,
-                 c.frames ? double(c.over) / c.frames : 0.0);
+                 c.frames ? double(c.over) / c.frames : 0.0, c.frames ? double(c.stood) / c.frames : 0.0);
     // the game's marks (aurora_present.h) against the classes: a machine's body draws, and how many the class moved with that machine
     std::fprintf(stderr, "[aurora-present] redraw marks: body draws marked %.1f a frame; their class: that machine %llu, another %llu, none %llu\n",
                  c.frames ? double(c.tagged) / c.frames : 0.0, (unsigned long long)c.tagSame, (unsigned long long)c.tagOther,
@@ -1914,11 +1916,26 @@ void aurora_present_frame_at(uint64_t position) {
     s->next_position = position;
 }
 
+namespace {
+// aurora_present_redraw_view's, for the next request (the game's thread alone)
+std::array<float, 12> g_redrawView{};
+bool g_redrawViewTold = false;
+} // namespace
+
+void aurora_present_redraw_view(const float* view) {
+  g_redrawViewTold = view != nullptr;
+  if (view != nullptr)
+    std::memcpy(g_redrawView.data(), view, sizeof g_redrawView);
+}
+
 void aurora_present_redraw(const AuroraRedrawRequest* request) {
+  const bool viewTold = std::exchange(g_redrawViewTold, false);
   if (s == nullptr || request == nullptr || !aurora::gx::redraw::g_on || s->stopped.load(std::memory_order_relaxed))
     return;
   auto q = std::make_shared<aurora::gx::redraw::Request>();
   q->machines = request->machines;
+  q->view = g_redrawView;
+  q->hasView = viewTold && std::all_of(q->view.begin(), q->view.end(), [](float f) { return std::fabs(f) < 1e7f; });
   std::memcpy(q->at.data(), request->at, sizeof request->at);
   // a seat with no machine (its place not a number, or out past any course) has no place: nothing is near it
   for (std::uint32_t i = 0; i < AURORA_REDRAW_MACHINES; ++i) {

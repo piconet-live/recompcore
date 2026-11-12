@@ -24,6 +24,10 @@ struct Request {
   std::uint32_t machines = 0;  // a bit for each machine with a place
   std::array<std::array<float, 3>, MostMachines> at{};  // machine i's place in the true picture's view
   std::vector<Picture> pictures;
+  // The true picture's view (the game's 3x4, row-major), when the host tells it: the game's draws carry it in their matrices, so only
+  // with it can a draw's own place in the world be read (what stands still there is the world's, whichever machine is near)
+  bool hasView = false;
+  std::array<float, 12> view{};
 };
 
 // The command processor, each draw once its uniform is settled (merged draws too). `vertices`: bytes of the draw's vertices as sent,
@@ -72,6 +76,7 @@ void test_uncorrected(u32 texture) noexcept;
 struct Counts {
   u64 pictures = 0, world = 0, machine = 0, whole = 0, icon = 0, flat = 0, offscreen = 0, splits = 0, frames = 0, uniformBytes = 0;
   u64 byVertex = 0, unreadable = 0, moved = 0, over = 0, written = 0;
+  u64 stood = 0;  // draws near a machine left with the world: they stand still in it (the course's own, drawn from the world's origin)
   // the game's marks against the classes: draws marked a machine's body, of which the class moved with that machine, with another, or with none
   u64 tagged = 0, tagSame = 0, tagOther = 0, tagNone = 0;
 };

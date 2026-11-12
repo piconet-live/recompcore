@@ -94,7 +94,9 @@ struct RedrawRequest
   u32 pictures;
   RedrawPicture picture[REDRAW_MOST];
 };
-void Redraw(const RedrawRequest* request);
+// `view`: the true picture's view the places in `at` are in (the game's 3x4, 12 floats row-major; the library's
+// aurora_present_redraw_view, when it has one), or null.
+void Redraw(const RedrawRequest* request, const float* view);
 void NoteBetween(u64 position, float fraction);
 // The draw marks (the host's, at the game's own draw sites: the runner's port/image/sites_marks.py): from here on in the
 // command stream the game's draws are of the object `tag` names (aurora_present.h AURORA_TAG_*; 0 none). The emulated CPU's

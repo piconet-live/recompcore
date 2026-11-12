@@ -150,6 +150,12 @@ typedef struct AuroraRedrawRequest {
   AuroraRedrawPicture picture[AURORA_REDRAW_MOST];
 } AuroraRedrawRequest;
 AURORA_PRESENT_API void aurora_present_redraw(const AuroraRedrawRequest* request);
+// The true picture's view for the next aurora_present_redraw: the game's 3x4 view matrix, 12 floats row-major (the one the places in
+// `at` are in), told just before it on the same thread. The game's draws carry the view in their matrices; with it the library reads
+// a draw's own place in the world, and what stands still there stays with the world though a machine is near (the course itself, drawn
+// from the world's origin: without the view a machine crossing that origin takes the whole course along in the pictures between).
+// Optional: a host without it gets the classes by nearness alone.
+AURORA_PRESENT_API void aurora_present_redraw_view(const float* view);
 // The game's draw marks: the emulator's feed puts GX_AURORA_SET_DRAW_TAG commands (GXAurora.h) into the stream at the places the
 // game's own draw sites name (the runner's host calls): every draw after one carries its tag (the rays' DrawRec, the redraw's notes),
 // until the next. A tag: bits 0-7 1 + the machine (racer index), 0 none; bits 8-15 the kind; bits 16-23, a burner's: which burner of
